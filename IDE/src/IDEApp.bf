@@ -123,7 +123,7 @@ namespace IDE
 		public const String cVersion = "0.43.6";
 		public const String cEmSdkDep = "EmsdkDep3_Done.txt";
 
-#if BF_PLATFORM_LINUX
+#if BF_PLATFORM_LINUX || BF_PLATFORM_MACOS
 		public const uint8[?] cAppIcon = [IgnoreErrors]{ Compiler.ReadBinary("Resources/beeflang.png") };
 
 		[CallingConvention(.Stdcall), CLink]
@@ -13816,7 +13816,7 @@ namespace IDE
 					flags, mMainFrame);
 			}
 
-#if BF_PLATFORM_LINUX
+#if BF_PLATFORM_LINUX || BF_PLATFORM_MACOS
 			let icon = (Span<uint8>)cAppIcon;
 			BFApp_RegisterAppIcon(icon.Ptr, icon.Length);
 #endif

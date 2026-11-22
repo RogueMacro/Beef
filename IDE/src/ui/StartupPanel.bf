@@ -276,6 +276,14 @@ namespace IDE.ui
 					Linux.SdBusErrorFree(&error);
 					return;
 				}
+#elif BF_PLATFORM_MACOS
+				ProcessStartInfo psi = scope ProcessStartInfo();
+				psi.SetFileName("/usr/bin/open");
+				psi.SetArguments(scope $"\"{mPath}\"");
+				psi.UseShellExecute = false;
+
+				var process = scope SpawnedProcess();
+				process.Start(psi).IgnoreError();
 #endif
 			}
 
@@ -494,6 +502,14 @@ namespace IDE.ui
 				Linux.SdBusErrorFree(&error);
 				return;
 			}
+#elif BF_PLATFORM_MACOS
+			ProcessStartInfo psi = scope ProcessStartInfo();
+			psi.SetFileName("/usr/bin/open");
+			psi.SetArguments(scope $"\"{DOCS_URL}\"");
+			psi.UseShellExecute = false;
+
+			var process = scope SpawnedProcess();
+			process.Start(psi).IgnoreError();
 #endif
 		}
 	}
