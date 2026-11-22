@@ -44,7 +44,7 @@ Confirmed:
 - `SdlBFApp.cpp:334-341`: GL 3.2 core, **no** `SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG`, and
   `SDL_GL_CONTEXT_DEBUG_FLAG` is OR'd into the `SDL_GL_CONTEXT_PROFILE_MASK` value (should go in
   `SDL_GL_CONTEXT_FLAGS`). Numerically DEBUG_FLAG == PROFILE_CORE == 1, so it's harmless today but wrong.
-- `IDEHelper/CMakeLists.txt` only enables LLDB under `UNIX AND NOT APPLE`.
+- `IDEHelper/CMakeLists.txt` only enables LLDB under `UNIX AND NOT APPLE`. (Fixed in Task 10.)
 
 Corrections / new facts:
 - **SDL3 is not linked; it's `dlopen`ed at runtime** (`017b27f6 Use BfpDynLib to load SDL3`).
@@ -234,6 +234,39 @@ What doesn't work yet / not verified:
   `screenshot all=true` composite draws popups at the wrong place. Making popup positions absolute would mean
   changing creation/move/resize together and re-testing Linux.
 
+### Task 10 — debugger via LLDB (done, needs hands-on testing)
+- `IDEHelper/LLDBDebugger*.cpp` is already a full SB-API debugger (Linux port): launch/attach, breakpoints
+  (conditions, hit counts, logging, memory), stepping, Beef-aware evaluation, call stacks, hot compiling. CMake only
+  enabled it for `UNIX AND NOT APPLE`, so macOS fell back to `GDBDebugger` (the Start Debugging crash).
+- **Which liblldb.** Homebrew's `llvm@22` no longer ships lldb. The separate `lldb` formula (23.1.6) links Homebrew's
+  libLLVM **23**, and loading it next to the libLLVM **22** the IDE links breaks LLDB's expression parser: the first
+  `EvaluateExpression` segfaults in `llvm::DataLayout::getTypeAllocSize` (clang codegen of LLDB's ObjC runtime
+  utility function). Reproduced with a 30-line host: liblldb alone → fine; liblldb + `-lLLVM-22` → crash, even
+  without calling into LLVM 22 (most likely dyld coalescing weak C++ symbols across the two LLVMs).
+- **Fix: link Apple's `LLDB.framework`** (found via `xcode-select -p`: Xcode's `SharedFrameworks` or the CLT's
+  `Library/PrivateFrameworks`). It exports only `lldb::SB*` (no LLVM symbols), finds its signed `debugserver`
+  itself, and coexists with LLVM 22. Apple ships no SB headers, so they come from Homebrew's `lldb` keg
+  (`brew install lldb`); the SB API is ABI stable and the whole IDE links against lldb-1700 with no missing symbols.
+  `IDEHelper_libs*.txt` now gets `-F<dir> -framework LLDB -Wl,-rpath,<dir>`.
+- Code changes (all `__APPLE__` additions, Linux paths unchanged):
+  - Target stdio (pty output pump, FIFO pipes for redirected output, terminal stdin hand-off) shared with macOS —
+    plain POSIX. Checked: opening a FIFO `O_RDWR` doesn't block on macOS and the reader sees EOF on close, as on Linux.
+  - Attach: exe path from `proc_pidpath` (Linux reads `/proc/<pid>/exe`).
+  - Process stats: `proc_pidinfo(PROC_PIDTASKINFO)` instead of `task_for_pid` (needs an entitlement we lack);
+    times converted from mach absolute units.
+  - The Beef DWARF "host/shadow" layer (`DebugTarget`) is skipped (`HostSyncModules`/`HostBuildCallStack` return
+    early): it reads only ELF images and x64 registers. Every query it answers already falls back to LLDB.
+  - Hot compiling links relocatable **ELF** objects; on macOS `HotLoad` reports "hot compiling isn't supported on
+    this platform yet" (and still rebinds breakpoints). One ELF-only shadow check is `#ifdef __linux__`.
+- Verified via MCP on a small program: source breakpoints bind and hit; step over / out; call stack
+  (`Hello.Program.Add` ← `Main` ← `BeefStartProgram` ← `main` ← `dyld!start`); locals with summaries
+  (`List<int> { count=3 }`, `Point { mX=10 mY=6 mName="origin" }`); eval of arithmetic, `pt.mName.Length`, `list[1]`,
+  a method call `Add(3, 4)`; conditional breakpoint (`a == 3`); stop and re-launch. Program output goes to the IDE's
+  terminal unless output redirection is on (same as Linux).
+- Not done / follow-ups: Mach-O hot compiling; a Mach-O + arm64 `DebugTarget`; step-out landed on the loop header
+  line (27) rather than the call line (28) — check against Linux before calling it a bug; LLDB shows Beef `int` as
+  `long` (clang type system naming 8-byte ints; standalone lldb shows the same); attach not click-tested.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
@@ -246,13 +279,16 @@ What doesn't work yet / not verified:
 - Apple APIs: Obj-C++/C++ shims in `BeefySysLib/platform/darwin`, `BF_EXPORT`ed, linked frameworks listed in
   Beefy2D's macOS configs (user decision).
 - SDL stays dlopen'ed (no link-time dependency), with Homebrew prefixes as a fallback search path.
+- Debugger: the existing LLDB debugger, linked against Apple's `LLDB.framework` with Homebrew `lldb` headers
+  (user picked Homebrew's liblldb; switched to the framework after liblldb 23 + LLVM 22 proved to crash, see Task 10).
 
 ## Open problems / next
 
 1. Hands-on test of the native dialogs (see Task 6).
 2. (optional) Absolute popup positions, so MCP `all=true` composites are right (see Task 9).
 3. Map the default "Segoe UI Symbol/Emoji" alternates to Apple fonts.
-4. Debugger: LLDB on Apple; meanwhile avoid the GDB fallback crash (`BfpSpawn_Kill` NOT_IMPL).
+4. Debugger follow-ups (Task 10): Mach-O hot compiling, Mach-O/arm64 `DebugTarget`, step-out location check.
+   Without LLDB (no Xcode/CLT or no headers) the GDB fallback still crashes (`BfpSpawn_Kill` NOT_IMPL).
 5. Non-variadic `extern` declarations of variadic C functions (`ioctl`, `fcntl`, `open`, `printf`...) are broken
    on Apple arm64. Socket's is fixed; worth a corlib-wide audit.
 6. `ToLocalTime` on macOS; `LIBRARY_PATH` needed for hand-run IDE builds.
@@ -260,7 +296,7 @@ What doesn't work yet / not verified:
 ## Build commands that work
 
 ```sh
-brew install llvm@22 sdl3 ninja cmake
+brew install llvm@22 sdl3 ninja cmake lldb   # lldb: SB headers only; needs Xcode or the CLT for LLDB.framework
 ./bin/build.sh ide        # full: native libs + BeefBuild + tests + BeefIDE_d + BeefIDE (exit 0)
 cd IDE/dist && LIBRARY_PATH=$(brew --prefix llvm@22)/lib ./BeefBuild -proddir=../ -config=Debug   # IDE only
 cd IDE/dist && ./BeefIDE_d                                    # run
