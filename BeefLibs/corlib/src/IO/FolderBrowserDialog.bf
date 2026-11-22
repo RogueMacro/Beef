@@ -265,4 +265,35 @@ public class FolderBrowserDialog : CommonDialog
 		Linux.SdBusMessageCloseContainer(m);
 	}
 }
+#elif BF_PLATFORM_MACOS
+namespace System.IO;
+
+public class FolderBrowserDialog : CommonDialog
+{
+	public enum FolderKind
+	{
+		Open,
+		Save
+	}
+
+	protected FolderKind mFolderKind;
+
+	public this(FolderKind kind = .Open)
+	{
+		mFolderKind = kind;
+		Reset();
+	}
+
+	public StringView SelectedPath
+	{
+		get
+		{
+			return mDone ? ((mFileNames == null) ? "" : mFileNames[0]) : mInitialDir;
+		}
+		set
+		{
+			String.NewOrSet!(mInitialDir, value);
+		}
+	}
+}
 #endif

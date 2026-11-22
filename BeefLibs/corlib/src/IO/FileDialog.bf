@@ -921,4 +921,175 @@ public abstract class FileDialog : CommonDialog
 		}
 	}
 }
+#elif BF_PLATFORM_MACOS
+namespace System.IO;
+
+enum DialogResult
+{
+	None = 0,
+	OK = 1,
+	Cancel = 2
+}
+
+/// macOS dialogs. The API mirrors the Windows/Linux versions so callers compile unchanged.
+/// TODO: native NSOpenPanel/NSSavePanel implementation. Until then RunDialog returns Cancel.
+abstract class CommonDialog
+{
+	protected String mTitle ~ delete _;
+	protected String mInitialDir ~ delete _;
+	protected String[] mFileNames ~ DeleteContainerAndItems!(_);
+	protected bool mDone;
+
+	public virtual void Reset()
+	{
+		DeleteAndNullify!(mTitle);
+		DeleteAndNullify!(mInitialDir);
+		DeleteContainerAndItems!(mFileNames);
+		mFileNames = null;
+		mDone = false;
+	}
+
+	public StringView Title
+	{
+		set
+		{
+			String.NewOrSet!(mTitle, value);
+		}
+
+		get
+		{
+			return mTitle;
+		}
+	}
+
+	public Result<DialogResult> ShowDialog(INativeWindow owner = null)
+	{
+		mDone = false;
+		let result = Try!(RunDialog(owner));
+		mDone = true;
+		return result;
+	}
+
+	protected virtual Result<DialogResult> RunDialog(INativeWindow owner)
+	{
+		return .Ok(.Cancel);
+	}
+}
+
+public abstract class FileDialog : CommonDialog
+{
+	protected int32 mOptions;
+	private String mFilter ~ delete _;
+
+	public this()
+	{
+		Reset();
+	}
+
+	public override void Reset()
+	{
+		base.Reset();
+		DeleteAndNullify!(mFilter);
+	}
+
+	public StringView InitialDirectory
+	{
+		set
+		{
+			String.NewOrSet!(mInitialDir, value);
+		}
+
+		get
+		{
+			return mInitialDir;
+		}
+	}
+
+	public String[] FileNames
+	{
+		get
+		{
+			return mFileNames;
+		}
+	}
+
+	public StringView FileName
+	{
+		set
+		{
+			if (mFileNames == null)
+			{
+				mFileNames = new String[](new String(value));
+			}
+		}
+	}
+
+	public bool Multiselect
+	{
+		get
+		{
+			return GetOption(512);
+		}
+
+		set
+		{
+			SetOption(512, value);
+		}
+	}
+
+	public bool ValidateNames // Unused kept for compatibility
+	{
+		get
+		{
+			return !GetOption(256);
+		}
+
+		set
+		{
+			SetOption(256, !value);
+		}
+	}
+
+	public StringView DefaultExt { get; set; } // Unused kept for compatibility
+
+	public void GetFilter(String outFilter)
+	{
+		if (mFilter != null)
+			outFilter.Append(mFilter);
+	}
+
+	public Result<void> SetFilter(StringView value)
+	{
+		if (value.Length > 0)
+		{
+			int sepCount = 0;
+			for (let c in value)
+				if (c == '|')
+					sepCount++;
+			// Filter format is "Desc|Pattern|Desc|Pattern", so there must be an odd number of separators
+			if ((sepCount % 2) != 1)
+				return .Err;
+			String.NewOrSet!(mFilter, value);
+		}
+		else
+		{
+			DeleteAndNullify!(mFilter);
+		}
+
+		return .Ok;
+	}
+
+	protected bool GetOption(int32 option)
+	{
+		return (mOptions & option) != 0;
+	}
+
+	protected void SetOption(int32 option, bool value)
+	{
+		if (value)
+			mOptions |= option;
+		else
+			mOptions &= ~option;
+	}
+}
 #endif

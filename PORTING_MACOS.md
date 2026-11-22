@@ -71,6 +71,20 @@ Corrections / new facts:
 - `8b099203` (2025-11) fontconfig font cache in `Font.bf`.
 - 2026: many `SDL ...` commits (HiDPI `bd03c66d`, dlopen SDL `017b27f6`, clipboard, cursors, MSAA).
 
+## Task log
+
+### Task 1 — stub dialogs (done)
+- Added `#elif BF_PLATFORM_MACOS` to `FileDialog.bf` (`DialogResult`, `CommonDialog`, `FileDialog`),
+  `OpenFileDialog.bf`, `SaveFileDialog.bf`, `FolderBrowserDialog.bf`. API = the Linux surface
+  (Title, InitialDirectory, FileName(s), Multiselect, ValidateNames, DefaultExt, Get/SetFilter,
+  ShowReadOnly, OverwritePrompt, FolderKind, SelectedPath).
+- `CommonDialog.ShowDialog` calls `protected virtual Result<DialogResult> RunDialog(INativeWindow owner)`,
+  which returns `.Cancel` for now. Native NSOpenPanel/NSSavePanel work only has to override/replace `RunDialog`.
+- `DialogResult` uses the Windows values (None=0, OK=1, Cancel=2); Linux's differ but nothing depends on them.
+- Result: 0 compile errors. Next failure is the link: 333 undefined symbols (Debugger_*, BfCompiler_*,
+  Gfx_*, BFApp_*, BFWindow_*, SpellChecker_*, HTTP_*, fts_fuzzy_match, ...) = IDEHelper + BeefySysLib not
+  linked, and output lands in `IDE/build/Debug_macOS/IDE/IDE` → no macOS config in `IDE/BeefProj.toml`.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone and not
