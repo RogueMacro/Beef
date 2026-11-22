@@ -84,6 +84,46 @@ namespace System.Net
 			HostUnreachable          = 10065,
 			NotEmpty                 = 10066,
 			TooManyProcesses         = 10067,
+#elif BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+			Interrupted              = 4,
+			InvalidHandle            = 9,
+			PermissionDenied         = 13,
+			InvalidArgument          = 22,
+			TooManyOpenInSystem      = 23,
+			TooManyOpen              = 24,
+			WouldBlock               = 35,
+			InProgress               = 36,
+			Already                  = 37,
+			NotASocket               = 38,
+			DestAddressRequired      = 39,
+			MessageTooLong           = 40,
+			WrongProtocolType        = 41,
+			ProtocolUnavailable      = 42,
+			ProtocolUnsupported      = 43,
+			SocketTypeUnsupported    = 44,
+			OperationUnsupported     = 45,
+			ProtFamilyUnsupported    = 46,
+			AddressFamilyUnsupported = 47,
+			AddressInUse             = 48,
+			AddressUnavailable       = 49,
+			NetworkDown              = 50,
+			NetworkUnreachable       = 51,
+			NetworkReset             = 52,
+			ConnectionAborted        = 53,
+			ConnectionReset          = 54,
+			NoBufferSpace            = 55,
+			AlreadyConnected         = 56,
+			NotConnected             = 57,
+			SocketShutdown           = 58,
+			TooManyReferences        = 59,
+			TimedOut                 = 60,
+			ConnectionRefused        = 61,
+			Loop                     = 62,
+			NameTooLong              = 63,
+			HostDown                 = 64,
+			HostUnreachable          = 65,
+			NotEmpty                 = 66,
+			TooManyProcesses         = 67,
 #else
 			Interrupted              = 4,
 			InvalidHandle            = 9,
@@ -520,7 +560,7 @@ namespace System.Net
 		public const IPv4Address INADDR_ANY = default;
 		public const IPv6Address IN6ADDR_ANY = default;
 
-#if BF_PLATFORM_WINDOWS
+#if BF_PLATFORM_WINDOWS || BF_PLATFORM_MACOS || BF_PLATFORM_IOS
 		const int FIONBIO = (int)0x8004667e;
 #else
 		const int FIONBIO = (int)0x00005421;
@@ -635,6 +675,10 @@ namespace System.Net
 #if BF_PLATFORM_WINDOWS
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int32 ioctlsocket(HSocket s, int cmd, int* argp);
+#elif BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+		// ioctl is variadic, and the Apple arm64 ABI passes variadic arguments on the stack
+		[CLink, CallingConvention(.Stdcall)]
+		static extern int32 ioctl(HSocket s, int cmd, ...);
 #else
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int32 ioctl(HSocket s, int cmd, int* argp);
