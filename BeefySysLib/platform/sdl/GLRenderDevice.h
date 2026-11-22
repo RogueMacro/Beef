@@ -31,13 +31,23 @@ public:
 	GLuint					mGLTexture2;
 	ImageData*				mImageData;
 
+	// Render targets only. Framebuffer objects aren't shared between contexts, so there's one per
+	// context the target gets bound in; the texture and depth renderbuffer are shared.
+	bool					mIsRenderTarget;
+	GLuint					mGLDepthBuffer;
+	bool					mGLDepthHasStencil;
+	Dictionary<SDL_GLContext, GLuint> mGLFramebufferMap;
+
 public:
 	GLTexture();
 	virtual ~GLTexture();
 
+	bool					BindFramebuffer(GLenum target);
+
 	virtual void			PhysSetAsTarget() override;
 	virtual void			Blt(ImageData* imageData, int x, int y) override;
 	virtual void			SetBits(int destX, int destY, int destWidth, int destHeight, int srcPitch, uint32 *bits) override;
+	virtual void			GetBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits) override;
 };
 
 class GLShaderParam : public ShaderParam
@@ -150,6 +160,14 @@ public:
 
 	bool					mHasVSync;
 
+	// Size of the bound target, and whether it's a texture. Texture targets are drawn with a flipped
+	// projection so their first row is the image's top, like uploaded textures. Dirty forces the next
+	// draw batch to reapply its render state (projection, scissor) for a new target.
+	int						mPhysTargetWidth;
+	int						mPhysTargetHeight;
+	bool					mPhysTargetIsTexture;
+	bool					mPhysTargetDirty;
+
     GLDrawBatch*            mFreeBatchHead;
 
 public:
@@ -159,6 +177,7 @@ public:
 	virtual void			PhysSetRenderState(RenderState* renderState) override;
 	virtual void			PhysSetRenderTarget(Texture* renderTarget) override;
 	void					ResetContextState();
+	void					SetPhysTarget(int width, int height, bool isTexture);
 
 public:
 	GLRenderDevice();

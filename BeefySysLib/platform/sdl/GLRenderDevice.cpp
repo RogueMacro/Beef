@@ -132,6 +132,16 @@ static void (APIENTRYP bf_glDrawBuffers)(GLsizei n, const GLenum *bufs);
 static GLenum (APIENTRYP bf_glCheckFramebufferStatus)(GLenum target);
 static void (APIENTRYP bf_glTexSubImage2D)(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels);
 static void (APIENTRYP bf_glBindFramebuffer)(GLenum target, GLuint framebuffer);
+static void (APIENTRYP bf_glGenFramebuffers)(GLsizei n, GLuint* framebuffers);
+static void (APIENTRYP bf_glDeleteFramebuffers)(GLsizei n, const GLuint* framebuffers);
+static void (APIENTRYP bf_glGenRenderbuffers)(GLsizei n, GLuint* renderbuffers);
+static void (APIENTRYP bf_glDeleteRenderbuffers)(GLsizei n, const GLuint* renderbuffers);
+static void (APIENTRYP bf_glBindRenderbuffer)(GLenum target, GLuint renderbuffer);
+static void (APIENTRYP bf_glRenderbufferStorage)(GLenum target, GLenum internalformat, GLsizei width, GLsizei height);
+static void (APIENTRYP bf_glFramebufferRenderbuffer)(GLenum target, GLenum attachment, GLenum renderbuffertarget, GLuint renderbuffer);
+static void (APIENTRYP bf_glDeleteTextures)(GLsizei n, const GLuint* textures);
+static void (APIENTRYP bf_glFrontFace)(GLenum mode);
+static void (APIENTRYP bf_glGetIntegerv)(GLenum pname, GLint* data);
 static void (APIENTRYP bf_glClearColor)(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha);
 static void (APIENTRYP bf_glClearDepth)(GLdouble depth);
 static void (APIENTRYP bf_glClear)(GLbitfield mask);
@@ -294,6 +304,9 @@ GLTexture::GLTexture()
 	//mGLRenderTargetView = NULL;
 	mRenderDevice = NULL;
 	mImageData = NULL;
+	mIsRenderTarget = false;
+	mGLDepthBuffer = 0;
+	mGLDepthHasStencil = false;
 }
 
 GLTexture::~GLTexture()
@@ -302,11 +315,114 @@ GLTexture::~GLTexture()
 		mImageData->Deref();
 	//if (mGLTexture != NULL)
 		//mGLTexture->Release();
+
+	if (mIsRenderTarget)
+	{
+		// A framebuffer name is only meaningful in the context that made it, so only the current
+		// context's one can be deleted here; any others leak
+		GLuint* framebufferPtr = NULL;
+		if (mGLFramebufferMap.TryGetValue(bf_SDL_GL_GetCurrentContext(), &framebufferPtr))
+			bf_glDeleteFramebuffers(1, framebufferPtr);
+		if (mGLDepthBuffer != 0)
+			bf_glDeleteRenderbuffers(1, &mGLDepthBuffer);
+		if (mGLTexture != 0)
+			bf_glDeleteTextures(1, &mGLTexture);
+	}
+}
+
+bool GLTexture::BindFramebuffer(GLenum target)
+{
+	if (!mIsRenderTarget)
+		return false;
+
+	GLuint* framebufferPtr = NULL;
+	if (mGLFramebufferMap.TryAdd(bf_SDL_GL_GetCurrentContext(), NULL, &framebufferPtr))
+	{
+		*framebufferPtr = 0;
+		bf_glGenFramebuffers(1, framebufferPtr);
+		bf_glBindFramebuffer(GL_FRAMEBUFFER, *framebufferPtr);
+		bf_glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, mGLTexture, 0);
+		if (mGLDepthBuffer != 0)
+			bf_glFramebufferRenderbuffer(GL_FRAMEBUFFER, mGLDepthHasStencil ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, mGLDepthBuffer);
+		GLenum status = bf_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+		if (status != GL_FRAMEBUFFER_COMPLETE)
+		{
+			OutputDebugStrF("GLTexture: render target framebuffer incomplete (0x%X)\n", status);
+			bf_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			bf_glDeleteFramebuffers(1, framebufferPtr);
+			mGLFramebufferMap.Remove(bf_SDL_GL_GetCurrentContext());
+			return false;
+		}
+	}
+
+	bf_glBindFramebuffer(target, *framebufferPtr);
+	return true;
 }
 
 void GLTexture::PhysSetAsTarget()
 {
+#ifdef BF_PLATFORM_OPENGL_ES2
 	NOT_IMPL;
+#else
+	if (!BindFramebuffer(GL_FRAMEBUFFER))
+		return;
+
+	bf_glEnable(GL_BLEND);
+	bf_glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+	bf_glViewport(0, 0, (GLsizei)mWidth, (GLsizei)mHeight);
+	mRenderDevice->SetPhysTarget(mWidth, mHeight, true);
+
+	if (mWantsClear)
+	{
+		// glClear honors the scissor and depth mask; the dirty target makes the next batch restore both
+		bf_glDisable(GL_SCISSOR_TEST);
+		bf_glClearColor(0, 0, 0, 0);
+		GLbitfield clearMask = GL_COLOR_BUFFER_BIT;
+		if (mGLDepthBuffer != 0)
+		{
+			bf_glDepthMask(GL_TRUE);
+			bf_glClearDepth(1);
+			clearMask |= GL_DEPTH_BUFFER_BIT;
+			if (mGLDepthHasStencil)
+				clearMask |= GL_STENCIL_BUFFER_BIT;
+		}
+		bf_glClear(clearMask);
+		if (mGLDepthBuffer != 0)
+			bf_glDepthMask(mRenderDevice->mPhysRenderState->mWriteDepthBuffer ? GL_TRUE : GL_FALSE);
+
+		mHasBeenDrawnTo = true;
+		if (mResetClear)
+			mWantsClear = false;
+	}
+#endif
+}
+
+void GLTexture::GetBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits)
+{
+#ifndef BF_PLATFORM_OPENGL_ES2
+	if ((srcWidth <= 0) || (srcHeight <= 0) || (bits == NULL))
+		return;
+
+	// BindFramebuffer binds both read and draw when it first makes this context's framebuffer
+	GLint prevReadFramebuffer = 0;
+	GLint prevDrawFramebuffer = 0;
+	bf_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFramebuffer);
+	bf_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFramebuffer);
+	if (!BindFramebuffer(GL_READ_FRAMEBUFFER))
+	{
+		bf_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDrawFramebuffer);
+		return;
+	}
+
+	// Render targets are stored top row first (see GLRenderDevice::SetPhysTarget), so no flip is needed
+	bf_glPixelStorei(GL_PACK_ALIGNMENT, 4);
+	bf_glPixelStorei(GL_PACK_ROW_LENGTH, destPitch);
+	bf_glReadPixels(srcX, srcY, srcWidth, srcHeight, GL_RGBA, GL_UNSIGNED_BYTE, bits);
+	bf_glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+
+	bf_glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFramebuffer);
+	bf_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDrawFramebuffer);
+#endif
 }
 
 void GLTexture::Blt(ImageData* imageData, int x, int y)
@@ -383,7 +499,7 @@ void GLDrawBatch::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
 	bf_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, glRenderDevice->mGLIndexBuffer);
 	bf_glBufferData(GL_ELEMENT_ARRAY_BUFFER, mIdxIdx * sizeof(int16), mIndices, GL_STREAM_DRAW);
 
-	if (mRenderState != renderDevice->mPhysRenderState)
+	if ((mRenderState != renderDevice->mPhysRenderState) || (glRenderDevice->mPhysTargetDirty))
 		renderDevice->PhysSetRenderState(mRenderState);
 
 	bf_glDrawElements(GL_TRIANGLES, mIdxIdx, GL_UNSIGNED_SHORT, NULL);
@@ -523,6 +639,16 @@ GLRenderWindow::GLRenderWindow(GLRenderDevice* renderDevice, SDL_Window* sdlWind
 		BF_GET_GLPROC(glCheckFramebufferStatus);
 		BF_GET_GLPROC(glTexSubImage2D);
 		BF_GET_GLPROC(glBindFramebuffer);
+		BF_GET_GLPROC(glGenFramebuffers);
+		BF_GET_GLPROC(glDeleteFramebuffers);
+		BF_GET_GLPROC(glGenRenderbuffers);
+		BF_GET_GLPROC(glDeleteRenderbuffers);
+		BF_GET_GLPROC(glBindRenderbuffer);
+		BF_GET_GLPROC(glRenderbufferStorage);
+		BF_GET_GLPROC(glFramebufferRenderbuffer);
+		BF_GET_GLPROC(glDeleteTextures);
+		BF_GET_GLPROC(glFrontFace);
+		BF_GET_GLPROC(glGetIntegerv);
 		BF_GET_GLPROC(glClearColor);
 		BF_GET_GLPROC(glClearDepth);
 		BF_GET_GLPROC(glClear);
@@ -568,6 +694,10 @@ void GLRenderWindow::PhysSetAsTarget()
 	bf_SDL_GL_MakeCurrent(mSDLWindow, mGLContext);
 	if (contextChanged)
 		mRenderDevice->ResetContextState();
+#ifndef BF_PLATFORM_OPENGL_ES2
+	if (mRenderDevice->mPhysTargetIsTexture)
+		bf_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+#endif
 
 	bf_glEnable(GL_BLEND);
 	bf_glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -579,6 +709,7 @@ void GLRenderWindow::PhysSetAsTarget()
 
 	bf_glViewport(0, 0, (GLsizei)mWidth, (GLsizei)mHeight);
 	bf_glScissor(0, 0, (GLsizei)mWidth, (GLsizei)mHeight);
+	mRenderDevice->SetPhysTarget(mWidth, mHeight, false);
 
 	if (!mHasBeenDrawnTo)
 	{
@@ -644,6 +775,21 @@ GLRenderDevice::GLRenderDevice()
 	mGLIndexBuffer = 0;
 	mBlankTexture = 0;
     mFreeBatchHead = NULL;
+	mPhysTargetWidth = 0;
+	mPhysTargetHeight = 0;
+	mPhysTargetIsTexture = false;
+	mPhysTargetDirty = true;
+}
+
+void GLRenderDevice::SetPhysTarget(int width, int height, bool isTexture)
+{
+	mPhysTargetWidth = width;
+	mPhysTargetHeight = height;
+	mPhysTargetIsTexture = isTexture;
+	mPhysTargetDirty = true;
+	// The flipped projection used for texture targets reverses triangle winding
+	if (bf_glFrontFace != NULL)
+		bf_glFrontFace(isTexture ? GL_CW : GL_CCW);
 }
 
 GLRenderDevice::~GLRenderDevice()
@@ -806,19 +952,25 @@ void GLRenderDevice::PhysSetRenderState(RenderState* renderState)
 	if (mCurShader != NULL)
 	{
 		bf_glUseProgram(mCurShader->mGLProgram);
-		if (mCurShader->mScreenUniformLoc >= 0)
+		if ((mCurShader->mScreenUniformLoc >= 0) && (mPhysTargetWidth > 0) && (mPhysTargetHeight > 0))
 		{
 			GLfloat matrix[4][4];
-			CreateOrthographicOffCenter(0.0f, (float)mPhysRenderWindow->mWidth, (float)mPhysRenderWindow->mHeight, 0.0f, -100.0f, 100.0f, matrix);
+			// Windows: y down from the top. Texture targets: flipped, so row 0 holds the image's top row.
+			float top = mPhysTargetIsTexture ? (float)mPhysTargetHeight : 0.0f;
+			float bottom = mPhysTargetIsTexture ? 0.0f : (float)mPhysTargetHeight;
+			CreateOrthographicOffCenter(0.0f, (float)mPhysTargetWidth, bottom, top, -100.0f, 100.0f, matrix);
 			bf_glUniformMatrix4fv(mCurShader->mScreenUniformLoc, 1, false, (float*)matrix);
 		}
 	}
+	mPhysTargetDirty = false;
 
 	if (renderState->mClipped)
 	{
 		bf_glEnable(GL_SCISSOR_TEST);
-		bf_glScissor((GLsizei)renderState->mClipRect.x,
-		   mPhysRenderWindow->mHeight - (GLsizei)renderState->mClipRect.y - (GLsizei)renderState->mClipRect.height,
+		GLint scissorY = (GLint)renderState->mClipRect.y;
+		if (!mPhysTargetIsTexture)
+			scissorY = mPhysTargetHeight - (GLint)renderState->mClipRect.y - (GLint)renderState->mClipRect.height;
+		bf_glScissor((GLint)renderState->mClipRect.x, scissorY,
 			(GLsizei)renderState->mClipRect.width, (GLsizei)renderState->mClipRect.height);
 	}
 	else
@@ -895,26 +1047,93 @@ void GLRenderDevice::PhysSetRenderState(RenderState* renderState)
 	mPhysRenderState = renderState;
 }
 
+// Image.RenderTargetFlags bits (DXRenderDevice reads the same values)
+enum GLRenderTargetFlags
+{
+	GLRenderTargetFlag_HighPrecision = 0x4,
+	GLRenderTargetFlag_R8 = 0x8,
+	GLRenderTargetFlag_F16 = 0x10,
+	GLRenderTargetFlag_RG8 = 0x40,
+	GLRenderTargetFlag_R16F = 0x80,
+	GLRenderTargetFlag_R32Uint = 0x100,
+	GLRenderTargetFlag_RG16F = 0x400,
+	GLRenderTargetFlag_Depth = 0x800,
+	GLRenderTargetFlag_Stencil = 0x1000
+};
+
+// Not supported here yet: Shared, Mipmaps, UnorderedAccess, and multisampling (sampleCount > 1
+// renders single-sampled, so ResolveTo has nothing to do).
 Texture* GLRenderDevice::CreateRenderTarget(int width, int height, int flags, int sampleCount)
 {
-	// GLTexture* texture = new GLTexture();
-	// GLuint id;
-	// bf_glGenTextures(1, &id);
-	// bf_glBindTexture(GL_TEXTURE_2D, id);
-	// bf_glTexImage2D(GL_TEXTURE_2D, 0, (destAlpha ? GL_RGBA : GL_RGB), width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
-	// bf_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	// bf_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	//
-	// GLuint depthrenderbuffer;
-	// bf_glGenRenderbuffers(1, &depthrenderbuffer);
-	// bf_glBindRenderbuffer(GL_RENDERBUFFER, depthrenderbuffer);
-	// bf_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, width, height);
-	// bf_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthrenderbuffer);
-	// texture->mGLTexture = id;
-	// texture->mGLTexture2 = depthrenderbuffer;
-	// texture->AddRef();
-	// return texture;
+#ifdef BF_PLATFORM_OPENGL_ES2
 	NOT_IMPL;
+#else
+	if ((width <= 0) || (height <= 0))
+		return NULL;
+
+	GLint internalFormat = GL_RGBA8;
+	GLenum format = GL_RGBA;
+	GLenum type = GL_UNSIGNED_BYTE;
+	if ((flags & GLRenderTargetFlag_HighPrecision) != 0)
+	{
+		internalFormat = GL_R32F; format = GL_RED; type = GL_FLOAT;
+	}
+	else if ((flags & GLRenderTargetFlag_R8) != 0)
+	{
+		internalFormat = GL_R8; format = GL_RED; type = GL_UNSIGNED_BYTE;
+	}
+	else if ((flags & GLRenderTargetFlag_F16) != 0)
+	{
+		internalFormat = GL_RGBA16F; format = GL_RGBA; type = GL_HALF_FLOAT;
+	}
+	else if ((flags & GLRenderTargetFlag_RG8) != 0)
+	{
+		internalFormat = GL_RG8; format = GL_RG; type = GL_UNSIGNED_BYTE;
+	}
+	else if ((flags & GLRenderTargetFlag_R16F) != 0)
+	{
+		internalFormat = GL_R16F; format = GL_RED; type = GL_HALF_FLOAT;
+	}
+	else if ((flags & GLRenderTargetFlag_R32Uint) != 0)
+	{
+		internalFormat = GL_R32UI; format = GL_RED_INTEGER; type = GL_UNSIGNED_INT;
+	}
+	else if ((flags & GLRenderTargetFlag_RG16F) != 0)
+	{
+		internalFormat = GL_RG16F; format = GL_RG; type = GL_HALF_FLOAT;
+	}
+
+	GLuint textureId = 0;
+	bf_glGenTextures(1, &textureId);
+	bf_glBindTexture(GL_TEXTURE_2D, textureId);
+	bool integerFormat = ((flags & GLRenderTargetFlag_R32Uint) != 0);
+	bf_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, integerFormat ? GL_NEAREST : GL_LINEAR);
+	bf_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, integerFormat ? GL_NEAREST : GL_LINEAR);
+	bf_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	bf_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	bf_glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0, format, type, NULL);
+
+	GLTexture* glTexture = new GLTexture();
+	glTexture->mRenderDevice = this;
+	glTexture->mGLTexture = textureId;
+	glTexture->mGLTexture2 = 0;
+	glTexture->mIsRenderTarget = true;
+	glTexture->mWidth = width;
+	glTexture->mHeight = height;
+
+	if ((flags & (GLRenderTargetFlag_Depth | GLRenderTargetFlag_Stencil)) != 0)
+	{
+		bool wantStencil = (flags & GLRenderTargetFlag_Stencil) != 0;
+		glTexture->mGLDepthHasStencil = wantStencil;
+		bf_glGenRenderbuffers(1, &glTexture->mGLDepthBuffer);
+		bf_glBindRenderbuffer(GL_RENDERBUFFER, glTexture->mGLDepthBuffer);
+		bf_glRenderbufferStorage(GL_RENDERBUFFER, wantStencil ? GL_DEPTH24_STENCIL8 : GL_DEPTH_COMPONENT24, width, height);
+		bf_glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	}
+
+	glTexture->AddRef();
+	return glTexture;
+#endif
 }
 
 Texture* GLRenderDevice::CreateDynTexture(int width, int height)
