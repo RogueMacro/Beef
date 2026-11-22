@@ -193,6 +193,9 @@ What doesn't work yet / not verified:
   `PingFangUI.ttc` lists more descriptors than faces, so indices ≥144 there don't open; nobody should pick those.
 - `Font.bf`: `#elif BF_PLATFORM_MACOS` in `BuildFontNameCache` calls it; `AddSystemFont` uses the same naming as the
   fontconfig path. Beefy2D's macOS configs add `-framework CoreText`.
+- The bootstrap BeefBuild (BeefBoot compiles Beefy2D sources directly, no toml) also references it, so
+  `bin/build.sh`'s Darwin `LINKOPTS` gained `-framework CoreText -framework CoreFoundation`. Full
+  `./bin/build.sh ide` passes again (tests 201/201 + 1/1, Debug and Release).
 - Verified: with editor `Fonts = ["Menlo", "?Apple Symbols"]` the IDE opens `/System/Library/Fonts/Menlo.ttc` and
   `Apple Symbols.ttf` (lsof). UI fonts still come from bundled Noto via the "Segoe UI" fail entry, as on Linux.
 - Not done: mapping the IDE's default alternates (`?Segoe UI Symbol/Historic/Emoji`) to Apple equivalents. "Apple
