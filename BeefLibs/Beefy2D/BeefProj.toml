@@ -23,7 +23,7 @@ BeefLibType = "Static"
 PostBuildCmds = ["CopyToDependents(\"$(ProjectDir)/dist/libBeefySysLib_d.a\")"]
 
 [Configs.Debug.macOS]
-OtherLinkFlags = "$(LinkFlags) \"$(ProjectDir)/dist/libBeefySysLib_d.a\""
+OtherLinkFlags = "$(LinkFlags) \"$(ProjectDir)/dist/libBeefySysLib_d.a\" -framework AppKit -framework UniformTypeIdentifiers"
 CLibType = "Static"
 BeefLibType = "Static"
 PostBuildCmds = ["CopyToDependents(\"$(ProjectDir)/dist/libBeefySysLib_d.a\")"]
@@ -43,7 +43,7 @@ BeefLibType = "Static"
 PostBuildCmds = ["CopyToDependents(\"$(ProjectDir)/dist/libBeefySysLib.a\")"]
 
 [Configs.Release.macOS]
-OtherLinkFlags = "$(LinkFlags) \"$(ProjectDir)/dist/libBeefySysLib.a\""
+OtherLinkFlags = "$(LinkFlags) \"$(ProjectDir)/dist/libBeefySysLib.a\" -framework AppKit -framework UniformTypeIdentifiers"
 CLibType = "Static"
 BeefLibType = "Static"
 PostBuildCmds = ["CopyToDependents(\"$(ProjectDir)/dist/libBeefySysLib.a\")"]

@@ -295,5 +295,10 @@ public class FolderBrowserDialog : CommonDialog
 			String.NewOrSet!(mInitialDir, value);
 		}
 	}
+
+	protected override Result<DialogResult> RunDialog(INativeWindow owner)
+	{
+		return RunNativeDialog(.Folder, false, (mInitialDir != null) ? mInitialDir : "", "", "");
+	}
 }
 #endif

@@ -185,6 +185,8 @@ public class SaveFileDialog : FileDialog
 			SetOption(2, value);
 		}
 	}
+
+	protected override bool IsSaveDialog => true;
 }
 #else
 namespace System.IO

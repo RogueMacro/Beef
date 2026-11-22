@@ -932,9 +932,22 @@ enum DialogResult
 }
 
 /// macOS dialogs. The API mirrors the Windows/Linux versions so callers compile unchanged.
-/// TODO: native NSOpenPanel/NSSavePanel implementation. Until then RunDialog returns Cancel.
+/// The panels are shown by BFFileDialog_Show in BeefySysLib (platform/darwin/DarwinDialogs.mm), so programs
+/// using these must link BeefySysLib and -framework AppKit -framework UniformTypeIdentifiers (Beefy2D does).
 abstract class CommonDialog
 {
+	protected enum NativeKind : int32
+	{
+		Open,
+		Save,
+		Folder
+	}
+
+	[CallingConvention(.Stdcall), CLink]
+	static extern int32 BFFileDialog_Show(int32 kind, int32 flags, char8* title, char8* initialDir, char8* defaultName, char8* filter, char8** outPaths);
+	[CallingConvention(.Stdcall), CLink]
+	static extern void BFFileDialog_FreeResult(char8* paths);
+
 	protected String mTitle ~ delete _;
 	protected String mInitialDir ~ delete _;
 	protected String[] mFileNames ~ DeleteContainerAndItems!(_);
@@ -970,9 +983,42 @@ abstract class CommonDialog
 		return result;
 	}
 
-	protected virtual Result<DialogResult> RunDialog(INativeWindow owner)
+	protected abstract Result<DialogResult> RunDialog(INativeWindow owner);
+
+	protected Result<DialogResult> RunNativeDialog(NativeKind kind, bool multiselect, StringView initialDir, StringView defaultName, StringView filter)
 	{
-		return .Ok(.Cancel);
+		String initialDirStr = scope .(initialDir);
+		String defaultNameStr = scope .(defaultName);
+		String filterStr = scope .(filter);
+
+		char8* paths = null;
+		int32 result = BFFileDialog_Show((.)kind, multiselect ? 1 : 0,
+			(mTitle != null) ? mTitle.CStr() : null,
+			initialDirStr.IsEmpty ? null : initialDirStr.CStr(),
+			defaultNameStr.IsEmpty ? null : defaultNameStr.CStr(),
+			filterStr.IsEmpty ? null : filterStr.CStr(),
+			&paths);
+		if (result < 0)
+			return .Err;
+		if ((result == 0) || (paths == null))
+			return .Ok(.Cancel);
+
+		// Paths come back as consecutive NUL-terminated strings followed by an extra NUL
+		List<String> fileNames = scope .();
+		char8* ptr = paths;
+		while (*ptr != 0)
+		{
+			StringView path = .(ptr);
+			fileNames.Add(new String(path));
+			ptr += path.Length + 1;
+		}
+		BFFileDialog_FreeResult(paths);
+
+		DeleteContainerAndItems!(mFileNames);
+		mFileNames = new String[fileNames.Count];
+		for (int i < fileNames.Count)
+			mFileNames[i] = fileNames[i];
+		return .Ok(.OK);
 	}
 }
 
@@ -980,6 +1026,7 @@ public abstract class FileDialog : CommonDialog
 {
 	protected int32 mOptions;
 	private String mFilter ~ delete _;
+	private String mDefaultExt ~ delete _;
 
 	public this()
 	{
@@ -990,6 +1037,7 @@ public abstract class FileDialog : CommonDialog
 	{
 		base.Reset();
 		DeleteAndNullify!(mFilter);
+		DeleteAndNullify!(mDefaultExt);
 	}
 
 	public StringView InitialDirectory
@@ -1050,7 +1098,19 @@ public abstract class FileDialog : CommonDialog
 		}
 	}
 
-	public StringView DefaultExt { get; set; } // Unused kept for compatibility
+	/// Appended to a saved file name that has no extension
+	public StringView DefaultExt
+	{
+		get
+		{
+			return mDefaultExt;
+		}
+
+		set
+		{
+			String.NewOrSet!(mDefaultExt, value);
+		}
+	}
 
 	public void GetFilter(String outFilter)
 	{
@@ -1090,6 +1150,40 @@ public abstract class FileDialog : CommonDialog
 			mOptions |= option;
 		else
 			mOptions &= ~option;
+	}
+
+	protected virtual bool IsSaveDialog => false;
+
+	protected override Result<DialogResult> RunDialog(INativeWindow owner)
+	{
+		// FileName may carry a directory, which is used when no InitialDirectory was given
+		String defaultName = scope .();
+		String initialDir = scope .();
+		if ((mFileNames != null) && (mFileNames.Count > 0))
+		{
+			Path.GetFileName(mFileNames[0], defaultName);
+			Path.GetDirectoryPath(mFileNames[0], initialDir).IgnoreError();
+		}
+		if (!String.IsNullOrEmpty(mInitialDir))
+			initialDir.Set(mInitialDir);
+
+		let result = Try!(RunNativeDialog(IsSaveDialog ? .Save : .Open, Multiselect, initialDir, defaultName, (mFilter != null) ? mFilter : ""));
+
+		if ((result == .OK) && (IsSaveDialog) && (!String.IsNullOrEmpty(mDefaultExt)) && (mFileNames != null))
+		{
+			for (var fileName in mFileNames)
+			{
+				String ext = scope .();
+				Path.GetExtension(fileName, ext);
+				if (ext.IsEmpty)
+				{
+					if (!mDefaultExt.StartsWith('.'))
+						fileName.Append('.');
+					fileName.Append(mDefaultExt);
+				}
+			}
+		}
+		return result;
 	}
 }
 #endif

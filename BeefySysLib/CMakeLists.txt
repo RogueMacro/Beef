@@ -326,8 +326,11 @@ if (${APPLE})
     file(GLOB SRC_FILES_OS
         platform/darwin/BFPlatform.cpp
         platform/darwin/DarwinCommon.cpp
+        platform/darwin/DarwinDialogs.mm
         HeadlessApp.cpp
     )
+    # Objective-C++ (AppKit) shims. Users of these symbols must link -framework AppKit -framework UniformTypeIdentifiers
+    set_source_files_properties(platform/darwin/DarwinDialogs.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 else()
     file(GLOB SRC_FILES_OS
         platform/linux/BFPlatform.cpp
