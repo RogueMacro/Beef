@@ -266,6 +266,46 @@ namespace Beefy.gfx
 		// Effects holding glyphs made from this font's, told when the glyphs go (see FontEffect.Forget).
 		List<FontEffect> mEffectUsers ~ delete _;
 
+#if BF_PLATFORM_MACOS
+
+		// CoreText enumeration in BeefySysLib (platform/darwin/DarwinFonts.cpp)
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BFFont_EnumSystemFonts(function void(char8* family, char8* style, char8* path, int32 isRegular, void* userData) callback, void* userData);
+
+		// Same naming scheme as the fontconfig path: "FAMILY STYLE" for every face, plus "FAMILY" for the regular one
+		static void AddSystemFont(char8* family, char8* style, char8* path, int32 isRegular, void* userData)
+		{
+			let filepath = StringView(path);
+
+			String fontName = scope .(48);
+			fontName.Append(StringView(family));
+			if (style != null)
+			{
+				if (isRegular != 0)
+				{
+					fontName.ToUpper();
+
+					if (sFontNameMap.TryAdd(fontName, let pKey, let pVal))
+					{
+						(*pKey) = new String(fontName);
+						(*pVal) = new String(filepath);
+					}
+				}
+
+				fontName..Append(' ').Append(StringView(style));
+			}
+
+			fontName.ToUpper();
+
+			if (sFontNameMap.TryAdd(fontName, let pKey, let pVal))
+			{
+				(*pKey) = new String(fontName);
+				(*pVal) = new String(filepath);
+			}
+		}
+
+#endif
+
 #if BF_PLATFORM_LINUX
 
 		const String FONTCONFIG_LIB = "libfontconfig.so";
@@ -524,6 +564,8 @@ namespace Beefy.gfx
 						(*pVal) = new String(filepath);
 					}
 				}	 
+#elif BF_PLATFORM_MACOS
+				BFFont_EnumSystemFonts(=> AddSystemFont, null);
 #endif
 			}
 		}

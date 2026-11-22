@@ -327,9 +327,11 @@ if (${APPLE})
         platform/darwin/BFPlatform.cpp
         platform/darwin/DarwinCommon.cpp
         platform/darwin/DarwinDialogs.mm
+        platform/darwin/DarwinFonts.cpp
         HeadlessApp.cpp
     )
-    # Objective-C++ (AppKit) shims. Users of these symbols must link -framework AppKit -framework UniformTypeIdentifiers
+    # Apple framework shims. Users of these symbols must link -framework AppKit -framework UniformTypeIdentifiers
+    # (DarwinDialogs) and -framework CoreText (DarwinFonts)
     set_source_files_properties(platform/darwin/DarwinDialogs.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 else()
     file(GLOB SRC_FILES_OS
