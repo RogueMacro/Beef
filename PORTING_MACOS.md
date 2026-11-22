@@ -159,7 +159,7 @@ What doesn't work yet / not verified:
   (Homebrew has `/opt/homebrew/bin/gdb`), and its `Detach()` calls `BfpSpawn_Kill`, which is `NOT_IMPL` in
   `posix/PosixCommon.cpp:2310`. Part of the deferred debugger work; a cheap guard would be to not offer GDB on macOS.
 - ~~File dialogs return Cancel (stubs).~~ Native now, see Task 6.
-- The "built …" time on the IDE start line shows UTC labelled as local (corlib `ToLocalTime` on macOS?).
+- ~~The "built …" time on the IDE start line shows UTC labelled as local~~ — fixed, see Task 13.
 - `libLLVM.dylib` is linked by absolute Homebrew path (fine for dev, matters for `.app` packaging).
 
 ### Task 6 — native file dialogs (done, needs hands-on testing)
@@ -327,6 +327,44 @@ What doesn't work yet / not verified:
   installed headers; none of its bound names is a log/format-style function. Windows and Linux keep the old
   declarations (they're under `#else`), so nothing changes there.
 
+### Task 13 — local time zone (done, `d48afad7`)
+- Symptom: `DateTime.Now` / `ToLocalTime` gave UTC (the IDE's "built …" line was an hour early here, CET).
+  Cause: `TimeZoneInfo.GetLocalTimeZoneFromTzFile()` was a stub returning `Utc` on **every** non-Windows platform,
+  so Linux had the same bug. Decision (user): parse the tzfile, not libc hooks or a fixed offset.
+- `BeefLibs/corlib/src/TimeZoneInfo.Unix.bf` (`extension TimeZoneInfo`, `#if !BF_PLATFORM_WINDOWS`); the stub in
+  `TimeZoneInfo.bf` is gone, nothing else there changed.
+  - Source: `$TZ` (`:`-prefix stripped; absolute path, else `/usr/share/zoneinfo/<name>`, else parsed as a POSIX TZ
+    string), otherwise `/etc/localtime`. Id from the symlink target after `zoneinfo/` (`Europe/Oslo`), else `Local`.
+    Unreadable or invalid data falls back to UTC as before.
+  - TZif v1–v4: the 64-bit block plus the POSIX footer (`std offset dst [offset],start[/time],end[/time]`, `Mm.w.d`,
+    `Jn`, `n`, quoted `<+03>` names, US rules when a DST name has no rule, like glibc).
+  - The .NET Framework rule model (`AdjustmentRule`: date range, yearly start/end `TransitionTime`, `DaylightDelta`,
+    `BaseUtcOffsetDelta`) can't hold arbitrary transitions, so the code builds one rule per year from the transitions:
+    transitions become "Nth/last weekday" rules so identical years merge (Oslo: 20 rules for 1895–9999). Years whose
+    standard or daylight offset changes, or with several DST periods (Ramadan breaks, WWII double summer time), are
+    split into date ranges at the nearest midnight. Southern-hemisphere years wrap (start > end). The footer becomes
+    an open-ended last rule; times it can't express (`M3.5.0/-1` Nuuk, `M3.4.4/50` Gaza) are expanded exactly until
+    2100, then clamped into the day.
+  - Slim files (`zic -b slim`, common on Linux) end with a no-op transition marking where the footer takes over; the
+    footer only applies after the file's last transition, no-ops included.
+  - Gotcha: a floating `TransitionTime` stores `Day = 1`, so a January transition at 00:00 looks like the existing
+    "year starts/ends in DST" marker (`IsStartDateMarkerForBeginningOfYear`); those use a fixed date.
+- Verified (macOS; scratch harness comparing `ToLocalTime`, `IsDaylightSavingTime` and the local→UTC round trip with
+  libc `localtime_r`, sampled every 7h13m):
+  - all 598 zones, 1970–2038: no crashes; 117 offset differences in 78 zones, each a single sample within 12 hours of a
+    mid-year offset change (rules start at midnight); 4 round-trip failures, each the hour before a permanent switch
+    out of DST at the same offset (Yukon 2020, Damascus 2022), which the model treats as a fall-back hour.
+  - Python `zoneinfo`: offset changes identical to 2160 for Oslo, Sydney, New York, Casablanca, to 2100 for Gaza and
+    Nuuk (macOS libc ignores DST after 2037 for Nuuk: it can't parse the v3 footer's negative time).
+  - `TZ` forms (`EST5EDT`, `CET-1CEST,M3.5.0,M10.5.0/3`, `<+0330>-3:30`, negative DST `IST-1GMT0,...`, `:Europe/Paris`,
+    absolute path, bogus → UTC); slim vs fat builds of the same source (zic) give identical results.
+  - IDE start line: "built 11/22/2026 at 11:43 PM" = the binary's local mtime. `./bin/build.sh ide` passes (201/201 +
+    1/1, Debug and Release).
+- Known limits: the DST flag is false for all-year DST (war time) and for DST at the standard offset (Moscow 1991),
+  offsets are right; offsets rounded to whole minutes (local mean time only). **Linux not tested** (no Linux box/VM
+  here; Docker isn't running) — same file format, code paths and system paths, but `/etc/localtime` copies (not
+  symlinks) give Id `Local`.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
@@ -352,7 +390,7 @@ What doesn't work yet / not verified:
    Without LLDB (no Xcode/CLT or no headers) the GDB fallback still crashes (`BfpSpawn_Kill` NOT_IMPL).
 5. ~~Non-variadic `extern`s of variadic C functions~~: audited, curl fixed (Task 12). Any new `extern` of a
    variadic C function has to be declared with `...` on Apple.
-6. `ToLocalTime` on macOS; `LIBRARY_PATH` needed for hand-run IDE builds.
+6. ~~`ToLocalTime` on macOS~~ (Task 13); `LIBRARY_PATH` needed for hand-run IDE builds.
 
 ## Build commands that work
 
