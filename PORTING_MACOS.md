@@ -118,7 +118,7 @@ Corrections / new facts:
 
 | Site | What it does on Linux | macOS plan | Status |
 | --- | --- | --- | --- |
-| `Beefy2D/src/gfx/Font.bf` 269/456 | fontconfig (`libfontconfig.so`, AllowFail) builds a family-name → file map for system fonts | Without it the map is empty, but the IDE still works: "Segoe UI" falls through `AddFontFailEntry` to bundled `IDE/dist/fonts/NotoSans-*.ttf`, code font is bundled SourceCodePro. Lost: emoji/symbol fallbacks and user-chosen system fonts by name. Options: (a) CoreText (`CTFontManagerCopyAvailableFontURLs` + descriptor attributes) — needs Apple-framework FFI from Beef; (b) reuse the fontconfig path with Homebrew `fontconfig` (needs the same dyld search-path trick as SDL); (c) scan `/System/Library/Fonts`, `/Library/Fonts`, `~/Library/Fonts` by filename (cheap, approximate). | **Needs decision** (recommend CoreText, tied to the "how to call Apple APIs" decision) |
+| `Beefy2D/src/gfx/Font.bf` 269/456 | fontconfig (`libfontconfig.so`, AllowFail) builds a family-name → file map for system fonts | Without it the map is empty, but the IDE still works: "Segoe UI" falls through `AddFontFailEntry` to bundled `IDE/dist/fonts/NotoSans-*.ttf`, code font is bundled SourceCodePro. Lost: emoji/symbol fallbacks and user-chosen system fonts by name. Options: (a) CoreText (`CTFontManagerCopyAvailableFontURLs` + descriptor attributes) — needs Apple-framework FFI from Beef; (b) reuse the fontconfig path with Homebrew `fontconfig` (needs the same dyld search-path trick as SDL); (c) scan `/System/Library/Fonts`, `/Library/Fonts`, `~/Library/Fonts` by filename (cheap, approximate). | Done: CoreText shim (`fd26c3c1`), see Task 7 |
 | `IDEApp.bf` 126 / 13819 | embeds `Resources/beeflang.png`, `BFApp_RegisterAppIcon` → `SDL_SetWindowIcon` | Same on macOS (SDL sets the Dock icon) | Done (`0278d44c`) |
 | `IDEApp.bf` 137 | platform names | already had `BF_PLATFORM_MACOS` → `macOS` | No change |
 | `Workspace.bf` 147 | `GetHostPlatform` | already has `BF_PLATFORM_MACOS` | No change |
@@ -150,6 +150,7 @@ What works (verified with `BeefIDE_d -mcp=<port> -deterministic -workspace=<dir>
   (126 modules, links, exe prints "Hello from Beef on macOS"), and **Start Without Debugging**.
 
 What doesn't work yet / not verified:
+- ~~Visual check~~ — user confirmed the window draws correctly (2026-11-22).
 - **I couldn't look at the pixels myself.** No Screen Recording permission for `screencapture`; the MCP
   `screenshot` tool's default path calls `GLRenderDevice::CreateRenderTarget` = `NOT_IMPL` (throws, aborts
   the IDE; upstream, Linux too). `screen=true` uses `glReadPixels` on the back buffer after the swap, which is
@@ -157,9 +158,46 @@ What doesn't work yet / not verified:
 - **Start Debugging** aborts the IDE: with no LLDB on Apple, `DebugManager` falls back to `GDBDebugger`
   (Homebrew has `/opt/homebrew/bin/gdb`), and its `Detach()` calls `BfpSpawn_Kill`, which is `NOT_IMPL` in
   `posix/PosixCommon.cpp:2310`. Part of the deferred debugger work; a cheap guard would be to not offer GDB on macOS.
-- File dialogs return Cancel (stubs).
+- ~~File dialogs return Cancel (stubs).~~ Native now, see Task 6.
 - The "built …" time on the IDE start line shows UTC labelled as local (corlib `ToLocalTime` on macOS?).
 - `libLLVM.dylib` is linked by absolute Homebrew path (fine for dev, matters for `.app` packaging).
+
+### Task 6 — native file dialogs (done, needs hands-on testing)
+- Decision (user, 2026-11-22): Apple APIs go through small shims in `BeefySysLib/platform/darwin`,
+  exported with `BF_EXPORT`, not through the Objective-C runtime from Beef.
+- `BeefySysLib/platform/darwin/DarwinDialogs.mm` (ARC): `BFFileDialog_Show(kind, flags, title, initialDir,
+  defaultName, filter, &outPaths)` → -1 error / 0 cancel / 1 OK; paths come back NUL-separated, double-NUL
+  terminated; `BFFileDialog_FreeResult` frees them. Runs `NSOpenPanel`/`NSSavePanel` `runModal` on the calling
+  (main) thread, then gives key focus back to the previous window.
+- Filters: the Windows-style string goes through unchanged. Several filters → "Format:" popup accessory, first
+  selected (like Windows). Open panels match with `fnmatch(FNM_CASEFOLD)` in `panel:shouldEnableURL:`, so exact
+  names (`BeefProj.toml`) work; save panels get the filter's `*.ext` as `allowedContentTypes` (with
+  `allowsOtherFileTypes`). Folder dialogs ignore filters. NSSavePanel always asks before overwriting.
+- corlib (`FileDialog.bf` macOS branch): `CommonDialog.RunNativeDialog`, `FileDialog.RunDialog` (FileName may carry a
+  directory, used when `InitialDirectory` isn't set; `DefaultExt` appended on save when the name has no extension;
+  `DefaultExt` is now stored as an owned string), `SaveFileDialog.IsSaveDialog`, `FolderBrowserDialog.RunDialog`.
+- Linking: corlib's macOS dialogs now reference BeefySysLib symbols, so a program using them must link BeefySysLib
+  and `-framework AppKit -framework UniformTypeIdentifiers`. Beefy2D's macOS configs add the frameworks. A plain
+  corlib-only program that uses the dialogs gets a link error (before this it didn't compile at all).
+- Verified: shim compiles warning-free; IDE links; "Open File" brings up a modal panel window (CGWindowList shows a new
+  800×448 window at the modal layer). **Not verified:** clicking through (needs a human): picking files, multi-select,
+  the Format popup, save with/without extension, folder pick, Cancel, and that keyboard state is sane afterwards.
+
+### Task 7 — system fonts via CoreText (done)
+- `BeefySysLib/platform/darwin/DarwinFonts.cpp` (plain C++, CoreText is a C API): `BFFont_EnumSystemFonts(callback,
+  userData)` walks `CTFontCollectionCreateFromAvailableFonts`, reports family, style, file path and "regular"
+  (no bold/italic trait, weight ≈ 0). Families starting with `.` (private UI fonts) are skipped.
+- Faces inside `.ttc` collections get `path@index` (FTFont already parses that on every platform). The index comes from
+  matching the PostScript name against `CTFontManagerCreateFontDescriptorsFromURL`, cached per file. Checked against
+  FreeType: 841 TTC faces, family/style match on all but one (Galvji names "Oblique" vs "Italic"). The private
+  `PingFangUI.ttc` lists more descriptors than faces, so indices ≥144 there don't open; nobody should pick those.
+- `Font.bf`: `#elif BF_PLATFORM_MACOS` in `BuildFontNameCache` calls it; `AddSystemFont` uses the same naming as the
+  fontconfig path. Beefy2D's macOS configs add `-framework CoreText`.
+- Verified: with editor `Fonts = ["Menlo", "?Apple Symbols"]` the IDE opens `/System/Library/Fonts/Menlo.ttc` and
+  `Apple Symbols.ttf` (lsof). UI fonts still come from bundled Noto via the "Segoe UI" fail entry, as on Linux.
+- Not done: mapping the IDE's default alternates (`?Segoe UI Symbol/Historic/Emoji`) to Apple equivalents. "Apple
+  Symbols" would be easy; "Apple Color Emoji" is an sbix color font and I haven't checked Beefy's FreeType path
+  handles it.
 
 ## Decisions
 
@@ -169,14 +207,16 @@ What doesn't work yet / not verified:
   IDEHelper and hunspell fine; the only failure was BeefBoot's `-lLLVM-22` link, which the *original*
   build.sh already handles by exporting `LIBRARY_PATH` on Darwin. So upstream build.sh + these commits should
   suffice (not yet re-run end-to-end with your edit reverted).
-- Dialog stubs follow the Linux API surface; the native work only needs to implement `RunDialog`.
+- Dialogs follow the Linux API surface; the macOS work lives in `RunDialog`.
+- Apple APIs: Obj-C++/C++ shims in `BeefySysLib/platform/darwin`, `BF_EXPORT`ed, linked frameworks listed in
+  Beefy2D's macOS configs (user decision).
 - SDL stays dlopen'ed (no link-time dependency), with Homebrew prefixes as a fallback search path.
 
 ## Open problems / next
 
-1. Visual check of the window (or implement GL `CreateRenderTarget` so MCP screenshots work).
-2. Native dialogs (NSOpenPanel/NSSavePanel) — needs the "how to call AppKit" decision.
-3. System font lookup (CoreText) — same decision.
+1. Hands-on test of the native dialogs (see Task 6).
+2. GL `CreateRenderTarget` so MCP screenshots work (would make UI work verifiable without a human).
+3. Map the default "Segoe UI Symbol/Emoji" alternates to Apple fonts.
 4. Debugger: LLDB on Apple; meanwhile avoid the GDB fallback crash (`BfpSpawn_Kill` NOT_IMPL).
 5. Non-variadic `extern` declarations of variadic C functions (`ioctl`, `fcntl`, `open`, `printf`...) are broken
    on Apple arm64. Socket's is fixed; worth a corlib-wide audit.
