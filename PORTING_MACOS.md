@@ -218,11 +218,21 @@ What doesn't work yet / not verified:
   text); `all=true` composites the main window plus an open File menu; repeated captures fine; `pixel_probe` works.
   So UI changes can now be checked without a human.
 
-### Found while testing (not fixed yet)
-- **Popup menu placement on Retina:** with the main window client area at (194, 72) pt, the File menu window
-  opens at (95, 54) pt (CGWindowList), i.e. ~100 pt left and ~18 pt above where it should be. The IDE reports
-  the popup at (-99, -18). Looks like a points vs pixels mix-up in popup positioning (macOS SDL window positions
-  are in points; the IDE works in pixels at scale 2).
+### Task 9 — popup placement on Retina (done, `8ad2fd07`)
+- Symptom: with the main client area at (194, 72) pt, the File menu opened at (95, 54) pt.
+- Cause: Beefy's window coordinates are pixels (creation, `Resize`, `GetPlacement`, mouse events all convert to/from
+  SDL logical units), but `SdlBFWindow::GetPosition` returned SDL's *logical* position alongside pixel sizes.
+  Popups are placed from the parent's reported position + pixel offsets, then halved → half the window offset.
+  Linux X11 usually runs at scale 1, which hides it.
+- Fix: `GetPosition` converts to pixels (`SDLLogicalToPixel`). Also `GetDesktopResolution` applies the display
+  mode's `pixel_density`, and `GetWorkspaceRectFrom` compares its pixel rect with *pixel* display bounds (each
+  display's scaled bounds computed once — `SDLGetDisplayScale` creates a probe window per call).
+- Verified (CGWindowList vs IDE): File menu at (192, 90) pt right under the menu bar; File ▸ Open submenu beside it
+  at the Open row; autocomplete list just below the insertion point.
+- Known, left alone: SDL3 reports popup (menu/tooltip) positions **relative to the parent**, so `BFWindow.mX/mY` of
+  popups are parent-relative on every platform; window creation compensates. Only visible effect found: the MCP
+  `screenshot all=true` composite draws popups at the wrong place. Making popup positions absolute would mean
+  changing creation/move/resize together and re-testing Linux.
 
 ## Decisions
 
@@ -240,7 +250,7 @@ What doesn't work yet / not verified:
 ## Open problems / next
 
 1. Hands-on test of the native dialogs (see Task 6).
-2. Popup/menu placement on Retina (see "Found while testing").
+2. (optional) Absolute popup positions, so MCP `all=true` composites are right (see Task 9).
 3. Map the default "Segoe UI Symbol/Emoji" alternates to Apple fonts.
 4. Debugger: LLDB on Apple; meanwhile avoid the GDB fallback crash (`BfpSpawn_Kill` NOT_IMPL).
 5. Non-variadic `extern` declarations of variadic C functions (`ioctl`, `fcntl`, `open`, `printf`...) are broken
