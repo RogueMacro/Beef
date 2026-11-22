@@ -1039,7 +1039,11 @@ BFWindow* SdlBFApp::CreateNewWindow(BFWindow* parent, const StringImpl& title, i
 
 void SdlBFWindow::GetPosition(int* x, int* y, int* width, int* height, int* clientX, int* clientY, int* clientWidth, int* clientHeight)
 {
-	bf_SDL_GetWindowPosition(mSDLWindow, x, y);
+	// SDL positions are logical (points on macOS); callers work in pixels, like the sizes below
+	int logicalX = 0;
+	int logicalY = 0;
+	bf_SDL_GetWindowPosition(mSDLWindow, &logicalX, &logicalY);
+	SDLLogicalToPixel(mSDLWindow, logicalX, logicalY, x, y);
 	bf_SDL_GetWindowSizeInPixels(mSDLWindow, width, height);
 
 	if (clientX)
@@ -1051,7 +1055,7 @@ void SdlBFWindow::GetPosition(int* x, int* y, int* width, int* height, int* clie
 	if (clientHeight)
 		*clientHeight = *height;
 
-	if ((mParent == NULL) && (*x == 0) && (*y == 0))
+	if ((mParent == NULL) && (logicalX == 0) && (logicalY == 0))
 	{
 		SDL_PropertiesID props = bf_SDL_GetWindowProperties(mSDLWindow);
 		if (bf_SDL_HasProperty(props, "SDL.window.wayland.surface"))
@@ -1464,28 +1468,34 @@ void SdlBFApp::GetDesktopResolution(int& width, int& height)
 		SDL_DisplayMode* displayMode = bf_SDL_GetDesktopDisplayMode(display);
 		if (displayMode != NULL)
 		{
-			width = displayMode->w;
-			height = displayMode->h;
+			// Display mode sizes are logical; pixel_density maps them to pixels
+			float density = (displayMode->pixel_density > 0) ? displayMode->pixel_density : 1.0f;
+			width = (int)(displayMode->w * density + 0.5f);
+			height = (int)(displayMode->h * density + 0.5f);
 			//printf("Desktop: %d,%d %dx%d\n", 0, 0, width, height);
 		}
 	}
 }
 
-static bool InflateRectToMonitor(SDL_DisplayID monitor, AdjustedMonRect* inflatedRect)
+// Display bounds in the pixel space windows are positioned in
+static bool GetDisplayPixelBounds(SDL_DisplayID monitor, SDL_Rect* bounds)
 {
-	SDL_Rect bounds;
-	if(!bf_SDL_GetDisplayBounds(monitor, &bounds))
+	if (!bf_SDL_GetDisplayBounds(monitor, bounds))
 		return false;
 
 	float scale = SDLGetDisplayScale(monitor);
 	if (scale > 1.0f)
 	{
-		bounds.x = (int)(bounds.x * scale + 0.5f);
-		bounds.y = (int)(bounds.y * scale + 0.5f);
-		bounds.w = (int)(bounds.w * scale + 0.5f);
-		bounds.h = (int)(bounds.h * scale + 0.5f);
+		bounds->x = (int)(bounds->x * scale + 0.5f);
+		bounds->y = (int)(bounds->y * scale + 0.5f);
+		bounds->w = (int)(bounds->w * scale + 0.5f);
+		bounds->h = (int)(bounds->h * scale + 0.5f);
 	}
+	return true;
+}
 
+static void InflateRectToBounds(const SDL_Rect& bounds, AdjustedMonRect* inflatedRect)
+{
 	//printf("Monitor %d: %d,%d %dx%d\n", monitor, bounds.x, bounds.y, bounds.w, bounds.h);
 
 	inflatedRect->mMonCount++;
@@ -1510,8 +1520,6 @@ static bool InflateRectToMonitor(SDL_DisplayID monitor, AdjustedMonRect* inflate
 	}
 
 	//printf("Inflated: %d,%d %dx%d\n", inflatedRect->mX, inflatedRect->mY, inflatedRect->mWidth, inflatedRect->mHeight);
-
-	return true;
 }
 
 void SdlBFApp::GetWorkspaceRect(int& x, int& y, int& width, int& height)
@@ -1527,7 +1535,9 @@ void SdlBFApp::GetWorkspaceRect(int& x, int& y, int& width, int& height)
 
     for (int i = 0; i < displayCount; i++)
 	{
-        InflateRectToMonitor(displays[i], &inflateRect);
+		SDL_Rect bounds;
+		if (GetDisplayPixelBounds(displays[i], &bounds))
+			InflateRectToBounds(bounds, &inflateRect);
     }
     bf_SDL_free(displays);
 
@@ -1550,10 +1560,10 @@ void SdlBFApp::GetWorkspaceRectFrom(int fromX, int fromY, int fromWidth, int fro
 
     for (int i = 0; i < displayCount; i++)
 	{
-		bf_SDL_GetDisplayBounds(displays[i], &bounds);
-		if (bf_SDL_HasRectIntersection(&clip, &bounds))
+		// 'clip' is in pixels, so compare against pixel bounds
+		if ((GetDisplayPixelBounds(displays[i], &bounds)) && (bf_SDL_HasRectIntersection(&clip, &bounds)))
 		{
-        	InflateRectToMonitor(displays[i], &inflateRect);
+			InflateRectToBounds(bounds, &inflateRect);
 		}
     }
     bf_SDL_free(displays);
