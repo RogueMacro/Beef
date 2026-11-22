@@ -202,6 +202,28 @@ What doesn't work yet / not verified:
   Symbols" would be easy; "Apple Color Emoji" is an sbix color font and I haven't checked Beefy's FreeType path
   handles it.
 
+### Task 8 — GL render targets (done)
+- `GLRenderDevice::CreateRenderTarget`, `GLTexture::PhysSetAsTarget`, `GLTexture::GetBits` were `NOT_IMPL`
+  (shared SDL backend, so Linux too). Now: texture + one FBO per GL context (FBOs aren't shared; the main and
+  transparent-window contexts are different), optional depth / depth-stencil renderbuffer. Formats per the
+  `RenderTargetFlags` bits DX uses. Not yet: Mipmaps, Shared, UnorderedAccess, MSAA (renders single-sampled).
+- Orientation: texture targets use a flipped ortho projection so texel row 0 = image top (same as uploaded
+  textures, so drawing a render target as an image isn't upside down, and `GetBits` reads top-down with no
+  flip). Scissor isn't y-flipped for textures; `glFrontFace` switches to CW to keep culling right.
+- `PhysSetRenderState` takes projection/scissor size from the bound target (`mPhysTargetWidth/Height`) instead of
+  `mPhysRenderWindow`; a target change sets `mPhysTargetDirty` so the next batch reapplies its state even if the
+  render state object is the same (`DrawToRenderTarget` sets the default state *before* binding the target).
+- Window targets rebind FBO 0 only after a texture target was bound (desktop GL only; ES2 keeps `NOT_IMPL`).
+- Verified via MCP: default `screenshot` (offscreen) renders the full IDE correctly (orientation, colors, clipping,
+  text); `all=true` composites the main window plus an open File menu; repeated captures fine; `pixel_probe` works.
+  So UI changes can now be checked without a human.
+
+### Found while testing (not fixed yet)
+- **Popup menu placement on Retina:** with the main window client area at (194, 72) pt, the File menu window
+  opens at (95, 54) pt (CGWindowList), i.e. ~100 pt left and ~18 pt above where it should be. The IDE reports
+  the popup at (-99, -18). Looks like a points vs pixels mix-up in popup positioning (macOS SDL window positions
+  are in points; the IDE works in pixels at scale 2).
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
@@ -218,7 +240,7 @@ What doesn't work yet / not verified:
 ## Open problems / next
 
 1. Hands-on test of the native dialogs (see Task 6).
-2. GL `CreateRenderTarget` so MCP screenshots work (would make UI work verifiable without a human).
+2. Popup/menu placement on Retina (see "Found while testing").
 3. Map the default "Segoe UI Symbol/Emoji" alternates to Apple fonts.
 4. Debugger: LLDB on Apple; meanwhile avoid the GDB fallback crash (`BfpSpawn_Kill` NOT_IMPL).
 5. Non-variadic `extern` declarations of variadic C functions (`ioctl`, `fcntl`, `open`, `printf`...) are broken
