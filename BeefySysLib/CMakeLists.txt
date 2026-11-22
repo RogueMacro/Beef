@@ -109,6 +109,16 @@ endif(NOT MSVC)
 
 if (DEFINED BF_ENABLE_SDL)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBF_ENABLE_SDL")
+  if (${APPLE})
+    # SDL3 is loaded at runtime, so only its headers are needed here. Homebrew's include dir
+    # isn't on the default search path (notably /opt/homebrew on Apple Silicon).
+    find_path(SDL3_INCLUDE_DIR SDL3/SDL.h HINTS /opt/homebrew/include /usr/local/include)
+    if (SDL3_INCLUDE_DIR)
+      include_directories(SYSTEM ${SDL3_INCLUDE_DIR})
+    else()
+      message(FATAL_ERROR "SDL3 headers not found. Install SDL3 (for example 'brew install sdl3').")
+    endif()
+  endif()
 endif()
 
 ################ Files ################
