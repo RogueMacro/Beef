@@ -304,6 +304,29 @@ What doesn't work yet / not verified:
   sections of hot objects are left unloaded, as on Linux); `sBfTypeData` whose size changed isn't updated (logged,
   same as Linux); a method already running (e.g. `Main`'s loop) keeps running its old code until it's re-entered.
 
+### Task 12 — variadic C externs audit (done, `aac4bf01`)
+- Why it matters: Apple arm64 passes variadic arguments on the stack, while a Beef `extern` with fixed parameters puts
+  them in registers. Linux arm64 and x64 use registers for both, so these bugs only show up on Apple.
+- Method: collect every Beef `extern` name and `LinkName("...")` target in `BeefLibs`, `IDE/src`, `BeefBuild/src` and
+  `IDEHelper/Tests` (≈2900 + 940), then match them against prototypes ending in `...` in the macOS SDK, Homebrew
+  headers (curl, SDL2, SDL3, libgit2, fontconfig) and the BeefySysLib/BeefRT/IDEHelper headers. Script:
+  regex over comment-stripped headers, kept in the session scratchpad (not committed).
+- Hits:
+  - `curl_easy_setopt` / `curl_easy_getinfo` (`BeefLibs/curl/src/Curl.bf`): **broken**. The first `SetOpt` returned
+    `BadFunctionArgument`, so `Transfer.Init` died on the unhandled result. Fixed: declared with `...` under
+    `BF_PLATFORM_MACOS || BF_PLATFORM_IOS`, like `ioctl` in Socket (`b595ed18`). Other platforms unchanged.
+    The IDE itself doesn't call curl (only a commented-out block in BeefBuild does), so this affected user programs.
+  - `ioctl` (Socket): fixed earlier.
+  - SDL2 `SDL_Log*` / `SDL_SetError`: declared with only the format string, and callers pass no variadic arguments,
+    so the fixed-argument ABI matches. Left alone (a `%` in the message is a format bug on every platform).
+  - fontconfig `FcObjectSetBuild`, sd-bus, emscripten, the `sprintf` test: already declared with `...`.
+  - No variadic functions among the BeefySysLib/BeefRT/IDEHelper exports.
+- Verified with a scratch program (curl Transfer over a local `file://` URL, plus an Easy `SetOpt`/`Perform`/
+  `GetInfo(.EffectiveUrl)` on a missing file): before the fix it aborted with `BadFunctionArgument`, after it all
+  three paths pass. The IDE still builds. MiniZ's externs are libc and were covered by the SDK scan. FMOD has no
+  installed headers; none of its bound names is a log/format-style function. Windows and Linux keep the old
+  declarations (they're under `#else`), so nothing changes there.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
@@ -327,8 +350,8 @@ What doesn't work yet / not verified:
 4. Debugger follow-ups (Task 10/11): Mach-O/arm64 `DebugTarget`, step-out location check, evaluating statics added
    by a hot compile.
    Without LLDB (no Xcode/CLT or no headers) the GDB fallback still crashes (`BfpSpawn_Kill` NOT_IMPL).
-5. Non-variadic `extern` declarations of variadic C functions (`ioctl`, `fcntl`, `open`, `printf`...) are broken
-   on Apple arm64. Socket's is fixed; worth a corlib-wide audit.
+5. ~~Non-variadic `extern`s of variadic C functions~~: audited, curl fixed (Task 12). Any new `extern` of a
+   variadic C function has to be declared with `...` on Apple.
 6. `ToLocalTime` on macOS; `LIBRARY_PATH` needed for hand-run IDE builds.
 
 ## Build commands that work
