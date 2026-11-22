@@ -283,6 +283,8 @@ public:
 	uint64 mHotTlsExtraOffset;                       // __BFTLS_EXTRA, reserved for new thread-local variables
 	uint64 mHotTlsExtraSize;
 	uint64 mHotTlsExtraUsed;
+	uint64 mHotTlvThunk;                             // macOS: the base module's TLV descriptor thunk and key, for new
+	uint64 mHotTlvKey;                               //  thread-local variables' descriptors (see HotLoadExeTlsInfo)
 	Dictionary<String, uint64> mHotTlsDemangled;        // demangled thread-local names → TLS offset (for evaluation)
 	bool mHotTlsDemangledValid;
 	Array<HotImage> mHotImages;                      // each hot-loaded object's memory, until freed
@@ -343,6 +345,9 @@ protected:
 	bool HotFindCanonicalSymbol(const StringImpl& name, HotSymbol& outSymbol);
 	bool HotResolveExternal(const StringImpl& name, uint64& outAddr, String& outError);
 	bool HotResolveObjectSymbol(LLDBHotObject* obj, int symIdx, Array<HotPatch>& patches, uint64& outAddr, String& outError);
+	uint64 HotBindDefinition(const StringImpl& name, uint64 addr, uint64 size, bool isCode, Array<HotPatch>& patches);
+	bool HotFillTlvDescriptors(LLDBHotObject* obj, String& outError);
+	bool HotProtectImages(const Array<LLDBHotObject*>& objects, String& outError);
 	bool HotParseObject(LLDBHotObject* obj, String& outError);
 	bool HotPrepareObject(LLDBHotObject* obj, Array<HotPatch>& patches, String& outError);
 	void HotChooseBaseModule(const Array<LLDBHotObject*>& objects);
@@ -423,6 +428,7 @@ public:
 	virtual intptr GetDbgAllocHeapSize() override;
 	virtual String GetDbgAllocInfo() override;
 	void DoLaunch();
+	void CreateDsym();
 	static void BFP_CALLTYPE LaunchThreadProc(void* param);
 	void WaitForLaunchThread();
 	static void BFP_CALLTYPE PendingEvalThreadProc(void* param);
