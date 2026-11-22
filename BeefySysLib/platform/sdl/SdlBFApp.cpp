@@ -149,6 +149,21 @@ static BfpDynLib* GetSDLModule(const StringImpl& installDir)
 		path.Insert(0, installDir);
 #endif
 		gSDLModule = BfpDynLib_Load(path.c_str());
+#ifdef __APPLE__
+		// dyld doesn't search Homebrew's lib dirs by default, so also try next to the executable
+		// and the standard Homebrew prefixes
+		if (gSDLModule == NULL)
+		{
+			String searchDirs[] = { installDir, "/opt/homebrew/lib/", "/usr/local/lib/" };
+			for (auto& searchDir : searchDirs)
+			{
+				String checkPath = searchDir + "libSDL3.dylib";
+				gSDLModule = BfpDynLib_Load(checkPath.c_str());
+				if (gSDLModule != NULL)
+					break;
+			}
+		}
+#endif
 		if (gSDLModule == NULL)
 		{
 #ifdef BF_PLATFORM_WINDOWS
@@ -331,14 +346,19 @@ SdlBFWindow::SdlBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 	bf_SDL_StartTextInput(mSDLWindow);
 
 #ifndef BF_PLATFORM_OPENGL_ES2
-	int contextFlags = SDL_GL_CONTEXT_PROFILE_CORE;
+	int contextFlags = 0;
 #ifdef _DEBUG
 	contextFlags |= SDL_GL_CONTEXT_DEBUG_FLAG;
+#endif
+#ifdef __APPLE__
+	// macOS only provides 3.2+ core contexts when forward-compatible is requested
+	contextFlags |= SDL_GL_CONTEXT_FORWARD_COMPATIBLE_FLAG;
 #endif
 
 	bf_SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
 	bf_SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-	bf_SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, contextFlags);
+	bf_SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+	bf_SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, contextFlags);
 #endif // BF_PLATFORM_OPENGL_ES2
 
 	SDL_GLContext glContext = sdlApp->GetGLContext(mSDLWindow, (windowFlags & BFWINDOW_DEST_ALPHA) != 0);
