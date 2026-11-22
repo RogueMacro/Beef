@@ -31,6 +31,10 @@ void LLDBDebugger::HostUnsupported(const char* name)
 
 void LLDBDebugger::HostSyncModules()
 {
+#ifdef __APPLE__
+	// DebugTarget reads neither Mach-O images nor arm64 frames yet, so LLDB answers every query
+	return;
+#endif
 	if ((!mLLDBTarget.IsValid()) || (!mLLDBProcess.IsValid()))
 		return;
 	if (mDebugTarget == NULL)
@@ -134,6 +138,10 @@ void LLDBDebugger::HostReadFrameRegisters(lldb::SBFrame& frame, CPURegisters* re
 void LLDBDebugger::HostBuildCallStack()
 {
 	HostClearCallStack();
+#ifdef __APPLE__
+	// See HostSyncModules - there's no DebugTarget to map these frames onto
+	return;
+#endif
 	if (mLLDBFrames.IsEmpty())
 		return;
 	HostSyncModules();

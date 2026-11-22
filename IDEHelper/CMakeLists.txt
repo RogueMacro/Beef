@@ -192,19 +192,37 @@ endif()
 
 option(BF_DBG_HOST "Build the Beef debug info and expression evaluation layer" ON)
 
-if(UNIX AND NOT APPLE)
-  find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h HINTS ${LLVM_INCLUDE_DIRS})
-  find_library(LLDB_LIBRARY NAMES lldb-22 liblldb-22 lldb liblldb HINTS ${LLVM_LIBRARY_DIRS})
+if(UNIX)
+  if (APPLE)
+    # Link Apple's LLDB.framework (from Xcode or the Command Line Tools), which keeps its LLVM internal. Homebrew's
+    # liblldb links Homebrew's newer libLLVM, and that can't share a process with the LLVM 22 we link: its
+    # expression parser crashes. Apple ships no SB API headers, so those come from Homebrew's 'lldb' formula -
+    # the SB API is ABI stable.
+    execute_process(COMMAND xcode-select -p OUTPUT_VARIABLE XCODE_DEVELOPER_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    find_library(LLDB_LIBRARY NAMES LLDB PATHS "${XCODE_DEVELOPER_DIR}/../SharedFrameworks" "${XCODE_DEVELOPER_DIR}/Library/PrivateFrameworks" NO_DEFAULT_PATH)
+    find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h PATHS /opt/homebrew/opt/lldb/include /usr/local/opt/lldb/include NO_DEFAULT_PATH)
+    if (LLDB_LIBRARY)
+      get_filename_component(LLDB_FRAMEWORK_DIR "${LLDB_LIBRARY}" DIRECTORY)
+      set(LLDB_LINK_FLAGS "-F${LLDB_FRAMEWORK_DIR} -framework LLDB -Wl,-rpath,${LLDB_FRAMEWORK_DIR}")
+    endif()
+  else()
+    find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h HINTS ${LLVM_INCLUDE_DIRS})
+    find_library(LLDB_LIBRARY NAMES lldb-22 liblldb-22 lldb liblldb HINTS ${LLVM_LIBRARY_DIRS})
+    set(LLDB_LINK_FLAGS "${LLDB_LIBRARY}")
+  endif()
 
   if (NOT BF_DBG_HOST)
-    message(WARNING "BF_DBG_HOST is OFF; Linux IDE debugger support will be disabled")
+    message(WARNING "BF_DBG_HOST is OFF; IDE debugger support will be disabled")
   elseif (LLDB_INCLUDE_DIR AND LLDB_LIBRARY)
     message(STATUS "Found LLDB: ${LLDB_LIBRARY}")
+    include_directories(SYSTEM ${LLDB_INCLUDE_DIR})
     add_definitions(-DLLDB_ENABLED)
-    string(APPEND TARGET_LIBS_OS " ${LLDB_LIBRARY}")
+    string(APPEND TARGET_LIBS_OS " ${LLDB_LINK_FLAGS}")
     string(STRIP ${TARGET_LIBS_OS} TARGET_LIBS_OS)
+  elseif (APPLE)
+    message(WARNING "LLDB was not found (needs Xcode or the Command Line Tools, and 'brew install lldb' for headers); IDE debugger support will be disabled")
   else()
-    message(WARNING "LLDB was not found; Linux IDE debugger support will be disabled")
+    message(WARNING "LLDB was not found; IDE debugger support will be disabled")
   endif()
 
 endif()

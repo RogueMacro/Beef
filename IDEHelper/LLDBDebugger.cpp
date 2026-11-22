@@ -9,7 +9,7 @@
 #pragma comment(lib, "liblldb.lib")
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 #include <limits.h>
 #include <unistd.h>
 // LLVM's demangler rather than <cxxabi.h>: LLVM's include directory comes first, and when it holds libc++abi's
@@ -19,10 +19,14 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#endif
+#ifdef __linux__
 #include <elf.h>
 #endif
 #ifdef __APPLE__
 #include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <libproc.h>
 #endif
 
 #ifndef MAX_PATH
@@ -553,7 +557,7 @@ void LLDBDebugger::DoLaunch()
 	// the counterpart of its output being echoed there (see PumpTargetOutput). Otherwise LLDB gives it a
 	// pty that nothing writes to.
 	String stdinPath;
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 	if ((mOpenFileFlags & DbgOpenFileFlag_RedirectStdInput) == 0)
 	{
 		const char* ttyPath = isatty(STDIN_FILENO) ? ttyname(STDIN_FILENO) : NULL;
@@ -626,6 +630,11 @@ bool LLDBDebugger::Attach(int processId, BfDbgAttachFlags attachFlags)
 	if (len <= 0)
 		return false;
 	exePath = String(linkPath, (int)len);
+#elif defined(__APPLE__)
+	char pidPath[PROC_PIDPATHINFO_MAXSIZE];
+	if (proc_pidpath(processId, pidPath, sizeof(pidPath)) <= 0)
+		return false;
+	exePath = pidPath;
 #endif
 	if (exePath.IsEmpty())
 		return false;
@@ -674,7 +683,7 @@ void LLDBDebugger::GetStdHandles(BfpFile** outStdIn, BfpFile** outStdOut, BfpFil
 // group while it runs; the IDE doesn't read the terminal itself.
 void LLDBDebugger::GiveTerminalToTarget(const StringImpl& ttyPath, int pid)
 {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 	pid_t targetGroup = getpgid(pid);
 	if (targetGroup <= 0)
 		return;
@@ -709,7 +718,7 @@ void LLDBDebugger::GiveTerminalToTarget(const StringImpl& ttyPath, int pid)
 
 void LLDBDebugger::RestoreTerminal()
 {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 	if (mTerminalFd < 0)
 		return;
 	sigset_t blockSet;
@@ -729,7 +738,7 @@ void LLDBDebugger::CreateOutputPipes()
 {
 	CloseOutputPipes();
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 	auto _CreatePipe = [&](int& outWriteFd, BfpFile*& outReadFile)
 	{
 		static int sPipeIdx = 0;
@@ -738,7 +747,7 @@ void LLDBDebugger::CreateOutputPipes()
 		if (mkfifo(path.c_str(), 0600) != 0)
 			return;
 
-		// Opening a FIFO read/write doesn't block on Linux, and gives the read end a writer to open against
+		// Opening a FIFO read/write doesn't block on Linux or macOS, and gives the read end a writer to open against
 		int writeFd = open(path.c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
 		BfpFile* readFile = NULL;
 		if (writeFd != -1)
@@ -767,7 +776,7 @@ void LLDBDebugger::CreateOutputPipes()
 
 void LLDBDebugger::CloseOutputPipes()
 {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 	// Closing the write ends lets the IDE's reader threads see EOF
 	if (mStdOutPipeWrite != -1)
 	{
@@ -798,7 +807,7 @@ void LLDBDebugger::CloseOutputPipes()
 // the IDE's pipes, or to our own console when output isn't being redirected.
 void LLDBDebugger::PumpTargetOutput()
 {
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
 	const intptr maxPending = 8 * 1024 * 1024;
 
 	auto _Forward = [&](const char* data, size_t len, int pipeFd, String& pending, int localFd)
@@ -2500,26 +2509,20 @@ String LLDBDebugger::GetProcessInfo()
 		}
 	}
 #elif defined(__APPLE__)
-	// macOS: use task_info for memory and times
+	// task_for_pid needs an entitlement; proc_pidinfo works for processes the IDE's user owns
 	{
-		struct mach_task_basic_info info;
-		mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-		task_t task;
-		if (task_for_pid(mach_task_self(), mProcessId, &task) == KERN_SUCCESS)
+		struct proc_taskinfo info;
+		if (proc_pidinfo(mProcessId, PROC_PIDTASKINFO, 0, &info, sizeof(info)) == (int)sizeof(info))
 		{
-			if (task_info(task, MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) == KERN_SUCCESS)
-			{
-				result += StrFormat("VirtualMemory\t%llu\n",  (uint64)info.virtual_size);
-				result += StrFormat("WorkingMemory\t%llu\n",  (uint64)info.resident_size);
-				// user_time / system_time are in microseconds (struct time_value_t)
-				uint64 utimeHns  = (uint64)info.user_time.seconds   * 10000000ULL
-				                 + (uint64)info.user_time.microseconds * 10ULL;
-				uint64 stimeHns  = (uint64)info.system_time.seconds  * 10000000ULL
-				                 + (uint64)info.system_time.microseconds * 10ULL;
-				result += StrFormat("UserTime\t%llu\n",   utimeHns);
-				result += StrFormat("KernelTime\t%llu\n", stimeHns);
-			}
-			mach_port_deallocate(mach_task_self(), task);
+			result += StrFormat("VirtualMemory\t%llu\n", (uint64)info.pti_virtual_size);
+			result += StrFormat("WorkingMemory\t%llu\n", (uint64)info.pti_resident_size);
+			// The times are in mach absolute time units; convert to 100-nanosecond units (matches WinDebugger)
+			mach_timebase_info_data_t timebase;
+			mach_timebase_info(&timebase);
+			uint64 utimeHns = (uint64)((double)info.pti_total_user * timebase.numer / timebase.denom / 100.0);
+			uint64 stimeHns = (uint64)((double)info.pti_total_system * timebase.numer / timebase.denom / 100.0);
+			result += StrFormat("UserTime\t%llu\n", utimeHns);
+			result += StrFormat("KernelTime\t%llu\n", stimeHns);
 		}
 	}
 #endif
@@ -9596,6 +9599,7 @@ bool LLDBDebugger::HotApplyPatches(const Array<HotPatch>& patches, Array<HotWrit
 	return true;
 }
 
+#ifdef __linux__
 bool LLDBDebugger::HotLoadBatch(const Array<String>& objectFiles, int hotIdx, int& outNumPatched, bool& outRestored, String& outError)
 {
 	mHotLoadCount++;
@@ -9713,6 +9717,8 @@ bool LLDBDebugger::HotLoadBatch(const Array<String>& objectFiles, int hotIdx, in
 	return success;
 }
 
+#endif
+
 void LLDBDebugger::HotLoad(const Array<String>& objectFiles, int hotIdx)
 {
 	AutoCrit autoCrit(mDebugManager->mCritSect);
@@ -9739,8 +9745,17 @@ void LLDBDebugger::HotLoad(const Array<String>& objectFiles, int hotIdx)
 
 	int numPatched = 0;
 	bool restored = true;
+#ifdef __linux__
 	if (success)
 		success = HotLoadBatch(objectFiles, hotIdx, numPatched, restored, error);
+#else
+	// Hot loading links relocatable ELF objects into the target; Mach-O objects aren't handled yet
+	if (success)
+	{
+		success = false;
+		error = "hot compiling isn't supported on this platform yet";
+	}
+#endif
 	mHotLoadApplied = success;
 
 	if (success)

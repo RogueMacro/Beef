@@ -328,6 +328,7 @@ void LLDBDebugger::ShadowCheckFrames()
 				ShadowCheckLineCalls((addr_target)wdStackFrame->mRegisters.GetPC());
 		}
 
+#ifdef __linux__
 		// Modules with only .dynsym are left out: LLDB also reads MiniDebugInfo locals and symbol versions there
 		DbgModule* symbolModule = mDebugTarget->FindDbgModuleForAddress(sourcePC);
 		if ((symbolModule != NULL) && (((ElfDbgModule*)symbolModule)->FindSection(".symtab") != NULL))
@@ -339,6 +340,7 @@ void LLDBDebugger::ShadowCheckFrames()
 				beefSymbol = "!Invalid symbol";
 			ShadowCompare("addr_symbol", lldbSymbol, beefSymbol);
 		}
+#endif
 	}
 
 	ShadowCheckTLS();
