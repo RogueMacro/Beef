@@ -43,6 +43,16 @@ DebugWorkingDirectory = "$(ProjectDir)/dist"
 EnvironmentVars = ["_NO_DEBUG_HEAP=1"]
 PreprocessorMacros = ["DEBUG,HASGIT"]
 
+[Configs.Debug.macOS]
+TargetDirectory = "$(ProjectDir)/dist"
+TargetName = "BeefIDE_d"
+OtherLinkFlags = "$(LinkFlags) ./libIDEHelper_d.a ./libBeefySysLib_d.a ./libhunspell.dylib $(Var IDEHelperLibs)"
+PreBuildCmds = ["ReadFile(\"$(WorkspaceDir)/dist/IDEHelper_libs_d.txt\", \"IDEHelperLibs\")"]
+DebugCommandArguments = "-proddir=\"~/BeefTest\""
+DebugWorkingDirectory = "$(ProjectDir)/dist"
+EnvironmentVars = ["_NO_DEBUG_HEAP=1"]
+PreprocessorMacros = ["DEBUG,HASGIT"]
+
 [Configs.DebugOpt.Win64]
 TargetDirectory = "$(ProjectDir)/dist"
 TargetName = "BeefIDE_do"
@@ -72,6 +82,16 @@ OtherLinkFlags = "$(LinkFlags) libBeefRT.a libIDEHelper.a libBeefySysLib.a libhu
 PreBuildCmds = ["ReadFile(\"$(WorkspaceDir)/dist/IDEHelper_libs_d.txt\", \"IDEHelperLibs\")"]
 DebugCommandArguments = "-proddir=\"$(ProjectDir)\\..\\BeefBuild\""
 DebugWorkingDirectory = "$(ProjectDir)\\dist"
+EnvironmentVars = ["z_NO_DEBUG_HEAP=1"]
+PreprocessorMacros = ["RELEASE,HASGIT"]
+
+[Configs.Release.macOS]
+TargetDirectory = "$(ProjectDir)/dist"
+TargetName = "BeefIDE"
+OtherLinkFlags = "$(LinkFlags) ./libIDEHelper.a ./libBeefySysLib.a ./libhunspell.dylib $(Var IDEHelperLibs)"
+PreBuildCmds = ["ReadFile(\"$(WorkspaceDir)/dist/IDEHelper_libs.txt\", \"IDEHelperLibs\")"]
+DebugCommandArguments = "-proddir=\"$(ProjectDir)/../BeefBuild\""
+DebugWorkingDirectory = "$(ProjectDir)/dist"
 EnvironmentVars = ["z_NO_DEBUG_HEAP=1"]
 PreprocessorMacros = ["RELEASE,HASGIT"]
 

@@ -10,3 +10,9 @@ OtherLinkFlags = "$(LinkFlags) -lcurl"
 
 [Configs.Release.Linux64]
 OtherLinkFlags = "$(LinkFlags) -lcurl"
+
+[Configs.Debug.macOS]
+OtherLinkFlags = "$(LinkFlags) -lcurl"
+
+[Configs.Release.macOS]
+OtherLinkFlags = "$(LinkFlags) -lcurl"

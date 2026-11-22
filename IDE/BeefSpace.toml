@@ -25,6 +25,9 @@ ConfigSelections = {IDE = {Config = "DebugOpt"}, Beefy2D = {Config = "DebugOpt"}
 [Configs.Debug.Linux64]
 EnableSideStack = true
 
+[Configs.Debug.macOS]
+EnableSideStack = true
+
 [Configs.Release.Win32]
 BfOptimizationLevel = "OgPlus"
 EmitDebugInfo = "No"
@@ -36,6 +39,10 @@ BfOptimizationLevel = "O3"
 AllocStackTraceDepth = 0
 
 [Configs.Release.Linux64]
+BfOptimizationLevel = "O3"
+AllocStackTraceDepth = 0
+
+[Configs.Release.macOS]
 BfOptimizationLevel = "O3"
 AllocStackTraceDepth = 0
 
@@ -66,6 +73,15 @@ EmitObjectAccessCheck = false
 EnableRealtimeLeakCheck = false
 ConfigSelections = {IDE = {Config = "Debug"}, Beefy2D = {Config = "Debug"}, IDEHelper = {Config = "Debug"}, Debugger64 = {Config = "Debug"}, BeefySysLib = {Config = "Debug"}}
 
+[Configs.Debug-IDE.macOS]
+BfOptimizationLevel = "O0"
+EmitDebugInfo = "No"
+EmitDynamicCastCheck = false
+EnableObjectDebugFlags = false
+EmitObjectAccessCheck = false
+EnableRealtimeLeakCheck = false
+ConfigSelections = {IDE = {Config = "Debug"}, Beefy2D = {Config = "Debug"}, IDEHelper = {Config = "Debug"}, Debugger64 = {Config = "Debug"}, BeefySysLib = {Config = "Debug"}}
+
 [Configs.Debug2.Win32]
 EmitDebugInfo = "No"
 EmitDynamicCastCheck = false
@@ -80,6 +96,10 @@ PreprocessorMacros = ["NEWFONT"]
 ConfigSelections = {Beefy2D = {Config = "Debug"}, IDEHelper = {Enabled = false, Config = "Debug"}, Debugger64 = {Enabled = false, Config = "Debug"}, BeefySysLib = {Enabled = false, Config = "Debug"}}
 
 [Configs.Debug2.Linux64]
+PreprocessorMacros = ["NEWFONT"]
+ConfigSelections = {Beefy2D = {Config = "Debug"}, IDEHelper = {Enabled = false, Config = "Debug"}, Debugger64 = {Enabled = false, Config = "Debug"}, BeefySysLib = {Enabled = false, Config = "Debug"}}
+
+[Configs.Debug2.macOS]
 PreprocessorMacros = ["NEWFONT"]
 ConfigSelections = {Beefy2D = {Config = "Debug"}, IDEHelper = {Enabled = false, Config = "Debug"}, Debugger64 = {Enabled = false, Config = "Debug"}, BeefySysLib = {Enabled = false, Config = "Debug"}}
 
@@ -109,6 +129,15 @@ EnableSideStack = false
 COptimizationLevel = "O2"
 ConfigSelections = {IDEHelper = {Config = "Debug"}, Debugger64 = {Config = "Debug"}, BeefySysLib = {Config = "Debug"}}
 
+[Configs.Paranoid.macOS]
+EmitDynamicCastCheck = false
+EnableObjectDebugFlags = false
+EmitObjectAccessCheck = false
+EnableRealtimeLeakCheck = false
+EnableSideStack = false
+COptimizationLevel = "O2"
+ConfigSelections = {IDEHelper = {Config = "Debug"}, Debugger64 = {Config = "Debug"}, BeefySysLib = {Config = "Debug"}}
+
 [Configs.Test.Win32]
 EmitDynamicCastCheck = false
 EnableObjectDebugFlags = false
@@ -124,6 +153,13 @@ EnableRealtimeLeakCheck = false
 COptimizationLevel = "O2"
 
 [Configs.Test.Linux64]
+EmitDynamicCastCheck = false
+EnableObjectDebugFlags = false
+EmitObjectAccessCheck = false
+EnableRealtimeLeakCheck = false
+COptimizationLevel = "O2"
+
+[Configs.Test.macOS]
 EmitDynamicCastCheck = false
 EnableObjectDebugFlags = false
 EmitObjectAccessCheck = false
@@ -147,6 +183,10 @@ ConfigSelections = {Beefy2D = {Config = "Debug"}, IDEHelper = {Config = "Debug"}
 BfOptimizationLevel = "O0"
 ConfigSelections = {Beefy2D = {Config = "Debug"}, IDEHelper = {Config = "Debug"}, Debugger64 = {Config = "Debug"}, BeefySysLib = {Config = "Debug"}}
 
+[Configs.Debug3.macOS]
+BfOptimizationLevel = "O0"
+ConfigSelections = {Beefy2D = {Config = "Debug"}, IDEHelper = {Config = "Debug"}, Debugger64 = {Config = "Debug"}, BeefySysLib = {Config = "Debug"}}
+
 [Configs.Debug_NoDeps.Win32]
 InitLocalVariables = true
 EmitObjectAccessCheck = false
@@ -159,5 +199,9 @@ EnableSideStack = true
 ConfigSelections = {IDE = {Config = "Debug"}, Beefy2D = {Config = "Debug"}, IDEHelper = {Enabled = false, Config = "Debug"}, Debugger64 = {Enabled = false, Config = "Debug"}, BeefySysLib = {Enabled = false, Config = "Debug"}}
 
 [Configs.Debug_NoDeps.Linux64]
+EnableSideStack = true
+ConfigSelections = {IDE = {Config = "Debug"}, Beefy2D = {Config = "Debug"}, IDEHelper = {Enabled = false, Config = "Debug"}, Debugger64 = {Enabled = false, Config = "Debug"}, BeefySysLib = {Enabled = false, Config = "Debug"}}
+
+[Configs.Debug_NoDeps.macOS]
 EnableSideStack = true
 ConfigSelections = {IDE = {Config = "Debug"}, Beefy2D = {Config = "Debug"}, IDEHelper = {Enabled = false, Config = "Debug"}, Debugger64 = {Enabled = false, Config = "Debug"}, BeefySysLib = {Enabled = false, Config = "Debug"}}

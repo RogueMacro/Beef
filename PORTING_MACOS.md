@@ -29,7 +29,7 @@ it silently uses defaults (that's why the IDE "builds" at all today).
 ### Fast iteration
 Native libs only need rebuilding when C++ changes. For Beef-only changes:
 ```sh
-cd IDE/dist && ./BeefBuild -proddir=../ -config=Debug      # ~seconds to a few minutes
+cd IDE/dist && LIBRARY_PATH=$(brew --prefix llvm@22)/lib ./BeefBuild -proddir=../ -config=Debug   # a few seconds
 ```
 
 ## Findings (verification of the initial notes)
@@ -85,6 +85,24 @@ Corrections / new facts:
   Gfx_*, BFApp_*, BFWindow_*, SpellChecker_*, HTTP_*, fts_fuzzy_match, ...) = IDEHelper + BeefySysLib not
   linked, and output lands in `IDE/build/Debug_macOS/IDE/IDE` → no macOS config in `IDE/BeefProj.toml`.
 
+### Task 2 — macOS project configs (done)
+- `IDE/BeefProj.toml`: `Debug.macOS` / `Release.macOS`, modelled on Linux64:
+  `$(LinkFlags) ./libIDEHelper[_d].a ./libBeefySysLib[_d].a ./libhunspell.dylib $(Var IDEHelperLibs)`.
+  (`$(LinkFlags)` already contributes `./libBeefRT[_d].a -Wl,-rpath -Wl,@executable_path`.)
+  Release reads `IDEHelper_libs.txt` (Linux64 Release reads the `_d` file — likely a copy/paste slip upstream; left alone).
+- `IDE/BeefSpace.toml`: every `*.Linux64` section duplicated as `*.macOS` (Debug, Release, Debug-IDE,
+  Debug2, Paranoid, Test, Debug3, Debug_NoDeps).
+- `BeefLibs/Beefy2D/BeefProj.toml`: `Debug.macOS` / `Release.macOS` mirroring Linux64, including
+  `CopyToDependents` of the `.a`. Safe: both ends are symlinks to the same jbuild file and the copy only
+  happens when src mtime > dest mtime, so it is a no-op.
+- `BeefLibs/curl/BeefProj.toml`: `-lcurl` for macOS (links system `/usr/lib/libcurl.4.dylib`).
+- No frameworks needed: SDL3 is dlopen'ed and GL comes through `SDL_GL_GetProcAddress`.
+- Result: `BeefIDE_d` and `BeefIDE` link. `otool -L`: libcurl (system), `@rpath/libhunspell.dylib`,
+  `/opt/homebrew/opt/llvm@22/lib/libLLVM.dylib` (absolute brew path → not relocatable; fine for dev),
+  libc++, libSystem. rpath `@executable_path`.
+- Gotcha: running the IDE step by hand needs `LIBRARY_PATH=$(brew --prefix llvm@22)/lib`, otherwise
+  `ld: library 'LLVM-22' not found` (build.sh exports it).
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone and not
@@ -102,5 +120,5 @@ Corrections / new facts:
 ```sh
 ./bin/build.sh            # BeefBuild only: OK
 ./bin/build.sh ide        # native libs + BeefBuild OK; IDE step fails (43 errors) at 6086538b
-cd IDE/dist && ./BeefBuild -proddir=../ -config=Debug    # IDE step only
+cd IDE/dist && LIBRARY_PATH=$(brew --prefix llvm@22)/lib ./BeefBuild -proddir=../ -config=Debug    # IDE step only
 ```
