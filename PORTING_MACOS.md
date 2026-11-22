@@ -256,16 +256,53 @@ What doesn't work yet / not verified:
     times converted from mach absolute units.
   - The Beef DWARF "host/shadow" layer (`DebugTarget`) is skipped (`HostSyncModules`/`HostBuildCallStack` return
     early): it reads only ELF images and x64 registers. Every query it answers already falls back to LLDB.
-  - Hot compiling links relocatable **ELF** objects; on macOS `HotLoad` reports "hot compiling isn't supported on
-    this platform yet" (and still rebinds breakpoints). One ELF-only shadow check is `#ifdef __linux__`.
+  - Hot compiling linked only relocatable **ELF** objects, so at first `HotLoad` reported it unsupported on macOS -
+    now done, see Task 11. One ELF-only shadow check is `#ifdef __linux__`.
 - Verified via MCP on a small program: source breakpoints bind and hit; step over / out; call stack
   (`Hello.Program.Add` ← `Main` ← `BeefStartProgram` ← `main` ← `dyld!start`); locals with summaries
   (`List<int> { count=3 }`, `Point { mX=10 mY=6 mName="origin" }`); eval of arithmetic, `pt.mName.Length`, `list[1]`,
   a method call `Add(3, 4)`; conditional breakpoint (`a == 3`); stop and re-launch. Program output goes to the IDE's
   terminal unless output redirection is on (same as Linux).
-- Not done / follow-ups: Mach-O hot compiling; a Mach-O + arm64 `DebugTarget`; step-out landed on the loop header
+- Not done / follow-ups: a Mach-O + arm64 `DebugTarget`; step-out landed on the loop header
   line (27) rather than the call line (28) — check against Linux before calling it a bug; LLDB shows Beef `int` as
   `long` (clang type system naming 8-byte ints; standalone lldb shows the same); attach not click-tested.
+
+### Task 11 — hot compiling on macOS (done, needs hands-on testing)
+- Enable per workspace: Workspace properties → Enable Hot Compilation (`AllowHotSwapping = true` under
+  `[Configs.Debug.macOS]`). It defaults off on every non-Windows platform, Linux included.
+- The Linux design carries over (LLDBDebugger.cpp "Hot swap" section): load each rebuilt object into memory mapped
+  in the target near the program, resolve its symbols against the program (`dlsym` for libraries), bind globals to
+  their canonical definitions (data keeps its storage, runtime type tables are patched in place), and redirect each
+  replaced method with a jump written over its old entry. What's new for macOS:
+  - **Mach-O arm64 objects**: an Apple `LLDBHotObject` with parse / prepare / resolve / link next to the ELF ones
+    (`#elif defined(__APPLE__)`). Relocations: `UNSIGNED` (+`SUBTRACTOR`), `BRANCH26` (16-byte stubs when out of
+    ±128MB), `PAGE21`/`PAGEOFF12` (+`ADDEND`, load/store scaling), `GOT_LOAD_*`, `TLVP_LOAD_*`, `POINTER_TO_GOT`.
+    Symbol sizes (Mach-O has none) are the distance to the next symbol in the section. Common symbols are handled.
+  - **arm64 jumps**: `b imm26` (4 bytes) or `ldr x16, #8; br x16; .quad` (16), behind small per-arch helpers
+    (`HotFitsRelJump`/`HotWriteRelJump`/`HotWriteShortJump`); the x64 versions encode exactly what Linux wrote before.
+  - **W^X**: Apple silicon maps nothing writable+executable except `MAP_JIT` memory, which the program's own threads
+    can't write - the first try (one `MAP_JIT` heap) crashed on the first write to a new static. Now the heap is
+    plain RW (`mmap` with the address as a hint, accepted within 1GB of it), each image puts code+GOT+stubs on their
+    own 16KB pages and data after, and one `mprotect` expression per batch (`HotProtectImages`) makes code RX and
+    data RW. Verified separately that RW→RX anonymous code runs on this machine, with or without a debugger.
+  - **Thread-locals**: existing ones bind to the program's TLV descriptors; a new `[ThreadStatic]` gets a descriptor
+    built from `__BFTLS_EXTRA`'s (dyld's thunk and key, offset into that 16KB reserve), starting zeroed as on Linux.
+  - **Debug map**: the program's DWARF lives in its `.o` files, and a hot compile rewrites those, after which LLDB
+    drops the original code's debug info ("debug map object file ... changed"). With hot swapping on, the debugger
+    runs `xcrun dsymutil` on the program at launch (≈0.1s for a corlib-sized program), so LLDB reads the `.dSYM`.
+    (`BfpSpawn_WaitFor` with a timeout throws on macOS, so it waits without one.)
+  - Hot objects are registered with LLDB as modules (their code sections mapped where we loaded them), like Linux.
+- Verified via MCP with a program ticking every 250ms:
+  - edit a method body (`i * 2` → `i * 3`), static state carries on
+  - change a virtual override
+  - add a static with an initializer (starts at its value), a `[ThreadStatic]` (starts at 0), a new method with new string literals
+  - second hot compile adding a virtual method to the base class (vtable extension), old image freed afterwards
+  - breakpoint inside hot code: binds in `BeefHot_*_HotTest_Program.o`, locals, call stack through hot and original
+    frames, step over / out
+  - injected write failure (`BEEF_LLDB_HOT_FAIL_WRITE=1`): writes undone, program keeps running the old code
+- Known gaps: evaluating a static *added* by a hot compile fails (LLDB reads it at its object-file address; data
+  sections of hot objects are left unloaded, as on Linux); `sBfTypeData` whose size changed isn't updated (logged,
+  same as Linux); a method already running (e.g. `Main`'s loop) keeps running its old code until it's re-entered.
 
 ## Decisions
 
@@ -287,7 +324,8 @@ What doesn't work yet / not verified:
 1. Hands-on test of the native dialogs (see Task 6).
 2. (optional) Absolute popup positions, so MCP `all=true` composites are right (see Task 9).
 3. Map the default "Segoe UI Symbol/Emoji" alternates to Apple fonts.
-4. Debugger follow-ups (Task 10): Mach-O hot compiling, Mach-O/arm64 `DebugTarget`, step-out location check.
+4. Debugger follow-ups (Task 10/11): Mach-O/arm64 `DebugTarget`, step-out location check, evaluating statics added
+   by a hot compile.
    Without LLDB (no Xcode/CLT or no headers) the GDB fallback still crashes (`BfpSpawn_Kill` NOT_IMPL).
 5. Non-variadic `extern` declarations of variadic C functions (`ioctl`, `fcntl`, `open`, `printf`...) are broken
    on Apple arm64. Socket's is fixed; worth a corlib-wide audit.
