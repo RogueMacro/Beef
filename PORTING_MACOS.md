@@ -396,6 +396,25 @@ What doesn't work yet / not verified:
 - Known gaps: File ▸ Preferences and File ▸ Exit stay where they are (not moved to the app menu as Settings…/Quit);
   no standard Window menu items (Minimize ⌘M, Zoom); IDE shortcuts remain Ctrl-based.
 
+### Task 15 — setup script and Brewfile (done)
+- Goal: make the port easy for others to build. Containers were ruled out: Docker on a Mac runs Linux, the build needs
+  AppKit/CoreText, Xcode's `LLDB.framework` and Apple's linker, and cross-compiling from Linux (osxcross) means
+  repackaging Apple's SDK and still gives no `LLDB.framework` or way to test.
+- `Brewfile`: cmake, ninja, llvm@22, sdl3, lldb (headers only).
+- `bin/setup_macos.sh` (bash 3.2; `--check` changes nothing): arch/macOS version, Xcode or CLT (`xcode-select -p`,
+  `xcrun clang`, dsymutil), `LLDB.framework` (same search as `IDEHelper/CMakeLists.txt`), developer mode
+  (`DevToolsSecurity`), Homebrew, each formula (LLVM must be 22.1.x, `libSDL3.dylib` present, LLDB headers), libffi
+  sources, a non-ninja `jbuild_d/`. Missing required pieces exit 1 with a hint; debugger-only pieces are warnings.
+  - Installs missing formulas with plain `brew install`, not `brew bundle install`: bundle also upgrades outdated
+    formulas (it reports an outdated cmake as unsatisfied) and unlinks keg-only `llvm@22` if the user linked it.
+- `bin/build.sh`: also looks for `$(brew --prefix llvm@22)/bin/llvm-config`. llvm@22 is keg-only, so before this a
+  fresh machine needed it on PATH by hand, and failed with the Linux "install llvm-22-dev" message (now macOS-specific).
+- README: short "Building on macOS (unofficial port)" section.
+- Verified: `--check` on this machine (all ok); without brew on PATH (fails with hint, exit 1); a Brewfile with a
+  nonexistent formula (reported as not installed); bad argument (exit 2); build.sh's LLVM lookup with only a `brew`
+  wrapper on PATH (finds `/opt/homebrew/opt/llvm@22/bin/llvm-config`) and with no brew (empty, so the error path);
+  `./bin/build.sh ide` passes. **Not verified:** a really fresh Mac (actual installs, CLT-only machine, Intel).
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
@@ -427,7 +446,7 @@ What doesn't work yet / not verified:
 ## Build commands that work
 
 ```sh
-brew install llvm@22 sdl3 ninja cmake lldb   # lldb: SB headers only; needs Xcode or the CLT for LLDB.framework
+bin/setup_macos.sh        # checks prerequisites, installs missing Brewfile formulas (--check: report only)
 ./bin/build.sh ide        # full: native libs + BeefBuild + tests + BeefIDE_d + BeefIDE (exit 0)
 cd IDE/dist && LIBRARY_PATH=$(brew --prefix llvm@22)/lib ./BeefBuild -proddir=../ -config=Debug   # IDE only
 cd IDE/dist && ./BeefIDE_d                                    # run
