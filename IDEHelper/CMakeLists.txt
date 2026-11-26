@@ -198,12 +198,14 @@ if(UNIX)
     # liblldb links Homebrew's newer libLLVM, and that can't share a process with the LLVM 22 we link: its
     # expression parser crashes. Apple ships no SB API headers, so those come from Homebrew's 'lldb' formula -
     # the SB API is ABI stable.
+    # Weak-linked, so the IDE still starts on a machine without Xcode / the Command Line Tools (CreateDebuggerLLDB
+    # then returns NULL and debugging reports what's missing).
     execute_process(COMMAND xcode-select -p OUTPUT_VARIABLE XCODE_DEVELOPER_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     find_library(LLDB_LIBRARY NAMES LLDB PATHS "${XCODE_DEVELOPER_DIR}/../SharedFrameworks" "${XCODE_DEVELOPER_DIR}/Library/PrivateFrameworks" NO_DEFAULT_PATH)
     find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h PATHS /opt/homebrew/opt/lldb/include /usr/local/opt/lldb/include NO_DEFAULT_PATH)
     if (LLDB_LIBRARY)
       get_filename_component(LLDB_FRAMEWORK_DIR "${LLDB_LIBRARY}" DIRECTORY)
-      set(LLDB_LINK_FLAGS "-F${LLDB_FRAMEWORK_DIR} -framework LLDB -Wl,-rpath,${LLDB_FRAMEWORK_DIR}")
+      set(LLDB_LINK_FLAGS "-F${LLDB_FRAMEWORK_DIR} -weak_framework LLDB -Wl,-rpath,${LLDB_FRAMEWORK_DIR}")
     endif()
   else()
     find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h HINTS ${LLVM_INCLUDE_DIRS})

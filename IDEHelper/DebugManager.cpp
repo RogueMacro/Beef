@@ -669,7 +669,12 @@ BF_EXPORT void BF_CALLTYPE Debugger_Create()
 #endif
 
 	gDebugManager->mDebuggerLLDB = CreateDebuggerLLDB(gDebugManager);
+#ifdef __APPLE__
+	// GDB doesn't work on macOS (and is rarely installed); without LLDB there is no debugger
+	gDebugManager->mDebuggerGDB = NULL;
+#else
 	gDebugManager->mDebuggerGDB = CreateDebuggerGDB(gDebugManager);
+#endif
 
 #ifdef BF_PLATFORM_WINDOWS
 	::AllowSetForegroundWindow(ASFW_ANY);
@@ -759,6 +764,15 @@ BF_EXPORT int BF_CALLTYPE Debugger_GetAddrSize()
 	return gDebugger->GetAddrSize();
 }
 
+static const char* NoLLDBMessage()
+{
+#ifdef __APPLE__
+	return "error Debugging needs LLDB from Xcode or the Command Line Tools, which weren't found. Install them with 'xcode-select --install' and restart the IDE";
+#else
+	return "error LLDB is not enabled in this BeefIDE build";
+#endif
+}
+
 BF_EXPORT bool BF_CALLTYPE Debugger_OpenFile(const char* launchPath, const char* targetPath, const char* args, const char* workingDir, void* envBlockPtr, int envBlockSize, bool hotSwapEnabled, DbgOpenFileFlags openFileFlags)
 {
 	BF_ASSERT(gDebugger == NULL);
@@ -774,7 +788,7 @@ BF_EXPORT bool BF_CALLTYPE Debugger_OpenFile(const char* launchPath, const char*
 		gDebugger = gDebugManager->mDebuggerLLDB;
 		if (gDebugger == NULL)
 		{
-			gDebugManager->mOutMessages.push_back("error LLDB is not enabled in this BeefIDE build");
+			gDebugManager->mOutMessages.push_back(NoLLDBMessage());
 			return false;
 		}
 	}
@@ -806,6 +820,10 @@ BF_EXPORT bool BF_CALLTYPE Debugger_OpenFile(const char* launchPath, const char*
 	{
 		if (debuggerResult == DebuggerResult_WrongBitSize)
 			gDebugManager->mOutMessages.push_back(StrFormat("error The file 32-bit file '%s' cannot be debugged because 32-bit debugger has been disabled", launchPath));
+#ifdef __APPLE__
+		else if (gDebugManager->mDebuggerLLDB == NULL)
+			gDebugManager->mOutMessages.push_back(NoLLDBMessage());
+#endif
 		else
 			gDebugManager->mOutMessages.push_back("error Failed to start a debugger");
 		return false;

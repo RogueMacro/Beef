@@ -24,6 +24,7 @@
 #include <elf.h>
 #endif
 #ifdef __APPLE__
+#include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <libproc.h>
@@ -11208,6 +11209,12 @@ USING_NS_BF;
 Debugger* Beefy::CreateDebuggerLLDB(DebugManager* debugManager)
 {
 #ifdef LLDB_ENABLED
+#ifdef __APPLE__
+	// LLDB.framework is weak-linked: without Xcode or the Command Line Tools it isn't loaded, and none of the
+	//  SB API may be called
+	if (dlsym(RTLD_DEFAULT, "_ZN4lldb10SBDebugger10InitializeEv") == NULL)
+		return NULL;
+#endif
 	return new LLDBDebugger(debugManager);
 #else
 	return NULL;
