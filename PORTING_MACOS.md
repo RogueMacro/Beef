@@ -478,6 +478,36 @@ What doesn't work yet / not verified:
 - Verified: `./bin/build.sh ide` passes with upstream's new tests (410 test lines, was 404); debugger on macOS:
   breakpoint, step over/into/out, locals.
 
+### Task 19 — LLDB.framework weak-linked (done)
+- `IDEHelper/CMakeLists.txt`: `-weak_framework LLDB`. Without Xcode / the CLT the IDE (and BeefBuild) now start;
+  `CreateDebuggerLLDB` checks `dlsym(RTLD_DEFAULT, "_ZN4lldb10SBDebugger10InitializeEv")` and returns NULL, and
+  `DebugManager` (macOS) never creates the GDB debugger (it crashes on macOS: `BfpSpawn_Kill`). Starting a debug session
+  then prints "Debugging needs LLDB from Xcode or the Command Line Tools, which weren't found. Install them with
+  'xcode-select --install' and restart the IDE".
+- Verified: packaged app copy with both LLDB rpaths deleted (re-signed): launches, LLDB not loaded (vmmap), builds,
+  debug start gives the message, run-without-debugging runs the program, IDE stays up. Normal app: breakpoint hit.
+
+### Task 20 — CI uploads BeefIDE.app (done, not yet run)
+- macOS job runs `bin/package_macos.sh` after the build and uploads `BeefIDE-<ver>-macos-arm64.zip` as the
+  `BeefIDE-macos-arm64` artifact (30 days). The zip is uploaded rather than the .app folder, which would lose symlinks
+  and exec bits. Releases (attaching it to tags) not done.
+
+### Task 21 — Command acts as Control (done, needs hands-on testing)
+- `SdlBFApp` (`__APPLE__`): `SDLK_LGUI`/`SDLK_RGUI` map to `KEY_CONTROL`, so every Ctrl binding (IDE commands, editor
+  editing/navigation, Ctrl+click) also works with ⌘; the Control key still works. KEY_CONTROL's key-up is skipped
+  while the other of the two is still held (`sdlEvent.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)`).
+- Menus show Ctrl bindings as ⌘ (`DarwinMenu.mm`: Ctrl → `NSEventModifierFlagCommand`; multi-chord text ⌥⇧⌘ order).
+- Taken by macOS before the app sees them, so use Control for these: ⌘Space (Autocomplete; Spotlight), ⌘Tab (Recent
+  File Next; app switcher), ⌘H (Replace in Document; Hide — the menu shows no shortcut for it), ⌘` (Show File
+  Externally; window cycling).
+- Verified by injecting SDL key events (`SDL_PushEvent` from lldb) into the running IDE: ⌘End → last line; after ⌘
+  up, End stays on the line (Control released); Ctrl held + ⌘ released → Control still down. Menu items show
+  `Command-F`, `Shift-Command-F`, `Command-G`.
+- **Not verified:** real keystrokes. Synthetic NSEvents posted through AppKit never reached SDL's key handling (even
+  a plain 'x', with the window key and SDL keyboard focus set), so whether Cocoa turns ⌘+letter into SDL text input
+  (which would insert the letter) needs a person at the keyboard. Also: `-mcp` creates the main window
+  `SDL_WINDOW_NOT_FOCUSABLE` (`.NoActivate`), so real keyboard input can't reach an MCP-driven IDE until it's clicked.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
