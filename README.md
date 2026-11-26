@@ -31,6 +31,7 @@ The IDE and toolchain build natively on Apple Silicon Macs. This port is not off
 bin/setup_macos.sh     # checks Xcode / Command Line Tools, installs missing Homebrew packages from the Brewfile
 ./bin/build.sh ide     # builds the native libs, BeefBuild (and runs its tests) and the IDE
 IDE/dist/BeefIDE_d     # debug IDE; IDE/dist/BeefIDE is the release build
+bin/package_macos.sh   # optional: a self-contained builds/macos/BeefIDE.app (and a zip of it)
 ```
 
 # IDE Screenshots

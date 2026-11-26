@@ -7,6 +7,7 @@
 #include "img/PNGData.h"
 #ifdef __APPLE__
 #include "platform/darwin/DarwinMenu.h"
+#include "platform/darwin/DarwinAppBundle.h"
 #endif
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_events.h>
@@ -157,7 +158,8 @@ static BfpDynLib* GetSDLModule(const StringImpl& installDir)
 		// and the standard Homebrew prefixes
 		if (gSDLModule == NULL)
 		{
-			String searchDirs[] = { installDir, "/opt/homebrew/lib/", "/usr/local/lib/" };
+			// @executable_path/../Frameworks/ is where BeefIDE.app bundles it
+			String searchDirs[] = { "@executable_path/../Frameworks/", installDir, "/opt/homebrew/lib/", "/usr/local/lib/" };
 			for (auto& searchDir : searchDirs)
 			{
 				String checkPath = searchDir + "libSDL3.dylib";
@@ -640,6 +642,11 @@ SdlBFApp::SdlBFApp()
 #endif
 
     mInstallDir += "/";
+
+#ifdef __APPLE__
+	// Inside BeefIDE.app the install dir is Contents/Resources/bin
+	DarwinGetAppBundleInstallDir(GetFileDir(exePath), mInstallDir);
+#endif
 
 	mSDLInitialized = false;
 

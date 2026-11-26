@@ -2339,7 +2339,8 @@ namespace IDE
 
 		void GetDefaultLayoutDataFileName(String outResult)
 		{
-			outResult.Append(mInstallDir, "/DefaultLayout.toml");
+			// mUserDataDir is mInstallDir unless the install dir is read-only (packaged)
+			outResult.Append(mUserDataDir, "/DefaultLayout.toml");
 		}
 
 		bool GetWorkspaceFileName(String outResult)
@@ -13573,11 +13574,35 @@ namespace IDE
 			return mVersionInfo;
 		}
 
+		// True when running from an installed package whose install dir isn't writable, so user data
+		//  (settings, layout, managed libs) lives in mUserDataDir instead
+		public bool IsPackagedInstall
+		{
+			get
+			{
+#if BF_PLATFORM_LINUX && LINUX_PACKAGE
+				return true;
+#elif BF_PLATFORM_MACOS
+				// BeefIDE.app: the install dir is Contents/Resources/bin (see bin/package_macos.sh)
+				return mInstallDir.Contains(".app/Contents/Resources/");
+#else
+				return false;
+#endif
+			}
+		}
+
 		protected void InitUserDataDir()
 		{
 #if BF_PLATFORM_LINUX && LINUX_PACKAGE
 			delete mUserDataDir;
 			mUserDataDir = new $"{Environment.GetEnvironmentVariable("HOME", .. scope .())}/.config/beeflang/";
+#elif BF_PLATFORM_MACOS
+			if (IsPackagedInstall)
+			{
+				delete mUserDataDir;
+				mUserDataDir = new $"{Environment.GetEnvironmentVariable("HOME", .. scope .())}/Library/Application Support/BeefLang/";
+				Directory.CreateDirectory(mUserDataDir).IgnoreError();
+			}
 #endif
 		}
 

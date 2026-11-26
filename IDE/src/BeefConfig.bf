@@ -225,12 +225,16 @@ namespace IDE
 			data.GetString("ManagedLibDir", mManagedLibPath);
 			if ((mManagedLibPath.IsEmpty) && (!mLibDirectories.IsEmpty))
 			{
-#if BF_PLATFORM_LINUX && LINUX_PACKAGE
-				var managedPath = Path.GetAbsolutePath("BeefManaged", gApp.mUserDataDir, .. scope .());
-#else
-				var libPath = Path.GetAbsolutePath(mLibDirectories[0].mPath, gApp.mInstallDir, .. scope .());
-				var managedPath = Path.GetAbsolutePath("../BeefManaged", libPath, .. scope .());
-#endif
+				String managedPath = scope .();
+				if (gApp.IsPackagedInstall)
+				{
+					Path.GetAbsolutePath("BeefManaged", gApp.mUserDataDir, managedPath);
+				}
+				else
+				{
+					var libPath = Path.GetAbsolutePath(mLibDirectories[0].mPath, gApp.mInstallDir, .. scope .());
+					Path.GetAbsolutePath("../BeefManaged", libPath, managedPath);
+				}
 				if (Directory.CreateDirectory(managedPath) case .Ok)
 					mManagedLibPath.Set(managedPath);
 				else
