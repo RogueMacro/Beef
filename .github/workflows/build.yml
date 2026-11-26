@@ -56,19 +56,14 @@ jobs:
           sudo ./llvm.sh 22
           sudo apt-get install -y llvm-22-dev libsystemd-dev libcurl4-openssl-dev
       - run: bin/build.sh ide
-  build-macos:
-    name: Build on macOS
-    if: false
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, macos-15-intel]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+  build-macos-ide:
+    # Unofficial macOS port (see PORTING_MACOS.md): Apple Silicon only, built the way a user would
+    name: Build IDE on macOS
+    runs-on: macos-15
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
-      - run: |
-          brew update
-          brew install llvm@22
-          echo "$(brew --prefix llvm@22)/bin" >> $GITHUB_PATH
-      - run: bin/build.sh
+      # Checks Xcode / LLDB.framework and installs the Brewfile formulas (llvm@22, sdl3, lldb headers, ...)
+      - run: bin/setup_macos.sh
+        name: Set up dependencies
+      - run: bin/build.sh ide
