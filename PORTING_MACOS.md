@@ -463,6 +463,21 @@ What doesn't work yet / not verified:
   - Pre-existing, not packaging-specific: macOS static-lib projects call `llvm/bin/llvm-ar` relative to the install dir
     (`BuildContext.bf` ~420), which exists nowhere on macOS.
 
+### Task 18 — merge upstream (done, 2026-11-26)
+- `upstream` remote = https://github.com/beefytech/Beef. Merged its master at `79a02f76` (15 commits since the fork
+  point `6086538b`) as `30da2a1f`.
+- One conflict, `IDEHelper/LLDBDebugger.cpp`: both sides added a function at the same spot (our `HotBindDefinition`,
+  upstream's Linux-only `HotDebugInfoAddrs`); kept both.
+- Upstream's Linux LLDB work moves breakpoints, autos, line call sites and hot objects onto its DebugTarget layer when
+  it covers the address. On macOS DebugTarget never gets modules (`HostSyncModules` returns early), so every new path
+  falls back to LLDB: `HostBindBreakpointAddresses`/`HostHotBindBreakpoint` find no source file, autos need a
+  `mSubProgram`, `HostCoversAddress` is false. `IssueStep`/`StepIntoSpecific` are plain SB API.
+- Build fix `d1495c60`: upstream added `#include <elf.h>` to `ElfDbgModule.h` and an `ElfDbgModule` in
+  `HostLoadHotObject`; macOS has no `elf.h` and doesn't build `ElfDbgModule.cpp`. Both are now Linux-only (worth
+  sending upstream).
+- Verified: `./bin/build.sh ide` passes with upstream's new tests (410 test lines, was 404); debugger on macOS:
+  breakpoint, step over/into/out, locals.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
