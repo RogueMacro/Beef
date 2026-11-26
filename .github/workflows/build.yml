@@ -67,3 +67,12 @@ jobs:
       - run: bin/setup_macos.sh
         name: Set up dependencies
       - run: bin/build.sh ide
+      # Self-contained BeefIDE.app (ad hoc signed, not notarized), uploaded as a zip
+      - run: bin/package_macos.sh
+        name: Package BeefIDE.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BeefIDE-macos-arm64
+          path: builds/macos/BeefIDE-*-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
