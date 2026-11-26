@@ -572,8 +572,15 @@ static int SDLConvertKeyCode(SDL_Keycode scanCode)
     case SDLK_INSERT: return 0x2D;
     case SDLK_DELETE: return 0x2E;
     case SDLK_HELP: return 0x2F;
+#ifdef __APPLE__
+	// Command acts as Control, so every Ctrl binding (IDE commands, editing, Ctrl+click) is also a Cmd binding.
+	//  The Control key itself still works too.
+    case SDLK_LGUI: return KEY_CONTROL;
+    case SDLK_RGUI: return KEY_CONTROL;
+#else
     case SDLK_LGUI: return 0x5B;
     case SDLK_RGUI: return 0x5C;
+#endif
 	case SDLK_KP_0: return 0x60;
 	case SDLK_KP_1: return 0x61;
     case SDLK_KP_2: return 0x62;
@@ -949,6 +956,11 @@ void SdlBFApp::ProcessSDLEvents()
 				if (sdlBFWindow != NULL)
 				{
 					const int key = SDLConvertKeyCode(sdlEvent.key.key);
+#ifdef __APPLE__
+					// Command and Control both map to KEY_CONTROL: it's only up once neither is held
+					if ((key == KEY_CONTROL) && ((sdlEvent.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_GUI)) != 0))
+						break;
+#endif
 					sdlBFWindow->mKeyUpFunc(sdlBFWindow, key);
 					if (key < KEYCODE_MAX)
 						sdlBFWindow->mIsKeyDown[key] = false;

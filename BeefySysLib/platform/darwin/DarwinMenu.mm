@@ -3,7 +3,8 @@
 //
 // - The window's root menu maps onto [NSApp mainMenu]; its top-level items follow an application menu
 //   (Services, Hide, Hide Others, Show All, Quit).
-// - Shortcuts are display-only: the Beef side handles all key bindings itself, so AppKit must never match
+// - Shortcuts are display-only, with Ctrl shown as Cmd (Command acts as Control, see SdlBFApp's key mapping).
+//   The Beef side handles all key bindings itself, so AppKit must never match
 //   them. Hot keys that fit an NSMenuItem key equivalent (one chord) are set as one only while their menu is
 //   open (menuWillOpen / menuDidClose), so a closed menu bar has nothing to match. (Answering NO to
 //   menuHasKeyEquivalent does not stop AppKit from matching.) Multi-chord hot keys are drawn after a tab.
@@ -320,8 +321,9 @@ static bool ParseHotKey(const StringImpl& hotKey, NSString** outKey, NSEventModi
 
 		String modName = hotKey.Substring(start, plusIdx - start);
 		modName.Trim();
+		// Command acts as Control on macOS (SdlBFApp), so Ctrl bindings are shown as Cmd ones
 		if (modName.Equals("Ctrl", StringImpl::CompareKind_OrdinalIgnoreCase))
-			*outFlags |= NSEventModifierFlagControl;
+			*outFlags |= NSEventModifierFlagCommand;
 		else if (modName.Equals("Alt", StringImpl::CompareKind_OrdinalIgnoreCase))
 			*outFlags |= NSEventModifierFlagOption;
 		else if (modName.Equals("Shift", StringImpl::CompareKind_OrdinalIgnoreCase))
@@ -338,13 +340,42 @@ static bool ParseHotKey(const StringImpl& hotKey, NSString** outKey, NSEventModi
 	return GetKeyEquivalent(keyName, outKey, outFlags);
 }
 
-// "Ctrl+K, Ctrl+Shift+C" -> "⌃K, ⌃⇧C"
+// "Ctrl+K, Ctrl+Shift+C" -> "⌘K, ⇧⌘C". AppKit orders modifiers ⌃⌥⇧⌘; the IDE writes Ctrl+Alt+Shift, and its
+//  Ctrl is Command on macOS (SdlBFApp)
 static NSString* MakeHotKeyDisplay(const StringImpl& hotKey)
 {
-	NSMutableString* result = [ToNSString(hotKey) mutableCopy];
-	[result replaceOccurrencesOfString:@"Ctrl+" withString:@"⌃" options:0 range:NSMakeRange(0, result.length)];
-	[result replaceOccurrencesOfString:@"Alt+" withString:@"⌥" options:0 range:NSMakeRange(0, result.length)];
-	[result replaceOccurrencesOfString:@"Shift+" withString:@"⇧" options:0 range:NSMakeRange(0, result.length)];
+	NSMutableString* result = [NSMutableString string];
+	for (NSString* chord in [ToNSString(hotKey) componentsSeparatedByString:@", "])
+	{
+		NSString* rest = chord;
+		NSString* mods = @"";
+		bool hasCmd = false;
+		while (true)
+		{
+			if ([rest hasPrefix:@"Ctrl+"])
+			{
+				hasCmd = true;
+				rest = [rest substringFromIndex:5];
+			}
+			else if ([rest hasPrefix:@"Alt+"])
+			{
+				mods = [mods stringByAppendingString:@"⌥"];
+				rest = [rest substringFromIndex:4];
+			}
+			else if ([rest hasPrefix:@"Shift+"])
+			{
+				mods = [mods stringByAppendingString:@"⇧"];
+				rest = [rest substringFromIndex:6];
+			}
+			else
+				break;
+		}
+		if (hasCmd)
+			mods = [mods stringByAppendingString:@"⌘"];
+		if (result.length > 0)
+			[result appendString:@", "];
+		[result appendFormat:@"%@%@", mods, rest];
+	}
 	return result;
 }
 
