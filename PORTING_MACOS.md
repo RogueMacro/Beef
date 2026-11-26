@@ -365,6 +365,37 @@ What doesn't work yet / not verified:
   here; Docker isn't running) — same file format, code paths and system paths, but `/etc/localtime` copies (not
   symlinks) give Id `Local`.
 
+### Task 14 — native menu bar (done, needs hands-on testing)
+- Request (user, 2026-11-26): File/Edit/View/... in the macOS menu bar at the top of the screen, not inside the window.
+- Before: Windows uses native menus (`mMainWindow.mSysMenu` → `BFWindow_AddMenuItem`), every other platform draws
+  `IDE/src/ui/MenuBar.bf` inside `MainFrame`; `SdlBFWindow::AddMenuItem` returned NULL.
+- `BeefySysLib/platform/darwin/DarwinMenu.mm` (ARC, AppKit): `SdlBFWindow` creates a root menu for `BFWINDOW_MENU`
+  windows (only the IDE main window) and forwards Add/Modify/RemoveMenuItem under `__APPLE__`. The root replaces SDL's
+  default `[NSApp mainMenu]`: an app menu (Services, Hide ⌘H, Hide Others ⌥⌘H, Show All, Quit ⌘Q), then the IDE's
+  menus. The "Help" menu becomes `NSApp.helpMenu` (Spotlight menu search).
+  - Opening a submenu calls `mMenuItemSelectedFunc` with it (`menuNeedsUpdate:`), like `WM_INITMENUPOPUP` on Windows,
+    so the Beef update handlers refresh enabled/checked state. Item clicks are queued and delivered from
+    `DarwinMenu_DispatchPending()` at the end of `SdlBFApp::ProcessSDLEvents`, not from inside `SDL_PollEvent`.
+  - Quit runs the main window's close query (same as the close button), then removes it.
+  - **Shortcuts are display-only**; the IDE keeps handling keys (its bindings stay Ctrl-based, shown as ⌃). AppKit
+    matches item key equivalents even when the menu delegate answers NO to `menuHasKeyEquivalent:` (checked: ⌃F was
+    consumed by Edit ▸ Quick Find), so equivalents are only set while their menu is open (`menuWillOpen:` /
+    `menuDidClose:`). Multi-chord hot keys ("Ctrl+K, Ctrl+C") are drawn after a right-aligned tab in an attributed title.
+  - `&` mnemonics are stripped. NULL text/hot key in Modify keeps the current one, as on Windows.
+  - While a native modal (NSOpenPanel) runs, clicks and update calls are ignored. While a Beef modal dialog is up,
+    `BFWindow.NativeMenuItemSelected` (macOS only) ignores leaf items, since unlike Windows the menu bar isn't disabled.
+- IDE: `CreateMenu`, the MCP `GetMenuRoot` and `MainFrame` treat macOS like Windows (no `MenuBar` widget, no Alt+letter
+  menu opening). `bin/build.sh` bootstrap `LINKOPTS` gained `-framework AppKit` (Beefy2D's configs already had it).
+- Verified (lldb on the running IDE + MCP): `NSApp.mainMenu` = app menu + File…Help with the right items; key
+  equivalents `Control-F`, `Control-Shift-F`, `Shift-F3`, `Option-←` while open, none while closed;
+  `performKeyEquivalent:` returns NO for ⌃F and ⌃⌥O with menus closed, YES for ⌘Q (IDE then exits via close query);
+  update handler disables Debug items with no workspace; Help ▸ About opens the About dialog; a second About while it
+  is up is ignored. MCP screenshot: no in-window menu bar. `./bin/build.sh ide` passes.
+- **Not verified:** real mouse clicks / keyboard in the menu bar (no Accessibility permission here), look of the
+  attributed multi-chord items and of disabled items.
+- Known gaps: File ▸ Preferences and File ▸ Exit stay where they are (not moved to the app menu as Settings…/Quit);
+  no standard Window menu items (Minimize ⌘M, Zoom); IDE shortcuts remain Ctrl-based.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
@@ -377,6 +408,7 @@ What doesn't work yet / not verified:
 - Apple APIs: Obj-C++/C++ shims in `BeefySysLib/platform/darwin`, `BF_EXPORT`ed, linked frameworks listed in
   Beefy2D's macOS configs (user decision).
 - SDL stays dlopen'ed (no link-time dependency), with Homebrew prefixes as a fallback search path.
+- Menu bar: native NSMenu on macOS; shortcuts display-only, the IDE keeps handling keys (Task 14).
 - Debugger: the existing LLDB debugger, linked against Apple's `LLDB.framework` with Homebrew `lldb` headers
   (user picked Homebrew's liblldb; switched to the framework after liblldb 23 + LLVM 22 proved to crash, see Task 10).
 
