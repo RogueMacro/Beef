@@ -2164,7 +2164,7 @@ BfIRValue BfModule::CreateAllocaInst(BfTypeInstance* typeInst, bool addLifetime,
 	return allocaInst;
 }
 
-BfDeferredCallEntry* BfModule::AddStackAlloc(BfTypedValue val, BfIRValue arraySize, BfAstNode* refNode, BfScopeData* scopeData, bool condAlloca, bool mayEscape, BfIRBlock valBlock)
+BfDeferredCallEntry* BfModule::AddStackAlloc(BfTypedValue val, BfIRValue arraySize, BfAstNode* refNode, BfScopeData* scopeData, bool condAlloca, bool mayEscape, BfIRBlock valBlock, bool stackMarkable)
 {
 	//This was removed because we want the alloc to be added to the __deferred list if it's actually a "stack"
 	// 'stack' in a head scopeData is really the same as 'scopeData', so use the simpler scopeData handling
@@ -2177,6 +2177,45 @@ BfDeferredCallEntry* BfModule::AddStackAlloc(BfTypedValue val, BfIRValue arraySi
 	auto checkBaseType = val.mType->ToTypeInstance();
 	if ((checkBaseType != NULL) && (checkBaseType->IsObject()) && (!arraySize))
 	{
+		if (stackMarkable)
+		{
+			// Deferred calls run in reverse order: registered before the destructor's, the object leaves the GC's
+			//  stack-markable list after its destructor ran. Until then the GC marks what it still holds (the items
+			//  of an appended list its destructor deletes one by one), or it would take them for leaks.
+			auto gcType = ResolveTypeDef(mCompiler->mGCTypeDef);
+			BfModuleMethodInstance removeMethod;
+			if (gcType != NULL)
+				removeMethod = GetMethodByName(gcType->ToTypeInstance(), "RemoveStackMarkableObject", 1);
+			BF_ASSERT(removeMethod);
+			if (removeMethod)
+			{
+				bool isDynAlloc = mCurMethodState->mCurScope->IsDyn(scopeData);
+				BfIRBlock prevBlock = mBfIRBuilder->GetInsertBlock();
+				if (valBlock)
+					mBfIRBuilder->SetInsertPoint(valBlock);
+				BfIRValue objValue = mBfIRBuilder->CreateBitCast(val.mValue, mBfIRBuilder->MapType(mContext->mBfObjectType));
+				if (!objValue.IsConst())
+					mBfIRBuilder->ClearDebugLocation(objValue);
+				if (valBlock)
+					mBfIRBuilder->SetInsertPoint(prevBlock);
+				bool argNeedsLoad = (condAlloca) && (!isDynAlloc);
+				if (argNeedsLoad)
+				{
+					BF_ASSERT(!IsTargetingBeefBackend());
+					auto valPtr = CreateAlloca(mContext->mBfObjectType);
+					mBfIRBuilder->ClearDebugLocation_Last();
+					mBfIRBuilder->CreateAlignedStore(objValue, valPtr, mContext->mBfObjectType->mAlign);
+					mBfIRBuilder->ClearDebugLocation_Last();
+					objValue = valPtr;
+				}
+				SizedArray<BfIRValue, 1> llvmArgs;
+				llvmArgs.push_back(objValue);
+				auto deferredCall = AddDeferredCall(removeMethod, llvmArgs, scopeData, refNode);
+				if ((deferredCall != NULL) && (argNeedsLoad))
+					deferredCall->mArgsNeedLoad = true;
+			}
+		}
+
 		bool hadDtorCall = false;
 		while (checkBaseType != NULL)
 		{
@@ -8107,19 +8146,24 @@ BfIRValue BfModule::CreateTypeData(BfType* type, BfCreateTypeDataContext& ctx, b
 			includeMethod = true;
 
 		BfMethodCustomAttributes* methodCustomAttributes = NULL;
-		if ((defaultMethod->mMethodInfoEx != NULL) && (defaultMethod->mMethodInfoEx->mMethodCustomAttributes != NULL) && (defaultMethod->mMethodInfoEx->mMethodCustomAttributes->mCustomAttributes != NULL))
+		if ((defaultMethod->mMethodInfoEx != NULL) && (defaultMethod->mMethodInfoEx->mMethodCustomAttributes != NULL))
 		{
+			// This also holds the parameter and return value attributes, which need reflecting even when the method itself
+			//  has no attributes
 			methodCustomAttributes = defaultMethod->mMethodInfoEx->mMethodCustomAttributes;
-			for (auto& customAttr : defaultMethod->mMethodInfoEx->mMethodCustomAttributes->mCustomAttributes->mAttributes)
+			if (methodCustomAttributes->mCustomAttributes != NULL)
 			{
-				if (customAttr.mType->mTypeDef->mName->ToString() == "ReflectAttribute")
+				for (auto& customAttr : methodCustomAttributes->mCustomAttributes->mAttributes)
 				{
-					includeMethod = true;
-				}
-				else
-				{
-					auto userReflectKind = GetUserReflectKind(customAttr.mType);
-					methodReflectKind = (BfReflectKind)(methodReflectKind | userReflectKind);
+					if (customAttr.mType->mTypeDef->mName->ToString() == "ReflectAttribute")
+					{
+						includeMethod = true;
+					}
+					else
+					{
+						auto userReflectKind = GetUserReflectKind(customAttr.mType);
+						methodReflectKind = (BfReflectKind)(methodReflectKind | userReflectKind);
+					}
 				}
 			}
 		}
@@ -10334,6 +10378,9 @@ BfIRValue BfModule::AllocFromType(BfType* type, const BfAllocTarget& allocTarget
 	bool isRawArrayAlloc = (allocFlags & BfAllocFlags_RawArray) != 0;
 	bool zeroMemory = (allocFlags & BfAllocFlags_ZeroMemory) != 0;
 	bool noDtorCall = (allocFlags & BfAllocFlags_NoDtorCall) != 0;
+	// Only for AddStackAlloc: the flags go on to the runtime's allocation info
+	bool stackMarkable = (allocFlags & BfAllocFlags_StackMarkable) != 0;
+	allocFlags = (BfAllocFlags)(allocFlags & ~BfAllocFlags_StackMarkable);
 
 	if ((type->IsValuelessType()) && ((!arraySize) || (isRawArrayAlloc)))
 	{
@@ -10649,7 +10696,7 @@ BfIRValue BfModule::AllocFromType(BfType* type, const BfAllocTarget& allocTarget
 				auto loadedPtr = _CreateDynAlloc(sizeValue, typeInstance->mAlign);
 				auto typedVal = BfTypedValue(mBfIRBuilder->CreateBitCast(loadedPtr, mBfIRBuilder->MapTypeInstPtr(typeInstance)), typeInstance);
 				if (!noDtorCall)
-					AddStackAlloc(typedVal, arraySize, NULL, scopeData, mCurMethodState->mInConditionalBlock, true);
+					AddStackAlloc(typedVal, arraySize, NULL, scopeData, mCurMethodState->mInConditionalBlock, true, BfIRBlock(), stackMarkable);
 				InitTypeInst(typedVal, scopeData, zeroMemory, sizeValue);
 				return typedVal.mValue;
 			}
@@ -10716,7 +10763,7 @@ BfIRValue BfModule::AllocFromType(BfType* type, const BfAllocTarget& allocTarget
 					bool doCondAlloca = false;
 					if (!IsTargetingBeefBackend())
 						doCondAlloca = !wasDynAlloc && isDynAlloc && mCurMethodState->mInConditionalBlock;
-					AddStackAlloc(typedVal, arraySize, NULL, scopeData, doCondAlloca, true);
+					AddStackAlloc(typedVal, arraySize, NULL, scopeData, doCondAlloca, true, BfIRBlock(), stackMarkable);
 				}
 				InitTypeInst(typedVal, scopeData, zeroMemory, sizeValue, allocFlags);
 
@@ -10760,7 +10807,7 @@ BfIRValue BfModule::AllocFromType(BfType* type, const BfAllocTarget& allocTarget
 				}
 			}
 			if (!noDtorCall)
-				AddStackAlloc(typedVal, BfIRValue(), NULL, scopeData, false, true);
+				AddStackAlloc(typedVal, BfIRValue(), NULL, scopeData, false, true, BfIRBlock(), stackMarkable);
 			if (typeInstance != NULL)
 			{
 				InitTypeInst(typedVal, scopeData, zeroMemory, GetConstValue(typeInstance->mInstSize));
@@ -13013,6 +13060,11 @@ BfIRValue BfModule::ConstantToCurrent(BfConstant* constant, BfIRConstHolder* con
 				InternalError("BfModule::ConstantToCurrent typeInst error");
 				return BfIRValue();
 			}
+
+			// The fields below map the constant's values: a type rebuilt since the constant was made (a module being
+			//  reified rebuilds its types) has no field instances until it is populated again.
+			if (wantTypeInst->IsIncomplete())
+				PopulateType(wantTypeInst, BfPopulateType_Data);
 
 			if (wantTypeInst->mBaseType != NULL)
 			{
@@ -21486,6 +21538,40 @@ void BfModule::EmitGCMarkValue(BfTypedValue& thisValue, BfType* checkType, int m
 	{
 		EmitGCMarkValue(thisValue, typeInstance->mBaseType, memberDepth, curOffset, objectOffsets, markFromGCThreadMethodInstance);
 	}
+}
+
+bool BfModule::WantsStackMarking(BfTypeInstance* typeInstance, BfAllocFlags allocFlags)
+{
+	// A scope object is marked by the GC as a stack-markable object when its GCMarkMembers does more than Object's
+	// Called before AllocFromType, so the methods may not be slotted yet (an anonymous type's are not)
+	PopulateType(typeInstance, BfPopulateType_DataAndMethods);
+	BfMethodInstance* markMethod = GetRawMethodByName(mContext->mBfObjectType, "GCMarkMembers");
+	BF_ASSERT(markMethod != NULL);
+	if (markMethod == NULL)
+		return false;
+	if (markMethod->mVirtualTableIdx >= typeInstance->mVirtualMethodTable.mSize)
+	{
+		// Marking an object whose GCMarkMembers is Object's costs nothing, so err that way
+		BF_ASSERT(typeInstance->IsIncomplete());
+		return true;
+	}
+	auto& vtableEntry = typeInstance->mVirtualMethodTable[markMethod->mVirtualTableIdx];
+	if (vtableEntry.mImplementingMethod.mTypeInstance == mContext->mBfObjectType)
+		return false;
+	if (allocFlags & BfAllocFlags_HasAppendWantMark)
+		return true;
+	auto impMethodInstance = (BfMethodInstance*)vtableEntry.mImplementingMethod;
+	if (impMethodInstance != NULL)
+	{
+		if (impMethodInstance->mMethodDef->mBody != NULL)
+			return true;
+	}
+	else
+	{
+		BF_ASSERT(vtableEntry.mImplementingMethod.mKind == BfMethodRefKind_AmbiguousRef);
+		return true;
+	}
+	return typeInstance->HasAppendedField(true);
 }
 
 void BfModule::EmitGCMarkMembers()
