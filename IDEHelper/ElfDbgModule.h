@@ -2,7 +2,10 @@
 
 #include "DbgModule.h"
 #include "BeefySysLib/util/MappedFile.h"
+#ifdef __linux__
+// ElfDbgModule.cpp is only built on Linux; elsewhere (macOS: LLDBDebuggerHost/Shadow) only the class declaration is needed
 #include <elf.h>
+#endif
 
 NS_BF_DBG_BEGIN
 
@@ -47,7 +50,9 @@ public:
 
 protected:
 	void ReadSymbols(const ElfSection* symTab, const ElfSection* strTab);
+#ifdef __linux__
 	bool RelocateDebugSections(const uint8* data, const Elf64_Shdr* shdrs, int numSections);
+#endif
 	void RemoveUnusedSrcFiles();
 };
 

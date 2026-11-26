@@ -632,6 +632,10 @@ bool LLDBDebugger::HostFindThreadLocalAddress(lldb::SBFrame& frame, const char* 
 
 void LLDBDebugger::HostLoadHotObject(const StringImpl& path, int hotIdx, addr_target imageAddr, int64 imageSize, const Array<addr_target>& sectionAddrs, const Array<uint64>& symbolAddrs)
 {
+#ifndef __linux__
+	// No Mach-O debug info layer: on macOS hot objects are only registered with LLDB as modules
+	return;
+#else
 	AutoCrit autoCrit(mDebugManager->mCritSect);
 	if ((mDebugTarget == NULL) || (mDebugTarget->mTargetBinary == NULL))
 		return;
@@ -651,6 +655,7 @@ void LLDBDebugger::HostLoadHotObject(const StringImpl& path, int hotIdx, addr_ta
 	dbgModule->mOrigImageData = new DbgModuleMemoryCache(dbgModule->mImageBase, dbgModule->mImageSize);
 	mDebugTarget->AddDbgModule(dbgModule);
 	LLDBLog("HostLoadHotObject: %s at 0x%llx, %d subprograms\n", path.c_str(), (unsigned long long)imageAddr, (int)dbgModule->mSubprograms.size());
+#endif
 }
 
 void LLDBDebugger::HostFinishHotLoad()
