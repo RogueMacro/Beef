@@ -415,6 +415,17 @@ What doesn't work yet / not verified:
   wrapper on PATH (finds `/opt/homebrew/opt/llvm@22/bin/llvm-config`) and with no brew (empty, so the error path);
   `./bin/build.sh ide` passes. **Not verified:** a really fresh Mac (actual installs, CLT-only machine, Intel).
 
+### Task 16 — GitHub Actions macOS build (written, not yet run)
+- `.github/workflows/build.yml`: upstream's `build-macos` job (`if: false` since `88e4b36f` "Disable broken macOS
+  build"; plain `bin/build.sh` on macos-latest + macos-15-intel) is replaced by `build-macos-ide`: `macos-15` (arm64),
+  `bin/setup_macos.sh` (installs the Brewfile formulas, checks Xcode's `LLDB.framework`), then `bin/build.sh ide`
+  (native libs, BeefBuild + IDEHelper tests, both IDE configs). Timeout 90 min. Intel dropped: the port is arm64-only.
+- The Windows/Linux jobs are unchanged and still run on every push.
+- Unverified until the first run: brew install time on the runner (lldb pulls Homebrew's llvm as a dependency), the
+  runner's default Xcode `LLDB.framework` linking against Homebrew lldb's headers, build time vs the timeout.
+- No artifacts yet: the binaries link Homebrew's libLLVM by absolute path and dlopen Homebrew's SDL3, so they only run
+  on a machine set up the same way. Uploading an `.app` belongs with the packaging work.
+
 ## Decisions
 
 - Uncommitted user edit to `bin/build.sh` (re-indent + brew `CMAKE_EXTRA_ARGS`) is left alone, not
