@@ -222,7 +222,7 @@ namespace IDE
 
 		static SysMenu GetMenuRoot()
 		{
-#if BF_PLATFORM_WINDOWS
+#if BF_PLATFORM_WINDOWS || BF_PLATFORM_MACOS
 			return gApp.mMainWindow?.mSysMenu;
 #else
 			return gApp.[Friend]mMainFrame.mMenuBar.mSysMenuRoot;

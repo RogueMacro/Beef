@@ -5,6 +5,9 @@
 #include "platform/PlatformHelper.h"
 #include "platform/PlatformInterface.h"
 #include "img/PNGData.h"
+#ifdef __APPLE__
+#include "platform/darwin/DarwinMenu.h"
+#endif
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_hints.h>
@@ -400,6 +403,12 @@ SdlBFWindow::SdlBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 	mParent = parent;
 	if (parent != NULL)
 		parent->mChildren.push_back(this);
+
+#ifdef __APPLE__
+	// The window's menu lives in the macOS menu bar
+	if ((windowFlags & BFWINDOW_MENU) != 0)
+		mMenu = DarwinMenu_CreateRoot(this);
+#endif
 
 	// Show window after positioning adjustment
 	if ((windowFlags & BFWINDOW_NOSHOW) == 0)
@@ -985,6 +994,10 @@ void SdlBFApp::ProcessSDLEvents()
 			break;
 		}
 	}
+
+#ifdef __APPLE__
+	DarwinMenu_DispatchPending();
+#endif
 }
 
 void SdlBFApp::Init()
@@ -1316,11 +1329,25 @@ void SdlBFApp::SetClipboardData(const StringImpl& format, const void* ptr, int s
 
 BFMenu* SdlBFWindow::AddMenuItem(BFMenu* parent, int insertIdx, const char* text, const char* hotKey, BFSysBitmap* bitmap, bool enabled, int checkState, bool radioCheck)
 {
+#ifdef __APPLE__
+	return DarwinMenu_AddItem(this, parent, insertIdx, text, hotKey, enabled, checkState, radioCheck);
+#else
 	return NULL;
+#endif
+}
+
+void SdlBFWindow::ModifyMenuItem(BFMenu* item, const char* text, const char* hotKey, BFSysBitmap* bitmap, bool enabled, int checkState, bool radioCheck)
+{
+#ifdef __APPLE__
+	DarwinMenu_ModifyItem(item, text, hotKey, enabled, checkState, radioCheck);
+#endif
 }
 
 void SdlBFWindow::RemoveMenuItem(BFMenu* item)
 {
+#ifdef __APPLE__
+	DarwinMenu_RemoveItem(item);
+#endif
 }
 
 BFSysBitmap* SdlBFApp::LoadSysBitmap(const wchar_t* fileName)

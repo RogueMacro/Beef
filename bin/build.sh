@@ -115,7 +115,7 @@ cd ../IDE/dist
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
   LIBEXT=dylib
-  LINKOPTS="-Wl,-no_compact_unwind -Wl,-rpath -Wl,@executable_path -framework CoreText -framework CoreFoundation"
+  LINKOPTS="-Wl,-no_compact_unwind -Wl,-rpath -Wl,@executable_path -framework CoreText -framework CoreFoundation -framework AppKit"
 else
   LIBEXT=so
   LINKOPTS="-ldl -lpthread -Wl,-rpath -Wl,\$ORIGIN"

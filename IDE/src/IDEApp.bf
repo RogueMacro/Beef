@@ -6561,7 +6561,8 @@ namespace IDE
 			CreateMenu_Populate(rootInfo);
 
 			SysMenu root;
-#if BF_PLATFORM_WINDOWS
+#if BF_PLATFORM_WINDOWS || BF_PLATFORM_MACOS
+			// Native menu bar (the macOS one sits at the top of the screen)
 			root = mMainWindow.mSysMenu;
 #else
 			root = mMainFrame.mMenuBar.mSysMenuRoot;
@@ -9109,7 +9110,7 @@ namespace IDE
 				evt.mHandled = true;
 			}
 
-#if !BF_PLATFORM_WINDOWS
+#if !BF_PLATFORM_WINDOWS && !BF_PLATFORM_MACOS
 			if (evt.mKeyFlags.HeldKeys == .Alt)
 			{
 				for (var btn in mMainFrame.mMenuBar.mButtons)

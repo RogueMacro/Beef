@@ -747,6 +747,12 @@ namespace Beefy
         public virtual void NativeMenuItemSelected(void* menu)
         {
             SysMenu aSysMenu = mSysMenuMap[(int)menu];
+#if BF_PLATFORM_MACOS
+			// The macOS menu bar stays usable while a modal dialog is up (Windows disables the owner window instead).
+			//  Opening a submenu (which only refreshes its items) is fine, running an item isn't.
+			if ((aSysMenu.mChildren == null) && (BFApp.sApp.HasModalDialogs()))
+				return;
+#endif
             MenuItemSelected(aSysMenu);
         }
 
