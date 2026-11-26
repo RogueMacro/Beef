@@ -22,6 +22,17 @@ The Beef IDE supports productivity features such as autocomplete, fixits, reform
 [Stable Releases](https://github.com/beefytech/Beef/releases)<br>
 [Nightly Windows Release](https://nightly.beeflang.org/BeefSetup.exe)<br>
 
+# Building on macOS (unofficial port)
+
+The IDE and toolchain build natively on Apple Silicon Macs. This port is not officially supported; see
+[PORTING_MACOS.md](PORTING_MACOS.md) for its status and known gaps.
+
+```sh
+bin/setup_macos.sh     # checks Xcode / Command Line Tools, installs missing Homebrew packages from the Brewfile
+./bin/build.sh ide     # builds the native libs, BeefBuild (and runs its tests) and the IDE
+IDE/dist/BeefIDE_d     # debug IDE; IDE/dist/BeefIDE is the release build
+```
+
 # IDE Screenshots
 
 ![Screenshot](IDE/screenshot0.gif)

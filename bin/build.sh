@@ -49,8 +49,15 @@ else
   echo "Ninja isn't installed, consider installing it for faster build speeds."
 fi
 
+# Homebrew's llvm@22 is keg-only, so it's usually not on PATH
+BREW_LLVM_CONFIG=""
+if [[ "$OSTYPE" == "darwin"* ]] && [ "$(command -v brew)" ]; then
+  BREW_LLVM_CONFIG="$(brew --prefix llvm@22 2>/dev/null)/bin/llvm-config"
+fi
+
 LLVM_CONFIG=$(command -v llvm-config-22 2>/dev/null ||
   command -v /usr/lib/llvm22/bin/llvm-config 2>/dev/null ||
+  { [ -n "$BREW_LLVM_CONFIG" ] && command -v "$BREW_LLVM_CONFIG" 2>/dev/null; } ||
   command -v llvm-config 2>/dev/null)
 LLVM_FOUND=0
 LLVM_DIR=""
@@ -73,7 +80,11 @@ set -e
 ### Dependencies ###
 
 if [ $LLVM_FOUND == 0 ]; then
-  echo "ERROR: LLVM 22.1 was not detected on your system. Please install the package 'llvm-22-dev' and try again." >&2
+  if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo "ERROR: LLVM 22.1 was not detected on your system. Run bin/setup_macos.sh (or 'brew install llvm@22') and try again." >&2
+  else
+    echo "ERROR: LLVM 22.1 was not detected on your system. Please install the package 'llvm-22-dev' and try again." >&2
+  fi
   exit 1
 fi
 
