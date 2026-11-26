@@ -7,52 +7,51 @@ ROOTPATH="$(dirname "$SCRIPTPATH")"
 echo Building from $SCRIPTPATH
 cd $SCRIPTPATH
 
-for i in "$@"
-do
-	if [[ $i == "clean" ]]; then
-		echo "Cleaning..."
-		rm -rf ../jbuild
-		rm -rf ../jbuild_d
-		exit
-	fi
+for i in "$@"; do
+  if [[ $i == "clean" ]]; then
+    echo "Cleaning..."
+    rm -rf ../jbuild
+    rm -rf ../jbuild_d
+    exit
+  fi
 
-	if [[ $i == "ide" ]]; then
-		echo "Enabled IDE build"
-		USE_SDL="-DBF_ENABLE_SDL=1"
-		BUILD_IMGCREATE="-DBUILD_IMGCREATE=1"
-		BUILD_IDE=1
-	fi
+  if [[ $i == "ide" ]]; then
+    echo "Enabled IDE build"
+    USE_SDL="-DBF_ENABLE_SDL=1"
+    BUILD_IMGCREATE="-DBUILD_IMGCREATE=1"
+    BUILD_IDE=1
+  fi
 
-	if [[ $i == "package" ]]; then
-		echo "Building for packaging"
-		PACKAGE_DEFINE="-define=LINUX_PACKAGE"
-	fi
+  if [[ $i == "package" ]]; then
+    echo "Building for packaging"
+    PACKAGE_DEFINE="-define=LINUX_PACKAGE"
+  fi
 
-	if [[ $i == "no_ffi" ]]; then
-		echo "Disabling FFI"
-		USE_FFI="-DBF_DISABLE_FFI=1"
-	fi
+  if [[ $i == "no_ffi" ]]; then
+    echo "Disabling FFI"
+    USE_FFI="-DBF_DISABLE_FFI=1"
+  fi
 done
 
-if command -v ninja >/dev/null 2>&1 ; then
-	CAN_USE_NINJA=1
-	if [ -d ../jbuild_d ] && [ ! -f ../jbuild_d/build.ninja ]; then
-		CAN_USE_NINJA=0
-	fi
+if command -v ninja >/dev/null 2>&1; then
+  CAN_USE_NINJA=1
+  if [ -d ../jbuild_d ] && [ ! -f ../jbuild_d/build.ninja ]; then
+    CAN_USE_NINJA=0
+  fi
 
-	if [ $CAN_USE_NINJA == 1 ]; then
-		echo "Ninja is enabled for this build."
-		USE_NINJA="-GNinja"
-	else
-		echo "Ninja couldn't be enabled for this build, consider doing a clean build to start using Ninja for faster build speeds."
-	fi
+  if [ $CAN_USE_NINJA == 1 ]; then
+    echo "Ninja is enabled for this build."
+    USE_NINJA="-GNinja"
+  else
+    echo "Ninja couldn't be enabled for this build, consider doing a clean build to start using Ninja for faster build speeds."
+  fi
 else
-	echo "Ninja isn't installed, consider installing it for faster build speeds."
+  echo "Ninja isn't installed, consider installing it for faster build speeds."
 fi
 
 LLVM_CONFIG=$(command -v llvm-config-22 2>/dev/null ||
-              command -v /usr/lib/llvm22/bin/llvm-config 2>/dev/null ||
-              command -v llvm-config 2>/dev/null)
+  command -v /usr/lib/llvm22/bin/llvm-config 2>/dev/null ||
+  command -v llvm-config 2>/dev/null)
 LLVM_FOUND=0
 LLVM_DIR=""
 
@@ -74,50 +73,52 @@ set -e
 ### Dependencies ###
 
 if [ $LLVM_FOUND == 0 ]; then
-	echo "ERROR: LLVM 22.1 was not detected on your system. Please install the package 'llvm-22-dev' and try again." >&2
-	exit 1
+  echo "ERROR: LLVM 22.1 was not detected on your system. Please install the package 'llvm-22-dev' and try again." >&2
+  exit 1
 fi
 
 if [ ! -f ../BeefySysLib/third_party/libffi/Makefile ]; then
-	echo Building libffi...
-	cd ../BeefySysLib/third_party/libffi
-	./configure --disable-docs
-	make
-	cd $SCRIPTPATH
+  echo Building libffi...
+  cd ../BeefySysLib/third_party/libffi
+  ./configure --disable-docs
+  make
+  cd $SCRIPTPATH
 fi
 
 ### LIBS ###
 
-if [[ "$OSTYPE" == "darwin"* ]] && \
-	[ "$(command -v brew)" ]; then
-	export LIBRARY_PATH=$(brew --prefix llvm@22)/lib
-	export LD_RUN_PATH=$(brew --prefix llvm@22)/lib
+CMAKE_EXTRA_ARGS=""
+if [[ "$OSTYPE" == "darwin"* ]] && [ "$(command -v brew)" ]; then
+  BREW_PREFIX=$(brew --prefix)
+  export LIBRARY_PATH=$(brew --prefix llvm@22)/lib
+  export LD_RUN_PATH=$(brew --prefix llvm@22)/lib
+  CMAKE_EXTRA_ARGS="-DCMAKE_PREFIX_PATH=$BREW_PREFIX -DCMAKE_CXX_FLAGS=-I$BREW_PREFIX/include"
 fi
 
 cd ..
 if [ ! -d jbuild_d ]; then
-	mkdir jbuild_d
-	mkdir jbuild
+  mkdir jbuild_d
+  mkdir jbuild
 fi
 
 cd jbuild_d
 
-echo cmake -DLLVM_DIR="$LLVM_DIR" $USE_NINJA $USE_SDL -DCMAKE_BUILD_TYPE=Debug ../
+echo cmake -DLLVM_DIR="$LLVM_DIR" $USE_NINJA $USE_SDL $USE_FFI $CMAKE_EXTRA_ARGS -DCMAKE_BUILD_TYPE=Debug ../
 
-cmake -DLLVM_DIR="$LLVM_DIR" $USE_NINJA $USE_SDL $USE_FFI -DCMAKE_BUILD_TYPE=Debug ../
+cmake -DLLVM_DIR="$LLVM_DIR" $USE_NINJA $USE_SDL $USE_FFI $CMAKE_EXTRA_ARGS -DCMAKE_BUILD_TYPE=Debug ../
 cmake --build .
 cd ../jbuild
-cmake -DLLVM_DIR="$LLVM_DIR" $USE_NINJA $USE_SDL $USE_FFI $BUILD_IMGCREATE -DCMAKE_BUILD_TYPE=RelWithDebInfo ../
+cmake -DLLVM_DIR="$LLVM_DIR" $USE_NINJA $USE_SDL $USE_FFI $BUILD_IMGCREATE $CMAKE_EXTRA_ARGS -DCMAKE_BUILD_TYPE=RelWithDebInfo ../
 cmake --build .
 
 cd ../IDE/dist
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
-	LIBEXT=dylib
-	LINKOPTS="-Wl,-no_compact_unwind -Wl,-rpath -Wl,@executable_path -framework CoreText -framework CoreFoundation"
+  LIBEXT=dylib
+  LINKOPTS="-Wl,-no_compact_unwind -Wl,-rpath -Wl,@executable_path -framework CoreText -framework CoreFoundation"
 else
-	LIBEXT=so
-	LINKOPTS="-ldl -lpthread -Wl,-rpath -Wl,\$ORIGIN"
+  LIBEXT=so
+  LINKOPTS="-ldl -lpthread -Wl,-rpath -Wl,\$ORIGIN"
 fi
 
 ln -s -f $ROOTPATH/jbuild_d/Debug/bin/libBeefRT_d.a libBeefRT_d.a
@@ -140,7 +141,7 @@ ln -s -f $ROOTPATH/jbuild/Release/bin/libIDEHelper.a ../../BeefLibs/Beefy2D/dist
 ### DEBUG ###
 
 echo Building BeefBuild_bootd
-../../jbuild_d/Debug/bin/BeefBoot --out="BeefBuild_bootd" --src=../src --src=../../BeefBuild/src --src=../../BeefLibs/corlib/src --src=../../BeefLibs/Beefy2D/src --define=CLI --define=DEBUG --startup=BeefBuild.Program --linkparams="./libBeefRT_d.a ./libIDEHelper_d.a ./libBeefySysLib_d.a ./libhunspell.$LIBEXT $(< ../../IDE/dist/IDEHelper_libs_d.txt) $LINKOPTS"
+../../jbuild_d/Debug/bin/BeefBoot --out="BeefBuild_bootd" --src=../src --src=../../BeefBuild/src --src=../../BeefLibs/corlib/src --src=../../BeefLibs/Beefy2D/src --define=CLI --define=DEBUG --startup=BeefBuild.Program --linkparams="./libBeefRT_d.a ./libIDEHelper_d.a ./libBeefySysLib_d.a ./libhunspell.$LIBEXT $(<../../IDE/dist/IDEHelper_libs_d.txt) $LINKOPTS"
 echo Building BeefBuild_d
 ./BeefBuild_bootd -clean -proddir=../../BeefBuild -config=Debug $PACKAGE_DEFINE
 echo Testing IDEHelper/Tests in BeefBuild_d
@@ -149,7 +150,7 @@ echo Testing IDEHelper/Tests in BeefBuild_d
 ### RELEASE ###
 
 echo Building BeefBuild_boot
-../../jbuild/Release/bin/BeefBoot --out="BeefBuild_boot" --src=../src --src=../../BeefBuild/src --src=../../BeefLibs/corlib/src --src=../../BeefLibs/Beefy2D/src --define=CLI --startup=BeefBuild.Program --linkparams="./libBeefRT.a ./libIDEHelper.a ./libBeefySysLib.a ./libhunspell.$LIBEXT $(< ../../IDE/dist/IDEHelper_libs.txt) $LINKOPTS"
+../../jbuild/Release/bin/BeefBoot --out="BeefBuild_boot" --src=../src --src=../../BeefBuild/src --src=../../BeefLibs/corlib/src --src=../../BeefLibs/Beefy2D/src --define=CLI --startup=BeefBuild.Program --linkparams="./libBeefRT.a ./libIDEHelper.a ./libBeefySysLib.a ./libhunspell.$LIBEXT $(<../../IDE/dist/IDEHelper_libs.txt) $LINKOPTS"
 echo Building BeefBuild
 ./BeefBuild_boot -clean -proddir=../../BeefBuild -config=Release $PACKAGE_DEFINE
 echo Testing IDEHelper/Tests in BeefBuild
@@ -158,10 +159,10 @@ echo Testing IDEHelper/Tests in BeefBuild
 ### IDE ###
 if [ -n "$BUILD_IDE" ]; then
 
-	echo Building BeefIDE_d
-	./BeefBuild -clean -proddir=../ -config=Debug $PACKAGE_DEFINE
-	echo Building BeefIDE
-	./BeefBuild -clean -proddir=../ -config=Release $PACKAGE_DEFINE
+  echo Building BeefIDE_d
+  ./BeefBuild -clean -proddir=../ -config=Debug $PACKAGE_DEFINE
+  echo Building BeefIDE
+  ./BeefBuild -clean -proddir=../ -config=Release $PACKAGE_DEFINE
 
-	ln -s -f $ROOTPATH/jbuild/Release/bin/ImgCreate images/ImgCreate
+  ln -s -f $ROOTPATH/jbuild/Release/bin/ImgCreate images/ImgCreate
 fi
