@@ -18,6 +18,27 @@ namespace Beefy.widgets
         public bool mIsSelected;
         public MenuWidget mSubMenu;
 
+        public override void Describe(Beefy.utils.StructuredData data)
+        {
+            base.Describe(data);
+            if (mMenuItem == null)
+                return;
+            if (mMenuItem.mLabel != null)
+                data.Add("label", mMenuItem.mLabel);
+            else
+                data.Add("separator", true);
+            if (mMenuItem.mDisabled)
+                data.Add("disabled", true);
+            if (mMenuItem.IsParent)
+                data.Add("submenu", true);
+            if (mMenuItem.mBold)
+                data.Add("bold", true);
+            if (mMenuItem.mIconImage != null)
+                data.Add("icon", true);
+            if (mIsSelected)
+                data.Add("selected", true);
+        }
+
         public this(Menu menuItem)
         {
             mMenuItem = menuItem;
@@ -214,7 +235,7 @@ namespace Beefy.widgets
 
 			float maxY = workspaceY + workspaceHeight;
 
-            if ((!allowScrollable) && (screenX + width > workspaceWidth))
+            if ((!allowScrollable) && (screenX + width > workspaceX + workspaceWidth))
                 screenX = screenX - width + mPopupInsets.mRight;
             else
                 screenX -= mPopupInsets.mLeft;
@@ -226,7 +247,21 @@ namespace Beefy.widgets
 			}
 
             if ((!allowScrollable) && (screenY + height > maxY))
+			{
                 screenY = screenY - height + mPopupInsets.mBottom;
+				// Too tall for either side of its anchor: overlap the anchor rather than leave the screen.
+				if (screenY < workspaceY)
+				{
+					screenY = workspaceY;
+					if (height > workspaceHeight)
+					{
+						menuContainer.InitScrollbars(false, true);
+						height = workspaceHeight;
+						menuRect = menuContainer.CalcRectFromContent();
+						width = Math.Min(mMaxContainerWidth, Math.Max(mMinContainerWidth, menuRect.mWidth));
+					}
+				}
+			}
             else
             {
                 screenY -= mPopupInsets.mTop;
@@ -319,6 +354,15 @@ namespace Beefy.widgets
 
             MenuContainer menuContainer;
 
+			void FixWindowPos(BFWindow parentWindow, ref float screenY, ref float screenHeight)
+			{
+				if ((parentWindow != null) && (!parentWindow.mPositionKnown))
+				{
+					// We can't adjust height based on staying "on-screen" on window managers that hide our true window position
+					screenHeight = Math.Min(screenHeight, parentWindow.mClientHeight - screenY);
+				}
+			}
+
             if (curWidgetWindow == null)
             {
                 menuContainer = CreateMenuContainer();                                
@@ -334,6 +378,7 @@ namespace Beefy.widgets
 				screenHeight = Math.Max(screenHeight, 32);
 
 				WidgetWindow parentWindow = (relativeWidget != null) ? relativeWidget.mWidgetWindow : null;
+				FixWindowPos(parentWindow, ref screenY, ref screenHeight);
                 curWidgetWindow = new WidgetWindow(parentWindow,
                     "Popup",
                     (int32)(screenX), (int32)(screenY),
@@ -366,6 +411,7 @@ namespace Beefy.widgets
                 float screenHeight;
                 CalcContainerSize(x, y, menuContainer, allowScrollable, ref screenX, ref screenY, out screenWidth, out screenHeight);
 
+				FixWindowPos(curWidgetWindow.mParent, ref screenY, ref screenHeight);
                 curWidgetWindow.Resize((int32)(screenX), (int32)(screenY),
                     (int32)screenWidth, (int32)screenHeight);
             }

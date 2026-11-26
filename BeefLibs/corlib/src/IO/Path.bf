@@ -9,6 +9,21 @@ namespace System.IO
 {
 	public static class Path
 	{
+		public enum CompareKind
+		{
+			/// Character for character; the paths must already use DirectorySeparatorChar.
+			Strict,
+			/// Either separator, repeated or trailing separators, and "." / ".." components.
+			Lenient
+		}
+
+		enum RootKind
+		{
+			Relative,
+			Rooted,
+			UNC
+		}
+
 #if BF_PLATFORM_WINDOWS
 		public const char8 DirectorySeparatorChar = '\\';
 #else
@@ -402,6 +417,86 @@ namespace System.IO
 		    return filePathA.Equals(filePathB, !Environment.IsFileSystemCaseSensitive);
 		}
 
+		/// Lexical only: the file system is not consulted, so links are not resolved.
+		public static bool Equals(StringView filePathA, StringView filePathB, CompareKind compareKind)
+		{
+			if (compareKind == .Strict)
+				return Equals(filePathA, filePathB);
+
+			var pathA = filePathA;
+			var pathB = filePathB;
+			bool ignoreCase = !Environment.IsFileSystemCaseSensitive;
+			let rootA = TakeRoot(ref pathA, var driveA);
+			let rootB = TakeRoot(ref pathB, var driveB);
+			if ((rootA != rootB) || (!driveA.Equals(driveB, ignoreCase)))
+				return false;
+
+			int parentsA = 0;
+			int parentsB = 0;
+			while (true)
+			{
+				bool hasA = TakeLastComponent(ref pathA, ref parentsA, var componentA);
+				bool hasB = TakeLastComponent(ref pathB, ref parentsB, var componentB);
+				if (hasA != hasB)
+					return false;
+				if (!hasA)
+					break;
+				if (!componentA.Equals(componentB, ignoreCase))
+					return false;
+			}
+			// ".." cannot climb above a root.
+			return (rootA != .Relative) || (parentsA == parentsB);
+		}
+
+		static RootKind TakeRoot(ref StringView path, out StringView drive)
+		{
+			drive = default;
+#if BF_PLATFORM_WINDOWS
+			if ((path.Length >= 2) && (path[1] == ':'))
+			{
+				drive = path.Substring(0, 2);
+				path.RemoveFromStart(2);
+			}
+#endif
+			int separators = 0;
+			while ((separators < path.Length) && (IsDirectorySeparatorChar(path[separators])))
+				separators++;
+			path.RemoveFromStart(separators);
+			if (separators == 0)
+				return .Relative;
+			return ((separators == 2) && (drive.IsEmpty)) ? .UNC : .Rooted;
+		}
+
+		// Walks backward so a ".." can cancel the component before it without building a list.
+		// `parents` ends as the ".." components nothing cancelled.
+		static bool TakeLastComponent(ref StringView path, ref int parents, out StringView component)
+		{
+			while (!path.IsEmpty)
+			{
+				int start = path.Length;
+				while ((start > 0) && (!IsDirectorySeparatorChar(path[start - 1])))
+					start--;
+				component = path.Substring(start);
+				path.RemoveFromEnd(path.Length - Math.Max(start - 1, 0));
+
+				if ((component.IsEmpty) || (component == "."))
+					continue;
+				if (component == "..")
+				{
+					parents++;
+					continue;
+				}
+				if (parents > 0)
+				{
+					parents--;
+					continue;
+				}
+				return true;
+			}
+			component = default;
+			return false;
+		}
+
 		static void GetDriveStringTo(String outDrive, String path)
 		{
 		    if ((path.Length >= 2) && (path[1] == ':'))
@@ -427,7 +522,7 @@ namespace System.IO
 		    if (curPath1.Contains(Path.AltDirectorySeparatorChar))
 		        curPath1.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
 		    if (curPath2.Contains(Path.AltDirectorySeparatorChar))
-		        curPath1.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+		        curPath2.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
 
 		    String driveString1 = scope String();
 		    GetDriveStringTo(driveString1, curPath1);
@@ -517,6 +612,12 @@ namespace System.IO
 			if ((relPath.Length > 1) &&
 				((relPath[0] == '/') || (relPath[0] == '\\')))
 			{
+				if ((relToAbsPath.Length >= 2) && (relToAbsPath[1] == ':'))
+				{
+					// Drive letter
+					outAbsPath.Append(relToAbsPath.Substring(0, 2));
+				}
+
 				outAbsPath.Append(relPath);
 				return;
 			}

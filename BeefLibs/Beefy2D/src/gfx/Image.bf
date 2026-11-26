@@ -20,7 +20,45 @@ namespace Beefy.gfx
 			Additive = 1,
 			NoPremult = 2,
 			AllowRead = 4,
-			FatalError = 8
+			FatalError = 8,
+			Mipmaps = 0x10,
+			// Color data: stored sRGB-encoded, hardware-decoded to linear on sample.
+			Srgb = 0x20,
+			// Keep the uploaded pixels in system memory. GetBits needs no copy (it reads back from the
+			// GPU); this is for a caller that wants them resident.
+			KeepPixels = 0x80
+		}
+
+		public enum RenderTargetFlags
+		{
+			None,
+			Alpha = 1,
+			Shared = 2,
+			// Single-channel R32_FLOAT instead of RGBA8 -- for data render targets that need real
+			// float precision rather than 8-bit-per-channel color storage.
+			HighPrecision = 4,
+			// Single-channel R8_UNORM -- for scalar masks (eg SSAO).
+			R8 = 8,
+			// RGBA16F -- for linear HDR scene color.
+			F16 = 0x10,
+			// Full mip chain, regenerated on demand with GenerateMips (1-sample, unshared only).
+			Mipmaps = 0x20,
+			// Two-channel R8G8_UNORM -- for paired scalar data (eg AO + packed edges).
+			RG8 = 0x40,
+			// Single-channel R16_FLOAT -- for half-precision data (eg linear depth for screen effects).
+			R16F = 0x80,
+			// Single-channel R32_UINT -- for compute atomics; not filterable, no mips.
+			R32Uint = 0x100,
+			// Also bindable as a compute UAV (RWTexture2D, mip 0); 1-sample, unshared only.
+			UnorderedAccess = 0x200,
+			// Two-channel R16G16_FLOAT -- paired half data (eg a ping-pong sim's h(t) + h(t-1)).
+			RG16F = 0x400,
+			// A depth plane, for a target drawn depth-tested (the scene target, pick buffers, a prepass
+			// whose depth is sampled). A target without one that a depth-testing state draws into gets
+			// one on first use, at a frame's cost.
+			Depth = 0x800,
+			// Includes a depth plane.
+			Stencil = 0x1000
 		}
 
         public Image mSrcTexture;
@@ -34,6 +72,8 @@ namespace Beefy.gfx
         public float mY;
         public void* mNativeTextureSegment;
         public PixelSnapping mPixelSnapping = PixelSnapping.Auto;
+		// Lazily built by RawView, owned by this Image. Null until something actually asks.
+		Image mRawView ~ delete _;
         
         [CallingConvention(.Stdcall), CLink]
         public static extern void Gfx_DrawTextureSegment(void* textureSegment, float a, float b, float c, float d, float tx, float ty, float z, uint32 color, int32 pixelSnapping);
@@ -41,11 +81,68 @@ namespace Beefy.gfx
 		[CallingConvention(.Stdcall), CLink]
 		static extern void* Gfx_LoadTexture(char8* fileName, int32 flags);
 
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_LoadTextureDetached(char8* fileName, int32 flags);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_CreateTextureDetached(int32 width, int32 height, uint32* bits, int32 flags);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern uint32* Gfx_DecodeImageBits(char8* fileName, int32 flags, out int32 width, out int32 height);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_FreeImageBits(uint32* bits);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_RegisterTexture(void* textureSegment);
+
         [CallingConvention(.Stdcall), CLink]
         static extern void* Gfx_CreateDynTexture(int32 width, int32 height);
 
         [CallingConvention(.Stdcall), CLink]
-        static extern void* Gfx_CreateRenderTarget(int32 width, int32 height, int32 destAlpha);
+        static extern void* Gfx_CreateRenderTarget(int32 width, int32 height, int32 flags, int32 sampleCount);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_CreateDepthTarget(int32 width, int32 height, int32 is16Bit);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_CreateDepthImageRef(void* textureSegment);
+
+		// Always compiled regardless of DXRenderDevice.cpp's ENABLE_RUNTIME_DEBUG_FLAGS -- reports
+		// whether that define is active, so a caller can tell "checked, found nothing" apart from
+		// "never checked" instead of both looking like silence. See d3d_validation.py.
+		[CallingConvention(.Stdcall), CLink]
+		public static extern bool Gfx_RuntimeDebugFlagsCompiledIn();
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_CreateRawImageRef(void* textureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_ResolveTo(void* srcTextureSegment, void* destTextureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_GenerateMips(void* textureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_CopyToMip(void* destTextureSegment, int32 mipLevel, void* srcTextureSegment, int32 width, int32 height);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_SetSecondaryTarget(void* textureSegment, void* secondarySegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		public static extern void Gfx_SetWindowMsaaSamples(int32 sampleCount);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_RenderTarget_GetSharedHandle(void* textureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern bool Gfx_RenderTarget_KeyedMutex_Acquire(void* textureSegment, uint64 key, uint32 timeoutMs);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_RenderTarget_KeyedMutex_Release(void* textureSegment, uint64 key);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void* Gfx_OpenSharedRenderTarget(void* handle, int width, int height);
 
         [CallingConvention(.Stdcall), CLink]
         static extern void* Gfx_ModifyTextureSegment(void* destSegment, void* srcTextureSegment, int32 srcX, int32 srcY, int32 srcWidth, int32 srcHeight);
@@ -61,6 +158,12 @@ namespace Beefy.gfx
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void Gfx_Texture_GetBits(void* textureSegment, int32 srcX, int32 srcY, int32 srcWidth, int32 srcHeight, int32 destPitch, uint32* bits);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_GetDepthBits(void* textureSegment, int32 srcX, int32 srcY, int32 srcWidth, int32 srcHeight, int32 destPitch, uint32* bits);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_Texture_Clear(void* textureSegment);
 
         [CallingConvention(.Stdcall), CLink]
         static extern void Gfx_Texture_Delete(void* textureSegment);
@@ -89,14 +192,95 @@ namespace Beefy.gfx
                 color, (int32)mPixelSnapping);            
         }
 
-        public static Image CreateRenderTarget(int32 width, int32 height, bool destAlpha = false)
-        {
-            void* aNativeTextureSegment = Gfx_CreateRenderTarget(width, height, destAlpha ? 1 : 0);
-            if (aNativeTextureSegment == null)
-                return null;
+		// sampleCount > 1 makes an MSAA target: it can only be drawn into and ResolveTo'd -- never
+		// sampled/drawn as a texture or GetBits-read (resolve into a 1-sample target first). Falls
+		// back toward 1 if the hardware doesn't support the requested count.
+		public static Image CreateRenderTarget(int32 width, int32 height, RenderTargetFlags flags, int32 sampleCount = 1)
+		{
+		    void* aNativeTextureSegment = Gfx_CreateRenderTarget(width, height, (int32)flags, sampleCount);
+		    if (aNativeTextureSegment == null)
+		        return null;
 
-            return CreateFromNativeTextureSegment(aNativeTextureSegment);
-        }
+		    return CreateFromNativeTextureSegment(aNativeTextureSegment);
+		}
+
+        public static Image CreateRenderTarget(int32 width, int32 height, bool destAlpha = false) => CreateRenderTarget(width, height, destAlpha ? .Alpha : .None);
+
+		// Wraps this render target's depth buffer as its own sampleable Image (R32_FLOAT). The caller
+		// owns the returned Image; the underlying resource is shared, so deletion order doesn't
+		// matter. 1-sample targets only.
+		public Image CreateDepthImage()
+		{
+			void* aNativeTextureSegment = Gfx_CreateDepthImageRef(mNativeTextureSegment);
+			if (aNativeTextureSegment == null)
+				return null;
+
+			return CreateFromNativeTextureSegment(aNativeTextureSegment);
+		}
+
+		// sRGB-space 2D preview. Translucent premultiplied images allocate a separate texture lazily;
+		// other sRGB images share storage. Null for non-sRGB images, which already sample raw.
+		public Image RawView
+		{
+			get
+			{
+				if (mRawView == null)
+				{
+					void* aNativeTextureSegment = Gfx_CreateRawImageRef(mNativeTextureSegment);
+					if (aNativeTextureSegment == null)
+						return null;
+					mRawView = CreateFromNativeTextureSegment(aNativeTextureSegment);
+				}
+				return mRawView;
+			}
+		}
+
+		// Depth-only target (no color plane): draw into it with a DisableRenderTarget +
+		// DisablePixelShader render state; sampling it samples the depth itself (incl. comparison
+		// samplers). GetDepthBits works, GetBits/ResolveTo do not. 1-sample only.
+		public static Image CreateDepthTarget(int32 width, int32 height, bool is16Bit)
+		{
+			void* aNativeTextureSegment = Gfx_CreateDepthTarget(width, height, is16Bit ? 1 : 0);
+			if (aNativeTextureSegment == null)
+				return null;
+
+			return CreateFromNativeTextureSegment(aNativeTextureSegment);
+		}
+
+		// Resolves this MSAA render target into a matching-size single-sample render target.
+		public void ResolveTo(Image dest)
+		{
+			Gfx_Texture_ResolveTo(mNativeTextureSegment, dest.mNativeTextureSegment);
+		}
+
+		// Rebuilds the mip chain from level 0 (render targets created with .Mipmaps only).
+		public void GenerateMips()
+		{
+			Gfx_Texture_GenerateMips(mNativeTextureSegment);
+		}
+
+		// Copies the top-left width x height of `src` into this texture's mip `mipLevel` (same format;
+		// the way to fill mips of a .Mipmaps target other than by GenerateMips).
+		public void CopyToMip(int32 mipLevel, Image src, int32 width, int32 height)
+		{
+			Gfx_Texture_CopyToMip(mNativeTextureSegment, mipLevel, src.mNativeTextureSegment, width, height);
+		}
+
+		// Extra render target bound as SV_Target1 whenever this image is drawn into (same size; null
+		// to clear). Sticky -- keep it set only around the pass that wants it.
+		public void SetSecondaryTarget(Image secondary)
+		{
+			Gfx_Texture_SetSecondaryTarget(mNativeTextureSegment, (secondary != null) ? secondary.mNativeTextureSegment : null);
+		}
+        
+		public static Image OpenSharedRenderTarget(void* handle, int32 width, int32 height)
+		{
+		    void* aNativeTextureSegment = Gfx_OpenSharedRenderTarget(handle, width, height);
+		    if (aNativeTextureSegment == null)
+		        return null;
+
+		    return CreateFromNativeTextureSegment(aNativeTextureSegment);
+		}
 
         public static Image LoadFromFile(StringView fileName, LoadFlags flags = .None)
         {
@@ -115,6 +299,50 @@ namespace Beefy.gfx
 
             return CreateFromNativeTextureSegment(aNativeTextureSegment);
         }
+
+		// Safe off the main thread: an image that can't be drawn until Register. Null when the file can't be loaded
+		// this way, which LoadFromFile may still manage.
+		public static Image LoadDetached(StringView fileName, LoadFlags flags)
+		{
+			var useFileName = scope String()..Append(fileName);
+			useFileName.Replace('\\', '/');
+			FilePackManager.TryMakeMemoryString(useFileName);
+			void* nativeTextureSegment = Gfx_LoadTextureDetached(useFileName, (int32)flags);
+			if (nativeTextureSegment == null)
+				return null;
+			return CreateFromNativeTextureSegment(nativeTextureSegment);
+		}
+
+		// Safe off the main thread, like LoadDetached: an image of width * height RGBA bits, which it copies.
+		public static Image CreateDetached(int32 width, int32 height, uint32* bits, LoadFlags flags)
+		{
+			void* nativeTextureSegment = Gfx_CreateTextureDetached(width, height, bits, (int32)flags);
+			if (nativeTextureSegment == null)
+				return null;
+			return CreateFromNativeTextureSegment(nativeTextureSegment);
+		}
+
+		// Safe off the main thread: a file's pixels as width * height RGBA, with no texture made. Null when it can't
+		// be decoded.
+		public static uint32[] DecodeBits(StringView fileName, LoadFlags flags, out int32 width, out int32 height)
+		{
+			var useFileName = scope String()..Append(fileName);
+			useFileName.Replace('\\', '/');
+			FilePackManager.TryMakeMemoryString(useFileName);
+			let nativeBits = Gfx_DecodeImageBits(useFileName, (int32)flags, out width, out height);
+			if (nativeBits == null)
+				return null;
+			let bits = new uint32[width * height];
+			Internal.MemCpy(bits.Ptr, nativeBits, bits.Count * sizeof(uint32));
+			Gfx_FreeImageBits(nativeBits);
+			return bits;
+		}
+
+		// Main thread: makes a detached image drawable.
+		public void Register()
+		{
+			Gfx_RegisterTexture(mNativeTextureSegment);
+		}
 
 		public static Image CreateDynamic(int width, int height)
 		{
@@ -208,6 +436,12 @@ namespace Beefy.gfx
 			Gfx_Texture_GetBits(mNativeTextureSegment, (.)srcX, (.)srcY, (.)srcWidth, (.)srcHeight, (.)destPitch, bits);
 		}
 
+		// Raw float bits (NDC 0-1 depth) from a render target's depth buffer. 1-sample targets only.
+		public void GetDepthBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits)
+		{
+			Gfx_Texture_GetDepthBits(mNativeTextureSegment, (.)srcX, (.)srcY, (.)srcWidth, (.)srcHeight, (.)destPitch, bits);
+		}
+
         public void CreateImageCels(Image[,] celImages)
         {
 			int32 rows = (int32)celImages.GetLength(0);
@@ -228,10 +462,10 @@ namespace Beefy.gfx
             }
         }
 
-		public Image[] CreateImageCels(int32 cols, int32 rows)
+		public Image[] CreateImageCels(int cols, int rows)
 		{
-		    int32 celW = mSrcWidth / cols;
-		    int32 celH = mSrcHeight / rows;
+		    int32 celW = (.)(mSrcWidth / cols);
+		    int32 celH = (.)(mSrcHeight / rows);
 
 		    Debug.Assert(celW * cols == mSrcWidth);
 		    Debug.Assert(celH * rows == mSrcHeight);
@@ -245,6 +479,48 @@ namespace Beefy.gfx
 		        }
 		    }
 			return celImages;
+		}
+
+		public void* GetSharedHandle()
+		{
+			return Gfx_RenderTarget_GetSharedHandle(mNativeTextureSegment);
+		}
+
+		public bool MutexAcquireRead(uint32 timeout = uint32.MaxValue)
+		{
+			return Gfx_RenderTarget_KeyedMutex_Acquire(mNativeTextureSegment, 1, timeout);
+		}
+
+		public bool MutexAcquireWrite(uint32 timeout = uint32.MaxValue)
+		{
+			return Gfx_RenderTarget_KeyedMutex_Acquire(mNativeTextureSegment, 0, timeout);
+		}
+
+		public void MutexReleaseRead()
+		{
+			Gfx_RenderTarget_KeyedMutex_Release(mNativeTextureSegment, 0);
+		}
+
+		public void MutexReleaseWrite()
+		{
+			Gfx_RenderTarget_KeyedMutex_Release(mNativeTextureSegment, 1);
+		}
+
+		// Plain try-lock usage of the keyed mutex: everyone acquires and releases with key 0, so the
+		// keys carry no reader/writer state -- "which buffer to use" must come from elsewhere.
+		public bool MutexTryAcquire()
+		{
+			return Gfx_RenderTarget_KeyedMutex_Acquire(mNativeTextureSegment, 0, 0);
+		}
+
+		public void MutexRelease()
+		{
+			Gfx_RenderTarget_KeyedMutex_Release(mNativeTextureSegment, 0);
+		}
+
+		public void Clear()
+		{
+			Gfx_Texture_Clear(mNativeTextureSegment);
 		}
     }
 #else    

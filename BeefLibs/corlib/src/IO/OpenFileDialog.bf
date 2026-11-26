@@ -192,4 +192,21 @@ public class OpenFileDialog : FileDialog
 
 	protected override char8* Method => "OpenFile";
 }
+#elif BF_PLATFORM_MACOS
+namespace System.IO;
+
+public class OpenFileDialog : FileDialog
+{
+	public bool ShowReadOnly // Unused kept for compatibility
+	{
+		get
+		{
+			return !GetOption(4);
+		}
+		set
+		{
+			SetOption(4, !value);
+		}
+	}
+}
 #endif

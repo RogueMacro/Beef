@@ -522,14 +522,54 @@ BfMethodDef::~BfMethodDef()
 
 BfImportKind BfMethodDef::GetImportKindFromPath(const StringImpl& filePath)
 {
-	String fileExt = GetFileExtension(filePath);
-
-	if ((fileExt.Equals(".DYLIB", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
-		(fileExt.Equals(".SO", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
-		(fileExt.Equals(".DLL", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
-		(fileExt.Equals(".EXE", StringImpl::CompareKind_OrdinalIgnoreCase)))
+	if ((filePath.EndsWith(".DYLIB", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
+		(filePath.EndsWith(".SO", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
+		(filePath.EndsWith(".DLL", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
+		(filePath.EndsWith(".EXE", StringImpl::CompareKind_OrdinalIgnoreCase)))
 	{
 		return BfImportKind_Import_Dynamic;
+	}
+
+	if ((filePath.EndsWith(".A", StringImpl::CompareKind_OrdinalIgnoreCase)) ||
+		(filePath.EndsWith(".LIB", StringImpl::CompareKind_OrdinalIgnoreCase)))
+	{
+		return BfImportKind_Import_Static;
+	}
+
+
+	// Check for versioned .so libs
+	const int pathLength = (int)filePath.length(); 
+	int allowedDotsRemaining = 4; // Allow 3 version numbers + .so
+	int lastDotIndex = pathLength;
+
+	for (int i = pathLength - 1; i >= 0; i--)
+	{
+		char c = filePath[i];
+		
+		if ((c == '/') || (c == '\\'))
+		{
+			break;
+		}
+
+		if ((c == '.'))
+		{
+			if ((--allowedDotsRemaining >= 0) && (i != lastDotIndex - 1))
+			{
+				lastDotIndex = i;
+				continue;
+			}
+			
+			break;
+		}
+	}
+
+	if ((lastDotIndex != pathLength)) 
+	{
+		String fileExt = filePath.Substring(lastDotIndex);
+		if ((fileExt.StartsWith(".SO.", StringImpl::CompareKind_OrdinalIgnoreCase)))
+		{
+			return BfImportKind_Import_Dynamic;
+		}
 	}
 
 	return BfImportKind_Import_Static;
@@ -1074,6 +1114,9 @@ bool BfTypeDef::HasParsingFailed()
 
 BfProject::BfProject()
 {
+	mCodeGenOptions.mSIMDSetting = BfSIMDSetting_NotSet;
+	mCodeGenOptions.mFloatingPointMode = BfFloatingPointMode_NotSet;
+	mCodeGenOptions.mFMASetting = BfFMASetting_NotSet;
 	mDisabled = false;
 	mSingleModule = false;
 	mTargetType = BfTargetType_BeefConsoleApplication;
@@ -1117,6 +1160,17 @@ bool BfProject::ReferencesOrReferencedBy(BfProject* refProject)
 bool BfProject::IsTestProject()
 {
 	return mTargetType == BfTargetType_BeefTest;
+}
+
+bool BfProject::IsFinalProgramTarget()
+{
+	// Target types that generate their own vdata. Note these can still be depended upon by another
+	//  project, so this does not imply the project is only ever linked into its own program.
+	return ((mTargetType == BfTargetType_BeefConsoleApplication) || (mTargetType == BfTargetType_BeefWindowsApplication) ||
+		(mTargetType == BfTargetType_BeefLib_DynamicLib) || (mTargetType == BfTargetType_BeefLib_StaticLib) ||
+		(mTargetType == BfTargetType_C_ConsoleApplication) || (mTargetType == BfTargetType_C_WindowsApplication) ||
+		(mTargetType == BfTargetType_BeefTest) ||
+		(mTargetType == BfTargetType_BeefApplication_StaticLib) || (mTargetType == BfTargetType_BeefApplication_DynamicLib));
 }
 
 bool BfProject::HasDependency(BfProject* project)
@@ -1217,6 +1271,26 @@ bool BfErrorEntry::operator==(const BfErrorEntry& other) const
 
 //////////////////////////////////////////////////////////////////////////
 
+int32 sMarkId = 1;
+BfPassInstance::BfPassInstance(BfSystem* bfSystem)
+{
+	mOutputMarkId = (int32)BfpSystem_InterlockedExchangeAdd32((uint32*)&sMarkId, 1);
+	mReadIdx = 0;
+	mDidMark = false;
+	mTrimMessagesToCursor = false;
+	mFailedIdx = 0;
+	mWarnIdx = 0;
+	mSystem = bfSystem;
+	mCompiler = NULL;
+	mLastWasDisplayed = false;
+	mLastWasAdded = false;
+	mClassifierPassId = 0;
+	mWarningCount = 0;
+	mDeferredErrorCount = 0;
+	mIgnoreCount = 0;
+	mHadSignatureChanges = false;
+}
+
 BfPassInstance::~BfPassInstance()
 {
 	for (auto bfError : mErrors)
@@ -1225,6 +1299,8 @@ BfPassInstance::~BfPassInstance()
 
 BfPassInstance::StateInfo BfPassInstance::GetState()
 {
+	AutoCrit autoCrit(mCritSect);
+
 	StateInfo stateInfo;
 	stateInfo.mOutStreamSize = (int)mOutStream.mSize;
 	stateInfo.mErrorsSize = mErrors.mSize;
@@ -1237,8 +1313,12 @@ BfPassInstance::StateInfo BfPassInstance::GetState()
 
 void BfPassInstance::RestoreState(StateInfo stateInfo)
 {
+	AutoCrit autoCrit(mCritSect);
+
 	while (mOutStream.mSize > stateInfo.mOutStreamSize)
 		mOutStream.pop_back();
+		
+	mReadIdx = 0;	
 
 	while (mErrors.mSize > stateInfo.mErrorsSize)
 	{
@@ -1256,6 +1336,8 @@ void BfPassInstance::RestoreState(StateInfo stateInfo)
 
 void BfPassInstance::ClearErrors()
 {
+	AutoCrit autoCrit(mCritSect);
+
 	mFailedIdx = 0;
 	for (auto bfError : mErrors)
 		delete bfError;
@@ -1280,16 +1362,35 @@ bool BfPassInstance::HasMessages()
 
 void BfPassInstance::OutputLine(const StringImpl& str)
 {
+	AutoCrit autoCrit(mCritSect);
+
 	//OutputDebugStrF("%s\n", str.c_str());
 	mOutStream.push_back(str);
 }
 
 bool BfPassInstance::PopOutString(String* outString)
 {
-	if (mOutStream.size() == 0)
+	AutoCrit autoCrit(mCritSect);
+
+	if (mReadIdx >= mOutStream.size())
 		return false;
-	*outString = mOutStream.front();
-	mOutStream.RemoveAt(0);
+	
+	*outString = mOutStream[mReadIdx++];
+
+	if (mReadIdx == 1)
+	{	
+		if (!mDidMark)
+		{
+			outString->Insert(0, StrFormat(":mark %d\n", mOutputMarkId));
+			mDidMark = true;
+		}
+		else
+		{
+			outString->Insert(0, StrFormat(":mark_undo %d\n", mOutputMarkId));
+		}
+		
+	}
+
 	return true;
 }
 
@@ -3382,6 +3483,7 @@ void BfSystem::AddToCompositePartial(BfPassInstance* passInstance, BfTypeDef* co
 		BF_ASSERT(newProp->mDeclaringType != NULL);
 		for (int methodIdx = 0; methodIdx < (int)newProp->mMethods.size(); methodIdx++)
 			newProp->mMethods[methodIdx] = typeDef->mMethods[startMethodIdx + newProp->mMethods[methodIdx]->mIdx];
+		newProp->mIdx = (int)typeDef->mProperties.size();
 		typeDef->mProperties.push_back(newProp);
 	}
 	typeDef->mPropertySet.Clear();
@@ -3988,11 +4090,11 @@ void BfSystem::RemoveOldParsers()
 	{
 		auto bfParser = mParsers[i];
 
-		bool wantsDelete = false;
-
 		if (bfParser->mRefCount == 0)
 		{
-			if ((bfParser->mNextRevision != NULL) || (bfParser->mAwaitingDelete))
+			// Emitted parsers have no editor owner or revision chain. Once their type
+			// definitions are deleted, reclaim them just like obsolete file revisions.
+			if ((bfParser->mNextRevision != NULL) || (bfParser->mAwaitingDelete) || (bfParser->mIsEmitted))
 			{
 				if (bfParser->mNextRevision != NULL)
 					bfParser->mNextRevision->mPrevRevision = bfParser->mPrevRevision;
@@ -4659,6 +4761,20 @@ BF_EXPORT void BF_CALLTYPE BfSystem_AddTypeOptions(BfSystem* bfSystem, char* fil
 	bfSystem->mTypeOptions.push_back(typeOptions);
 }
 
+BF_EXPORT void BF_CALLTYPE BfSystem_AddTypeOptionsEx(BfSystem* bfSystem, char* filter, int32 simdSetting, int32 optimizationLevel, int32 emitDebugInfo, int32 andFlags, int32 orFlags, int32 allocStackTraceDepth, char* reflectMethodFilter, int32 floatingPointMode, int32 fmaSetting)
+{
+	AutoCrit autoCrit(bfSystem->mDataLock);
+	int beforeCount = (int)bfSystem->mTypeOptions.size();
+	BfSystem_AddTypeOptions(bfSystem, filter, simdSetting, optimizationLevel, emitDebugInfo, andFlags, orFlags, allocStackTraceDepth, reflectMethodFilter);
+	// An empty filter does not append a row; never modify the previous row.
+	if ((int)bfSystem->mTypeOptions.size() > beforeCount)
+	{
+		auto& typeOptions = bfSystem->mTypeOptions[beforeCount];
+		typeOptions.mFloatingPointMode = floatingPointMode;
+		typeOptions.mFMASetting = fmaSetting;
+	}
+}
+
 BF_EXPORT void BF_CALLTYPE BfProject_Delete(BfProject* bfProject)
 {
 	auto bfSystem = bfProject->mSystem;
@@ -4720,7 +4836,11 @@ BF_EXPORT void BF_CALLTYPE BfProject_SetOptions(BfProject* bfProject, int target
 	codeGenOptions.mMergeFunctions = (flags & BfProjectFlags_MergeFunctions) != 0;
 	codeGenOptions.mLoadCombine = (flags & BfProjectFlags_CombineLoads) != 0;
 	codeGenOptions.mLoopVectorize = (flags & BfProjectFlags_VectorizeLoops) != 0;
-	codeGenOptions.mSLPVectorize = (flags & BfProjectFlags_VectorizeSLP) != 0;
+	codeGenOptions.mSLPVectorize = (flags & BfProjectFlags_VectorizeSLP) != 0;	
+	codeGenOptions.mSIMDSetting = BfSIMDSetting_NotSet;
+	codeGenOptions.mFloatingPointMode = BfFloatingPointMode_NotSet;
+	codeGenOptions.mFMASetting = BfFMASetting_NotSet;
+
 	if ((flags & BfProjectFlags_AsmOutput) != 0)
 	{
 		static bool setLLVMAsmKind = false;
@@ -4762,6 +4882,13 @@ BF_EXPORT void BF_CALLTYPE BfProject_SetOptions(BfProject* bfProject, int target
 }
 
 //////////////////////////////////////////////////////////////////////////
+
+BF_EXPORT void BF_CALLTYPE BfProject_SetCodeGenOptions(BfProject* bfProject, int32 simdSetting, int32 floatingPointMode, int32 fmaSetting)
+{
+	bfProject->mCodeGenOptions.mSIMDSetting = (BfSIMDSetting)simdSetting;
+	bfProject->mCodeGenOptions.mFloatingPointMode = (BfFloatingPointMode)floatingPointMode;
+	bfProject->mCodeGenOptions.mFMASetting = (BfFMASetting)fmaSetting;
+}
 
 class FixTypesHelper : BfElementVisitor
 {

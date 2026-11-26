@@ -182,8 +182,16 @@ void DrawLayer::CloseDrawBatch()
 void DrawLayer::QueueRenderCmd(RenderCmd* renderCmd)
 {
 	CloseDrawBatch();
+	renderCmd->mStatsCategory = mRenderDevice->mStatsCategory;
 	mRenderCmdList.PushBack(renderCmd);
 	renderCmd->CommandQueued(this);
+}
+
+void DrawLayer::QueueRenderable(Renderable* renderable)
+{
+	RenderableCmd* cmd = AllocRenderCmd<RenderableCmd>();
+	cmd->mRenderable = renderable;
+	QueueRenderCmd(cmd);
 }
 
 DrawBatch* DrawLayer::AllocateBatch(int minVtxCount, int minIdxCount)
@@ -212,6 +220,7 @@ DrawBatch* DrawLayer::AllocateBatch(int minVtxCount, int minIdxCount)
 		pool.pop_back();
 	}
 	drawBatch->mDrawLayer = this;
+	drawBatch->mStatsCategory = mRenderDevice->mStatsCategory;
 
 	int needIdxBytes = minIdxCount * sizeof(uint16);
 	int needVtxBytes = minVtxCount * vtxSize;
@@ -256,9 +265,16 @@ DrawBatch* DrawLayer::AllocateBatch(int minVtxCount, int minIdxCount)
 	return drawBatch;
 }
 
+void GpuTagCmd::Render(RenderDevice* renderDevice, RenderWindow* renderWindow)
+{
+	renderDevice->GpuTimerSpanRetag(mTag);
+}
+
 void DrawLayer::Draw()
 {
 	BP_ZONE("DrawLayer::Draw");
+
+	int gpuSpan = mRenderDevice->GpuTimerSpanBegin();
 
 	RenderCmd* curRenderCmd = mRenderCmdList.mHead;
 	while (curRenderCmd != NULL)
@@ -266,6 +282,9 @@ void DrawLayer::Draw()
 		curRenderCmd->Render(mRenderDevice, mRenderWindow);
 		curRenderCmd = curRenderCmd->mNext;
 	}
+
+	if (gpuSpan >= 0)
+		mRenderDevice->GpuTimerSpanEnd(gpuSpan);
 }
 
 void DrawLayer::Flush()
@@ -358,6 +377,8 @@ BF_EXPORT void BF_CALLTYPE DrawLayer_Delete(DrawLayer* drawLayer)
 	{
 		drawLayer->mRenderWindow->mDrawLayerList.Remove(drawLayer);
 	}
+	if (gBFApp->mRenderDevice->mCurDrawLayer == drawLayer)
+		gBFApp->mRenderDevice->mCurDrawLayer = NULL;
 
 	delete drawLayer;
 }
@@ -369,6 +390,9 @@ BF_EXPORT void BF_CALLTYPE DrawLayer_Clear(DrawLayer* drawLayer)
 
 BF_EXPORT void BF_CALLTYPE DrawLayer_Activate(DrawLayer* drawLayer)
 {
+	if ((drawLayer->mCurDrawBatch != NULL) &&
+		(drawLayer->mCurDrawBatch->mStatsCategory != gBFApp->mRenderDevice->mStatsCategory))
+		drawLayer->CloseDrawBatch();
 	if (drawLayer->mRenderWindow != NULL)
 	{
 		drawLayer->mRenderWindow->SetAsTarget();
@@ -388,6 +412,20 @@ BF_EXPORT void BF_CALLTYPE DrawLayer_DrawToRenderTarget(DrawLayer* drawLayer, Te
 	RenderTarget* prevTarget = renderDevice->mCurRenderTarget;
 	renderDevice->PhysSetRenderState(renderDevice->mDefaultRenderState);
 	renderDevice->PhysSetRenderTarget(textureSegment->mTexture);
+	drawLayer->Draw();
+	drawLayer->Clear();
+	renderDevice->mCurRenderTarget = prevTarget;
+}
+
+BF_EXPORT void BF_CALLTYPE DrawLayer_DrawToRenderTargetRect(DrawLayer* drawLayer, TextureSegment* textureSegment, int x, int y, int width, int height, bool clearRect)
+{
+	RenderDevice* renderDevice = gBFApp->mRenderDevice;
+
+	BP_ZONE("DrawLayer_DrawToRenderTargetRect DrawPart");
+	RenderTarget* prevTarget = renderDevice->mCurRenderTarget;
+	renderDevice->PhysSetRenderState(renderDevice->mDefaultRenderState);
+	renderDevice->PhysSetRenderTarget(textureSegment->mTexture);
+	renderDevice->PhysSetViewportRect(x, y, width, height, clearRect);
 	drawLayer->Draw();
 	drawLayer->Clear();
 	renderDevice->mCurRenderTarget = prevTarget;

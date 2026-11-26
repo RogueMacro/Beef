@@ -15,13 +15,20 @@ namespace IDE.Compiler
 {
     public enum BfSourceElementType : uint8
     {
-        Normal,
+		Normal,
 		Keyword,
 		Literal,
-		Identifier,	
 		Comment,
+		Identifier,	
+		Local,
+		Parameter,
+		Member,
+		Static,
 		Method,
 		Type,
+		PrimitiveType,
+		Struct,
+		GenericParam,
 		RefType,
 		Interface,
 		Namespace
@@ -96,10 +103,20 @@ namespace IDE.Compiler
 		public String mDocumentationName ~ delete _;
 		public bool mCancelled;
 		public int32 mTextVersion = -1;
+		public int32 mTextChangeIdx = -1;
 		public bool mIsUserRequested;
 		public bool mDoFuzzyAutoComplete;
 		public Stopwatch mStopwatch ~ delete _;
 		public ProfileInstance mProfileInstance ~ _.Dispose();
+
+		public PersistentTextPosition mCursorTextPosition ~ delete _;
+		public SourceEditWidgetContent mEditWidgetContent;
+
+		public ~this()
+		{
+			if (mCursorTextPosition != null)
+				mEditWidgetContent.PersistentTextPositions.Remove(mCursorTextPosition);
+		}
     }
 
     public class BfParser : ILeakIdentifiable

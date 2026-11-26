@@ -14,6 +14,7 @@ using IDE.Util;
 using System.Threading;
 using System.Diagnostics;
 using IDE.util;
+using Beefy.theme.dark;
 
 namespace IDE
 {    
@@ -32,7 +33,7 @@ namespace IDE
 			SimpleSource,
 		}
 
-		public IncludeKind mIncludeKind;
+		public IncludeKind mIncludeKind; // Indicates whether or not *we* were auto or manually included
         public Project mProject;
         public ProjectFolder mParentFolder;
         public String mName = new String() ~ delete _;
@@ -109,6 +110,11 @@ namespace IDE
 			mDetached = true;
 			ReleaseRef();
 		}
+
+		public virtual Image GetIcon()
+		{
+			return DarkTheme.sDarkTheme.GetImage(.Document);
+		}
     }
 
 	public class ProjectFileItem : ProjectItem
@@ -124,7 +130,10 @@ namespace IDE
 					return true;
 				String dirPath = scope .();
 				Path.GetDirectoryPath(mPath, dirPath);
-				return Path.Equals(dirPath, mParentFolder.mPath);
+				var checkPath = scope String(mParentFolder.mPath);
+				IDEUtils.FixFilePath(checkPath);
+				IDEUtils.FixFilePath(dirPath);
+				return Path.Equals(dirPath, checkPath);
 			}
 		}
 
@@ -137,6 +146,11 @@ namespace IDE
 		{
 			if ((mIsWatching) && (!IDEApp.sApp.mShuttingDown))
 				StopWatching();
+		}
+
+		public virtual void PreDelete()
+		{
+
 		}
 
 		public void GetFullImportPath(String outFullPath)
@@ -246,7 +260,7 @@ namespace IDE
 
 		}
 
-		public virtual void Rename(String newName, bool changePath = true)
+		public virtual bool Rename(String newName, bool changePath = true)
 		{
 			bool wasWatching = mIsWatching;
 			if ((wasWatching) && (changePath))
@@ -258,13 +272,19 @@ namespace IDE
 			Path.GetFileName(mPath, fileName);
 
 			bool didNameMatch = mName == fileName;
+			bool success = true;
 
 			if (IncludeInMap)
 			{
 				mParentFolder.mChildMap.Remove(mName);
 				mName.Set(newName);
 				bool added = mParentFolder.mChildMap.TryAdd(mName, this);
-				Debug.Assert(added);
+				if (!added)
+					success = false;
+			}
+			else
+			{
+				mName.Set(newName);
 			}
 
 			if ((didNameMatch) && (changePath))
@@ -281,6 +301,8 @@ namespace IDE
 
 			if ((wasWatching) && (changePath))
 				StartWatching();
+
+			return success;
 		}
 
 		public void RecalcPath()
@@ -448,8 +470,11 @@ namespace IDE
 			};
 		public Dictionary<String, ProjectItem> mChildMap = new Dictionary<String, ProjectItem>() ~ delete _;
         //public String mLastImportDir = new String() ~ delete _;
-		public bool mAutoInclude;
+		public bool mAutoInclude; // Indicates that we should auto-include items found inside us
 		public bool mSortDirty;
+		// Off for a container folder whose children are its only interest: its own directory watch would be
+		// recursive and cover everything beside them.
+		public bool mWatchSelf = true;
 
 		public this()
 		{
@@ -470,6 +495,11 @@ namespace IDE
 			}
 		}
 
+		public ProjectItem FindProjectItem(StringView name)
+		{
+			return mChildMap.GetValueAlt(name).GetValueOrDefault();
+		}
+
 		public void GetFullDisplayName(String displayName)
 		{
 			if (mParentFolder == null)
@@ -477,8 +507,11 @@ namespace IDE
 
 			if (mParentFolder.mParentFolder != null)
 			{
-				mParentFolder.mParentFolder.GetFullDisplayName(displayName);
-				displayName.Append("/");
+				if ((mParentFolder.mParentFolder.mName != null) && (!mParentFolder.mParentFolder.mName.IsEmpty))
+				{
+					mParentFolder.mParentFolder.GetFullDisplayName(displayName);
+					displayName.Append("/");
+				}
 			}
 			displayName.Append(mName);
 		}
@@ -532,6 +565,11 @@ namespace IDE
 			return mAutoInclude;
 		}
 
+		public virtual bool CheckAddFile(StringView path)
+		{
+			return true;
+		}
+
         public virtual void AddChildAtIndex(int index, ProjectItem item)
         {
 			item.mParentFolder = this;
@@ -562,7 +600,7 @@ namespace IDE
             AddChildAtIndex(pos, item);
         }
 
-        public virtual void RemoveChild(ProjectItem item)
+        public virtual void RemoveChild(ProjectItem item, bool isExplicitDelete)
         {
             var projectFileItem = item as ProjectFileItem;
             if (projectFileItem != null)
@@ -656,9 +694,51 @@ namespace IDE
 			}
         }
 
+		public virtual ProjectItem CreateProjectItem(StringView type, StructuredData data)
+		{
+			ProjectItem projectItem = null;
+			if (type == "Source")
+			{
+			    projectItem = new ProjectSource();
+				projectItem.mIncludeKind = .Manual;
+			}
+			else if (type == "IgnoreSource")
+			{
+				projectItem = new ProjectSource();
+				projectItem.mIncludeKind = .Ignore;
+			}
+			else if (type == "Folder")
+			{
+			    projectItem = new ProjectFolder();
+				projectItem.mIncludeKind = .Manual;
+			}
+			else if (type == "AutoFolder")
+			{
+			    projectItem = new ProjectFolder();
+				projectItem.mIncludeKind = .Auto;
+			}
+			else if (type == "IgnoreFolder")
+			{
+				projectItem = new ProjectFolder();
+				projectItem.mIncludeKind = .Ignore;
+			}
+			return projectItem;
+		}
+
+		public virtual ProjectItem CreateProjectSource(StringView type, StructuredData data)
+		{
+			return new ProjectSource();
+		}
+
         public override void Deserialize(StructuredData data)
         {
             base.Deserialize(data);
+
+			if ((mParentFolder != null) && (mParentFolder.mPath == mPath))
+			{
+				// Fixes a "src" included in a "src"
+				mParentFolder.mAutoInclude = false;
+			}
 
             //mLastImportDir.Clear();
             //data.GetString("LastImportDir", mLastImportDir);
@@ -666,7 +746,6 @@ namespace IDE
 			//var outer = data.Current;
 
 			bool doPopulate = false;
-
 			bool autoInclude = data.GetBool("AutoInclude", mIncludeKind == .Auto);
 			if ((autoInclude) && (!mAutoInclude))
 				doPopulate = true;
@@ -685,32 +764,9 @@ namespace IDE
 
 				if (projectItem == null)
 				{
-                    if (type == "Source")
-					{
-                        projectItem = new ProjectSource();
-						projectItem.mIncludeKind = .Manual;
-					}
-					else if (type == "IgnoreSource")
-					{
-						projectItem = new ProjectSource();
-						projectItem.mIncludeKind = .Ignore;
-					}
-                    else if (type == "Folder")
-					{
-                        projectItem = new ProjectFolder();
-						projectItem.mIncludeKind = .Manual;
-					}
-					else if (type == "AutoFolder")
-					{
-					    projectItem = new ProjectFolder();
-						projectItem.mIncludeKind = .Auto;
-					}
-					else if (type == "IgnoreFolder")
-					{
-						projectItem = new ProjectFolder();
-						projectItem.mIncludeKind = .Ignore;
-					}
-					else
+					projectItem = CreateProjectItem(type, data);
+
+                    if (projectItem == null)
 						continue;
 					
                     projectItem.mProject = mProject;
@@ -743,6 +799,9 @@ namespace IDE
 				AddChild(projectItem);
 			}
 
+			if (!mAutoInclude)
+				doPopulate = false;
+
 			if (doPopulate)
 				Populate(mPath);
         }
@@ -760,7 +819,7 @@ namespace IDE
 				String fileName = scope String();
 				fileEntry.GetFileName(fileName);
 
-				if ((!gApp.IsFilteredOut(fileName)) && (!mChildMap.ContainsKey(fileName)))
+				if ((!gApp.IsFilteredOut(fileName)) && (!mChildMap.ContainsKey(fileName)) && (CheckAddFile(fileName)))
 				{
 					let projectItem = new ProjectSource();
 					projectItem.mProject = mProject;
@@ -810,11 +869,13 @@ namespace IDE
 			Debug.Assert(!mIsWatching);
 			mIsWatching = true;
 
-			// Add self as a watch
-			var fullPath = scope String();
-			GetFullImportPath(fullPath);
-			fullPath.Append(Path.DirectorySeparatorChar);
-			IDEApp.sApp.mFileWatcher.WatchFile(fullPath, this);
+			if (mWatchSelf)
+			{
+				var fullPath = scope String();
+				GetFullImportPath(fullPath);
+				fullPath.Append(Path.DirectorySeparatorChar);
+				IDEApp.sApp.mFileWatcher.WatchFile(fullPath, this);
+			}
 
 			for (var child in mChildItems)
 				if (let childFileItem = child as ProjectFileItem)
@@ -826,10 +887,13 @@ namespace IDE
 		{
 			base.StopWatching();
 
-			var fullPath = scope String();
-			GetFullImportPath(fullPath);
-			fullPath.Append(Path.DirectorySeparatorChar);
-			IDEApp.sApp.mFileWatcher.RemoveWatch(fullPath, this);
+			if (mWatchSelf)
+			{
+				var fullPath = scope String();
+				GetFullImportPath(fullPath);
+				fullPath.Append(Path.DirectorySeparatorChar);
+				IDEApp.sApp.mFileWatcher.RemoveWatch(fullPath, this);
+			}
 
 			for (var child in mChildItems)
 				if (let childFileItem = child as ProjectFileItem)
@@ -860,6 +924,42 @@ namespace IDE
 						childFileItem.mPath.Set(newChildPath);
 					}
 				}
+		}
+
+		public override Image GetIcon()
+		{
+			return DarkTheme.sDarkTheme.GetImage(.ProjectFolder);
+		}
+
+		public void WithProjectItems(delegate void(ProjectItem) func)
+		{
+		    List<int32> idxStack = scope List<int32>();
+		    List<ProjectFolder> folderStack = scope List<ProjectFolder>();
+
+		    folderStack.Add(this);
+		    idxStack.Add(0);
+
+		    while (folderStack.Count > 0)
+		    {
+		        int32 curIdx = idxStack[idxStack.Count - 1]++;
+		        ProjectFolder curFolder = folderStack[folderStack.Count - 1];
+		        if (curIdx >= curFolder.mChildItems.Count)
+		        {
+		            folderStack.RemoveAt(folderStack.Count - 1);
+		            idxStack.RemoveAt(idxStack.Count - 1);
+		            continue;
+		        }
+
+		        var projectItem = curFolder.mChildItems[curIdx];
+		        if (projectItem is ProjectFolder)
+		        {
+		            folderStack.Add((ProjectFolder)projectItem);
+		            idxStack.Add(0);
+		            continue;
+		        }
+
+		        func(projectItem);
+		    }
 		}
     }
 
@@ -1141,6 +1241,8 @@ namespace IDE
 			[Reflect]
 			public BuildCommandTrigger mBuildCommandsOnRun = .Always;
 			[Reflect]
+			public bool mPostBuildOnFailure = false;
+			[Reflect]
 			public List<String> mLibPaths = new List<String>() ~ DeleteContainerAndItems!(_);
 			[Reflect]
 			public List<String> mLinkDependencies = new List<String>() ~ DeleteContainerAndItems!(_);
@@ -1174,6 +1276,12 @@ namespace IDE
 			public BuildOptions.PICLevel mPICLevel;
 			[Reflect]
             public BuildOptions.BfOptimizationLevel? mOptimizationLevel;
+			[Reflect]
+			public BuildOptions.FloatingPointMode? mFloatingPointMode;
+			[Reflect]
+			public BuildOptions.FMASetting? mFMASetting;
+			[Reflect]
+			public BuildOptions.SIMDSetting? mSIMDSetting;
 			[Reflect]
 			public BuildOptions.LTOType? mLTOType;
 			[Reflect]
@@ -1269,10 +1377,14 @@ namespace IDE
 				Set!(newOptions.mBuildOptions.mLinkDependencies, mBuildOptions.mLinkDependencies);
 				Set!(newOptions.mBuildOptions.mPreBuildCmds, mBuildOptions.mPreBuildCmds);
 				Set!(newOptions.mBuildOptions.mPostBuildCmds, mBuildOptions.mPostBuildCmds);
+				Set!(newOptions.mBuildOptions.mPostBuildOnFailure, mBuildOptions.mPostBuildOnFailure);
 				Set!(newOptions.mBuildOptions.mCleanCmds, mBuildOptions.mCleanCmds);
 
 				Set!(newOptions.mBeefOptions.mPreprocessorMacros, mBeefOptions.mPreprocessorMacros);
 				Set!(newOptions.mBeefOptions.mOptimizationLevel, mBeefOptions.mOptimizationLevel);
+				Set!(newOptions.mBeefOptions.mFloatingPointMode, mBeefOptions.mFloatingPointMode);
+				Set!(newOptions.mBeefOptions.mFMASetting, mBeefOptions.mFMASetting);
+				Set!(newOptions.mBeefOptions.mSIMDSetting, mBeefOptions.mSIMDSetting);
 				Set!(newOptions.mBeefOptions.mLTOType, mBeefOptions.mLTOType);
 				Set!(newOptions.mBeefOptions.mRelocType, mBeefOptions.mRelocType);
 				Set!(newOptions.mBeefOptions.mPICLevel, mBeefOptions.mPICLevel);
@@ -1369,6 +1481,7 @@ namespace IDE
         public int32 [] mColorDialogCustomColors;
 
         public ProjectFolder mRootFolder ~ mRootFolder.ReleaseRef();
+		public String mRootFolderName = new .("src") ~ delete _;
 
         public int32 mCurResVer;
         public int32 mLastGeneratedResVer;
@@ -1551,7 +1664,9 @@ namespace IDE
 	                return false;
 
 				String managedText = scope .();
-				if (File.ReadAllText(scope $"{mProjectDir}/BeefManaged.toml", managedText) case .Ok)
+				String managedFilePath = scope .();
+				if ((gApp.mPackMan.TryGetManagedInfoPath(mProjectDir, managedFilePath)) &&
+					(File.ReadAllText(managedFilePath, managedText) case .Ok))
 				{
 					mManagedInfo = new .();
 					mManagedInfo.mInfo = new .(managedText);
@@ -1562,6 +1677,14 @@ namespace IDE
 						if (mManagedInfo.mVersion.mVersion == null)
 							mManagedInfo.mVersion.mVersion = new .();
 						msd.GetString("Version", mManagedInfo.mVersion.mVersion);
+
+						// Different tags can select projects from the same cached commit.
+						if ((gApp.mPackMan.IsPathManaged(mProjectDir)) &&
+							(gApp.mWorkspace.mProjectLockMap.TryGetValue(mProjectName, var projectLock)))
+						{
+							if (projectLock case .Git(let url, let tag, let hash))
+								mManagedInfo.mVersion.mVersion.Set(tag);
+						}
 					}
 				}
 			}
@@ -1586,7 +1709,7 @@ namespace IDE
             return true;
         }
 
-        public void Serialize(StructuredData data)
+        public virtual void Serialize(StructuredData data)
         {
 			mRootFolder.SortItems();
 
@@ -1680,7 +1803,7 @@ namespace IDE
 
 			if (!isDefaultDependencies)
 			{
-				using (data.CreateObject("Dependencies", true))
+				using (data.CreateObject("Dependencies"))
 				{
 				    for (var dependency in mDependencies)
 				    {
@@ -1761,6 +1884,7 @@ namespace IDE
 								data.ConditionalAdd("StackSize", options.mBuildOptions.mStackSize, 0);
 								data.ConditionalAdd("BuildCommandsOnCompile", options.mBuildOptions.mBuildCommandsOnCompile, .Always);
 								data.ConditionalAdd("BuildCommandsOnRun", options.mBuildOptions.mBuildCommandsOnRun, .Always);
+								data.ConditionalAdd("PostBuildOnFailure", options.mBuildOptions.mPostBuildOnFailure, false);
 								WriteStrings("LibPaths", options.mBuildOptions.mLibPaths);
 								WriteStrings("LinkDependencies", options.mBuildOptions.mLinkDependencies);
 								WriteStrings("PreBuildCmds", options.mBuildOptions.mPreBuildCmds);
@@ -1814,6 +1938,9 @@ namespace IDE
 								data.ConditionalAdd("RelocType", options.mBeefOptions.mRelocType, defaultRelocType);
 								data.ConditionalAdd("PICLevel", options.mBeefOptions.mPICLevel, .NotSet);
 							    data.ConditionalAdd("OptimizationLevel", options.mBeefOptions.mOptimizationLevel);
+								data.ConditionalAdd("FloatingPointMode", options.mBeefOptions.mFloatingPointMode);
+								data.ConditionalAdd("FMASetting", options.mBeefOptions.mFMASetting);
+								data.ConditionalAdd("SIMDSetting", options.mBeefOptions.mSIMDSetting);
 								data.ConditionalAdd("LTOType", options.mBeefOptions.mLTOType);
 							    data.ConditionalAdd("MergeFunctions", options.mBeefOptions.mMergeFunctions);
 							    data.ConditionalAdd("CombineLoads", options.mBeefOptions.mCombineLoads);
@@ -1965,7 +2092,7 @@ namespace IDE
 			return TargetType.BeefConsoleApplication;
 		}
 
-        public void Deserialize(StructuredData data)
+        public virtual void Deserialize(StructuredData data)
         {
 			//mLastImportDir.Clear();
             //data.GetString("LastImportDir", mLastImportDir);
@@ -2137,6 +2264,7 @@ namespace IDE
 					options.mBuildOptions.mStackSize = data.GetInt("StackSize");
 					options.mBuildOptions.mBuildCommandsOnCompile = data.GetEnum<BuildCommandTrigger>("BuildCommandsOnCompile", .Always);
 					options.mBuildOptions.mBuildCommandsOnRun = data.GetEnum<BuildCommandTrigger>("BuildCommandsOnRun", .Always);
+					options.mBuildOptions.mPostBuildOnFailure = data.GetBool("PostBuildOnFailure", false);
 					ReadStrings("LibPaths", options.mBuildOptions.mLibPaths);
 					ReadStrings("LinkDependencies", options.mBuildOptions.mLinkDependencies);
 					ReadStrings("PreBuildCmds", options.mBuildOptions.mPreBuildCmds);
@@ -2178,6 +2306,12 @@ namespace IDE
 			        	options.mBeefOptions.mOptimizationLevel = data.GetEnum<BuildOptions.BfOptimizationLevel>("OptimizationLevel");
 					if (data.Contains("LTOType"))
 						options.mBeefOptions.mLTOType = data.GetEnum<BuildOptions.LTOType>("LTOType");
+					if (data.Contains("FloatingPointMode"))
+						options.mBeefOptions.mFloatingPointMode = data.GetEnum<BuildOptions.FloatingPointMode>("FloatingPointMode");
+					if (data.Contains("FMASetting"))
+						options.mBeefOptions.mFMASetting = data.GetEnum<BuildOptions.FMASetting>("FMASetting");
+					if (data.Contains("SIMDSetting"))
+						options.mBeefOptions.mSIMDSetting = data.GetEnum<BuildOptions.SIMDSetting>("SIMDSetting");
 			        options.mBeefOptions.mMergeFunctions = data.GetBool("MergeFunctions");
 			        options.mBeefOptions.mCombineLoads = data.GetBool("CombineLoads");
 			        options.mBeefOptions.mVectorizeLoops = data.GetBool("VectorizeLoops");
@@ -2259,7 +2393,7 @@ namespace IDE
 
 			if (!IsSingleFile)
 			{
-				mRootFolder.mPath = new String("src");
+				mRootFolder.mPath = new String(mRootFolderName);
 				using (data.Open("ProjectFolder"))
 					mRootFolder.Deserialize(data);
 				/*if (Directory.Exists(scope String(mProjectDir, "/src")))
@@ -2470,33 +2604,7 @@ namespace IDE
 
         public void WithProjectItems(delegate void(ProjectItem) func)
         {
-            List<int32> idxStack = scope List<int32>();
-            List<ProjectFolder> folderStack = scope List<ProjectFolder>();
-
-            folderStack.Add(mRootFolder);
-            idxStack.Add(0);
-
-            while (folderStack.Count > 0)
-            {
-                int32 curIdx = idxStack[idxStack.Count - 1]++;
-                ProjectFolder curFolder = folderStack[folderStack.Count - 1];
-                if (curIdx >= curFolder.mChildItems.Count)
-                {
-                    folderStack.RemoveAt(folderStack.Count - 1);
-                    idxStack.RemoveAt(idxStack.Count - 1);
-                    continue;
-                }
-
-                var projectItem = curFolder.mChildItems[curIdx];
-                if (projectItem is ProjectFolder)
-                {
-                    folderStack.Add((ProjectFolder)projectItem);
-                    idxStack.Add(0);
-                    continue;
-                }
-
-                func(projectItem);
-            }
+			mRootFolder.WithProjectItems(func);
         }
 
         public VerSpec* GetDependency(String projectName, bool checkRecursively = true)

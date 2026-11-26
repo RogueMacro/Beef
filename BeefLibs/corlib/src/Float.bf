@@ -64,6 +64,7 @@ namespace System
 
 		public bool IsNegative
 		{
+			[Inline]
 			get
 			{
 				return this < 0;
@@ -72,6 +73,7 @@ namespace System
 
 		public bool IsFinite
 		{
+			[Inline]
 			get
 			{
 				float val = (float)this;
@@ -81,6 +83,7 @@ namespace System
 
 		public bool IsInfinity
         {
+			[Inline]
 			get
 			{
 				float val = (float)this;
@@ -90,6 +93,7 @@ namespace System
 
 		public bool IsPositiveInfinity
         {
+			[Inline]
 			get
 			{
 				float val = (float)this;
@@ -99,6 +103,7 @@ namespace System
 
 		public bool IsNegativeInfinity
         {
+			[Inline]
 			get
 			{
 				float val = (float)this;
@@ -108,6 +113,7 @@ namespace System
 
         public bool IsNaN
         {
+			[Inline]
 			get
 			{
 				float val = (float)this;
@@ -117,6 +123,7 @@ namespace System
 
 		public bool IsSubnormal
 		{
+			[Inline]
 			get
 			{
 				float val = (float)this;
@@ -149,19 +156,34 @@ namespace System
 
 #if !BF_RUNTIME_DISABLE
 		static extern int32 ToString(float val, char8* str, bool roundTrip);
+		static extern int32 ToString_RoundTripFast(float val, char8* str);
+		static extern bool Parse(char8* val, int32 valLength, char8 decimalSeparator, float* outResult);
 #else
 		static int32 ToString(float val, char8* str, bool roundTrip) => Runtime.FatalError();
 #endif
 
 		public override void ToString(String strBuffer)
 		{
+#if !BF_RUNTIME_REDUCED
+			char8[128] outBuff = ?;
+			int len = ToString_RoundTripFast((float)this, &outBuff);
+			strBuffer.Append(&outBuff, len);
+#else
 			char8[128] outBuff = ?;
 			int len = ToString((float)this, &outBuff, false);
 			strBuffer.Append(&outBuff, len);
+#endif
 		}
 
 		public void ToString(String outString, String format, IFormatProvider formatProvider)
 		{
+#if !BF_RUNTIME_REDUCED
+			if ((format.IsEmpty) || (format == "R"))
+			{
+				ToString(outString);
+				return;
+			}
+#else
 			if (format.IsEmpty)
 			{
 				ToString(outString);
@@ -174,6 +196,7 @@ namespace System
 				outString.Append(&outBuff, len);
 				return;
 			}
+#endif
 			NumberFormatter.NumberToString(format, (float)this, formatProvider, outString);
 		}
 
@@ -189,9 +212,6 @@ namespace System
 
 			bool isNeg = val[0] == '-';
 			bool isPos = val[0] == '+';
-			bool digitsFound = false;
-			double result = 0;
-			double decimalMultiplier = 0;
 
 			var val;
 			if (isNeg || isPos)
@@ -204,7 +224,17 @@ namespace System
 			else if (val.Equals(info.NaNSymbol, true))
 				return NaN;
 
-			//TODO: Use Number.ParseNumber
+#if !BF_RUNTIME_REDUCED
+			// Correctly rounded parse via fast_float (BeefRT rt/fast_float.h)
+			float result = 0;
+			if (!Parse(val.Ptr, (int32)val.Length, info.NumberDecimalSeparator[0], &result))
+				return .Err;
+			return isNeg ? -result : result;
+#else
+			bool digitsFound = false;
+			double result = 0;
+			double decimalMultiplier = 0;
+
 			for (int32 i = 0; i < val.Length; i++)
 			{
 				char8 c = val.Ptr[i];
@@ -255,6 +285,7 @@ namespace System
 				return .Err;
 
 			return isNeg ? (float)(-result) : (float)result;
+#endif
 		}
     }
 }

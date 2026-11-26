@@ -824,9 +824,17 @@ void BfDefBuilder::ParseAttributes(BfAttributeDirective* attributes, BfMethodDef
 			{
 				if (methodDef->mIsExtern)
 					Fail("Extern methods cannot be inline", attributes->mAttributeTypeRef);
-				else
-					methodDef->mAlwaysInline = true;
+				else if (methodDef->mInlineKind != BfInlineKind_Never)
+				{
+					methodDef->mInlineKind = BfInlineKind_Always;
+					for (auto arg : attributes->mArguments)
+						if (auto assignExpr = BfNodeDynCast<BfAssignmentExpression>(arg))
+							if ((assignExpr->mLeft != NULL) && (assignExpr->mLeft->Equals("OptimizedOnly")))
+								methodDef->mInlineKind = BfInlineKind_OptimizedOnly;
+				}
 			}
+			else if (typeRefName == "NoInline")
+				methodDef->mInlineKind = BfInlineKind_Never;
 			else if (typeRefName == "AllowAppend")
 			{
 				methodDef->mAppendKind = BfAllowAppendKind_Yes;
@@ -1117,7 +1125,8 @@ void BfDefBuilder::Visit(BfPropertyDeclaration* propertyDeclaration)
 				auto paramDef = new BfParameterDef();
 				BfParameterDeclaration* paramDecl = indexerDeclaration->mParams[paramIdx];
 				paramDef->mParamDeclaration = paramDecl;
-				paramDef->SetName(paramDecl->mNameNode);
+				if (paramDecl->mNameNode != NULL)
+					paramDef->SetName(paramDecl->mNameNode);
 				paramDef->mTypeRef = paramDecl->mTypeRef;
 				paramDef->mMethodGenericParamIdx = mSystem->GetGenericParamIdx(methodDef->mGenericParams, paramDef->mTypeRef);
 				if (paramDecl->mModToken == NULL)
@@ -2473,6 +2482,7 @@ void BfDefBuilder::FinishTypeDef(bool wantsToString)
 
 			auto propDef = new BfPropertyDef();
 			mCurTypeDef->mProperties.Add(propDef);
+			propDef->mIdx = (int)mCurTypeDef->mProperties.size() - 1;
 			propDef->mTypeRef = mSystem->mDirectSelfBaseTypeRef;
 			BF_ASSERT(mCurDeclaringTypeDef != NULL);
 			propDef->mDeclaringType = mCurDeclaringTypeDef;
@@ -2496,6 +2506,7 @@ void BfDefBuilder::FinishTypeDef(bool wantsToString)
 
 			auto propDef = new BfPropertyDef();
 			mCurTypeDef->mProperties.Add(propDef);
+			propDef->mIdx = (int)mCurTypeDef->mProperties.size() - 1;
 			propDef->mTypeRef = mSystem->mDirectRefSelfBaseTypeRef;
 			BF_ASSERT(mCurDeclaringTypeDef != NULL);
 			propDef->mDeclaringType = mCurDeclaringTypeDef;
@@ -2570,7 +2581,7 @@ void BfDefBuilder::FinishTypeDef(bool wantsToString)
 		if (mSignatureHashCtx != NULL)
 			mSignatureHashCtx->MixinStr(methodDef->mName);
 
-		if ((methodDef->mAlwaysInline) ||
+		if ((methodDef->mInlineKind == BfInlineKind_Always) || (methodDef->mInlineKind == BfInlineKind_OptimizedOnly) ||
 			(methodDef->mAppendKind != BfAllowAppendKind_No) ||
 			(methodDef->mMethodType == BfMethodType_Mixin))
 			inlineHashCtx.Mixin(methodDef->mFullHash);

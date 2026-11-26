@@ -147,7 +147,8 @@ bool BfModule::AddDeferredCallEntry(BfDeferredCallEntry* deferredCallEntry, BfSc
 
 			auto prevInsertBlock = mBfIRBuilder->GetInsertBlock();
 			mBfIRBuilder->SaveDebugLocation();
-			mBfIRBuilder->SetInsertPointAtStart(mCurMethodState->mIRInitBlock);
+			// Restart the tail lifetime whenever its owning scope is entered.
+			mBfIRBuilder->SetInsertPointAtStart(scopeData->mBlock ? scopeData->mBlock : mCurMethodState->mIRInitBlock);
 
 			auto scopeHead = &mCurMethodState->mHeadScope;
 			if (scopeHead->mDIScope)
@@ -789,7 +790,7 @@ void BfModule::EmitDeferredCall(BfModuleMethodInstance moduleMethodInstance, Siz
 	if ((flags & BfDeferredBlockFlag_IsAllocaFunc) != 0)
 		func = mBfIRBuilder->CreateLoad(func);
 
-	expressionEvaluator.CreateCall(NULL, moduleMethodInstance.mMethodInstance, func, ((flags & BfDeferredBlockFlag_BypassVirtual) != 0), llvmArgs);
+	expressionEvaluator.CreateCall(NULL, moduleMethodInstance.mMethodInstance, func, ((flags & BfDeferredBlockFlag_BypassVirtual) != 0), llvmArgs, NULL, moduleMethodInstance.mNoInline ? BfCreateCallFlags_NoInline : BfCreateCallFlags_None);
 
 	if ((flags & BfDeferredBlockFlag_DoNullChecks) != 0)
 	{
@@ -966,6 +967,7 @@ void BfModule::EmitDeferredCallProcessor(BfScopeData* scopeData, SLIList<BfDefer
 			{
 				// Only bypass virtual if ALL these calls are devirtualized
 				callInfo->mBypassVirtual &= deferredCallEntry->mBypassVirtual;
+				callInfo->mModuleMethodInstance.mNoInline |= moduleMethodInstance.mNoInline;
 			}
 		}
 		else
@@ -1117,6 +1119,7 @@ void BfModule::EmitDeferredCallProcessor(BfScopeData* scopeData, SLIList<BfDefer
 					callInfo->mModuleMethodInstance = moduleMethodInstance;
 					callInfo->mBypassVirtual = deferredCallEntry->mBypassVirtual;
 				}
+				callInfo->mModuleMethodInstance.mNoInline |= moduleMethodInstance.mNoInline;
 			}
 			deferredCallEntry = deferredCallEntry->mNext;
 		}
@@ -1483,7 +1486,11 @@ BfLocalVariable* BfModule::HandleVariableDeclaration(BfVariableDeclaration* varD
 
 				BfIRValue dscVal = ExtractValue(initValue, dscDataIdx);
 				auto eqVal = mBfIRBuilder->CreateCmpEQ(dscVal, GetConstValue(tagId, dscType));
-				exprEvaluator->mResult = BfTypedValue(eqVal, boolType);
+
+				auto eqAlloca = CreateAlloca(boolType);				
+				mBfIRBuilder->CreateStore(eqVal, eqAlloca);
+				auto eqLoaded = mBfIRBuilder->CreateLoad(eqAlloca);
+				exprEvaluator->mResult = BfTypedValue(eqLoaded, boolType);
 
 				PopulateType(outType);
 				if (!outType->IsValuelessType())
@@ -1497,7 +1504,7 @@ BfLocalVariable* BfModule::HandleVariableDeclaration(BfVariableDeclaration* varD
 						(initValue.mKind == BfTypedValueKind_TempAddr) ||
 						(initValue.mKind == BfTypedValueKind_ReadOnlyTempAddr))
 						payload.mKind = initValue.mKind;
-					_EmitCond(eqVal, payload);
+					_EmitCond(eqLoaded, payload);
 				}
 
 				handled = true;
@@ -2235,7 +2242,7 @@ void BfModule::HandleTupleVariableDeclaration(BfVariableDeclaration* varDecl, Bf
 			}
 			else if ((tupleNameNode != NULL) && (tupleNameNode->mNameNode != NULL))
 			{
-				Fail(StrFormat("Unexpected tuple field name, expected unnamed tuple field", fieldDef->mName.c_str()), tupleNameNode->mNameNode);
+				Fail("Unexpected tuple field name, expected unnamed tuple field", tupleNameNode->mNameNode);
 			}
 		}
 		else
@@ -3488,9 +3495,10 @@ void BfModule::VisitEmbeddedStatement(BfAstNode* stmt, BfExprEvaluator* exprEval
 	}
 }
 
-void BfModule::VisitCodeBlock(BfBlock* block, BfIRBlock continueBlock, BfIRBlock breakBlock, BfIRBlock fallthroughBlock, bool defaultBreak, bool* hadReturn, BfLabelNode* labelNode, bool closeScope, BfEmbeddedStatementFlags flags)
+void BfModule::VisitCodeBlock(BfBlock* block, BfIRBlock continueBlock, BfIRBlock breakBlock, BfIRBlock fallthroughBlock, bool defaultBreak, bool* hadReturn, BfLabelNode* labelNode, bool closeScope, BfEmbeddedStatementFlags flags, BfDeferredLocalAssignData* breakLocalAssignData)
 {
 	BfBreakData breakData;
+	breakData.mBreakLocalAssignData = breakLocalAssignData;
 	breakData.mIRContinueBlock = continueBlock;
 	breakData.mIRBreakBlock = breakBlock;
 	breakData.mIRFallthroughBlock = fallthroughBlock;
@@ -3562,6 +3570,7 @@ void BfModule::VisitCodeBlock(BfBlock* block)
 					{
 						localMethod = new BfLocalMethod();
 						localMethod->mSystem = mSystem;
+						localMethod->mContext = mContext;
 						localMethod->mModule = this;
 						localMethod->mMethodDeclaration = localMethodDecl->mMethodDeclaration;
 						localMethod->mSource = mCurTypeInstance->mTypeDef->mSource;
@@ -4682,6 +4691,12 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 
 	SizedArray<BfDeferredLocalAssignData, 8> deferredLocalAssignDataVec;
 	deferredLocalAssignDataVec.resize(blocks.size());
+	// What's assigned at the breaks nested in each case (ie: 'if (c) break;'), which leave the switch without reaching the
+	//  end of the case. mLeftBlockUncond stays set if a case has no such break.
+	SizedArray<BfDeferredLocalAssignData, 8> breakLocalAssignDataVec;
+	breakLocalAssignDataVec.resize(blocks.size());
+	for (auto& breakLocalAssignData : breakLocalAssignDataVec)
+		breakLocalAssignData.mLeftBlockUncond = true;
 
 	auto boolType = GetPrimitiveType(BfTypeCode_Boolean);
 
@@ -4769,11 +4784,21 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 	auto startingLocalVarId = mCurMethodState->GetRootMethodState()->mCurLocalVarId;
 
 	bool prevHadFallthrough = false;
+	bool prevWasConstIgnore = false;
 
 	Dictionary<int64, _CaseState> handledCases;
 	HashSet<int64> condCases;
 	for (BfSwitchCase* switchCase : switchStmt->mSwitchCases)
 	{
+		if (switchCase->mCaseExpressions.mSize == 1)
+		{
+			if (auto defaultExpr = BfNodeDynCast<BfDefaultExpression>(switchCase->mCaseExpressions[0]))
+			{
+				if (defaultExpr->mOpenParen == NULL)
+					Warn(0, "Potentially unintended 'case default:'. Consider rewriting as 'default:' or 'case (.)default:' to clarify intention.", defaultExpr);
+			}
+		}
+
 		deferredLocalAssignDataVec[blockIdx].mScopeData = mCurMethodState->mCurScope;
 		deferredLocalAssignDataVec[blockIdx].ExtendFrom(mCurMethodState->mDeferredLocalAssignData);
 		SetAndRestoreValue<BfDeferredLocalAssignData*> prevDLA(mCurMethodState->mDeferredLocalAssignData, &deferredLocalAssignDataVec[blockIdx]);
@@ -5141,13 +5166,16 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 		{
 			UpdateSrcPos(switchCase->mCodeBlock);
 
-			VisitCodeBlock(switchCase->mCodeBlock, BfIRBlock(), endBlock, fallthroughBlock, true, &hadReturn, switchStmt->mLabelNode, openedScope /*, BfEmbeddedStatementFlags_RescopeDLA*/);
+			VisitCodeBlock(switchCase->mCodeBlock, BfIRBlock(), endBlock, fallthroughBlock, true, &hadReturn, switchStmt->mLabelNode, openedScope, BfEmbeddedStatementFlags_None /*BfEmbeddedStatementFlags_RescopeDLA*/, &breakLocalAssignDataVec[blockIdx]);
 
 			openedScope = false;
 			deferredLocalAssignDataVec[blockIdx].mHadReturn = hadReturn;
 			caseCount++;
 			if ((!hadReturn) &&
 				((!mCurMethodState->mDeferredLocalAssignData->mHadFallthrough) || (mCurMethodState->mDeferredLocalAssignData->mHadBreak)))
+				allHadReturns = false;
+			// A break nested in the case reaches the end of the switch even if the case otherwise returns
+			if (!breakLocalAssignDataVec[blockIdx].mLeftBlockUncond)
 				allHadReturns = false;
 
 			if (auto block = BfNodeDynCast<BfBlock>(switchCase->mCodeBlock))
@@ -5181,9 +5209,10 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 		mBfIRBuilder->SetInsertPoint(prevInsertBlock);
 
 		prevHadFallthrough = mCurMethodState->mDeferredLocalAssignData->mHadFallthrough;
+		prevWasConstIgnore = isConstIgnore;
 
 		blockIdx++;
-	}
+	}	
 
 	// Check for comprehensiveness
 	bool isComprehensive = true;
@@ -5344,7 +5373,11 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 		}
 	}
 
-	if (!hadConstMatch)
+	// Even if we had a const match, if the final case had a fallthrough that was not const-ignored then we still need the default block
+	bool constSkipDefault = hadConstMatch &&
+		((!prevHadFallthrough) || (prevWasConstIgnore));
+
+	if (!constSkipDefault)
 		mBfIRBuilder->CreateBr(defaultBlock);
 
 	mBfIRBuilder->SetInsertPoint(switchBlock);
@@ -5357,8 +5390,8 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 
 	if (switchStmt->mDefaultCase != NULL)
 	{
-		SetAndRestoreValue<bool> prevIgnoreWrites(mBfIRBuilder->mIgnoreWrites, true, hadConstMatch);
-		SetAndRestoreValue<bool> prevInConstIgnore(mCurMethodState->mCurScope->mInConstIgnore, true, hadConstMatch);
+		SetAndRestoreValue<bool> prevIgnoreWrites(mBfIRBuilder->mIgnoreWrites, true, constSkipDefault);
+		SetAndRestoreValue<bool> prevInConstIgnore(mCurMethodState->mCurScope->mInConstIgnore, true, constSkipDefault);
 
 		mBfIRBuilder->AddBlock(defaultBlock);
 		mBfIRBuilder->SetInsertPoint(defaultBlock);
@@ -5382,10 +5415,10 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 			caseScopeData.mLabel = newScope.mLabel;
 
 			bool hadReturn = false;
-			VisitCodeBlock(switchCase->mCodeBlock, BfIRBlock(), endBlock, BfIRBlock(), true, &hadReturn, switchStmt->mLabelNode);
+			VisitCodeBlock(switchCase->mCodeBlock, BfIRBlock(), endBlock, BfIRBlock(), true, &hadReturn, switchStmt->mLabelNode, false, BfEmbeddedStatementFlags_None, &breakLocalAssignDataVec[blockIdx]);
 			deferredLocalAssignDataVec[blockIdx].mHadReturn = hadReturn;
 			caseCount++;
-			if (!hadReturn)
+			if ((!hadReturn) || (!breakLocalAssignDataVec[blockIdx].mLeftBlockUncond))
 				allHadReturns = false;
 
 			RestoreScopeState();
@@ -5415,8 +5448,17 @@ void BfModule::Visit(BfSwitchStatement* switchStmt)
 		for (blockIdx = 0; blockIdx < (int)blocks.size(); blockIdx++)
 		{
 			auto deferredLocalAssignData = &deferredLocalAssignDataVec[blockIdx];
+			auto breakLocalAssignData = &breakLocalAssignDataVec[blockIdx];
+			bool hadNestedBreak = !breakLocalAssignData->mLeftBlockUncond;
 			if (deferredLocalAssignData->mHadFallthrough)
-				continue;
+			{
+				// The next case accounts for the fallthrough path, so only the nested breaks leave the switch from here
+				if (!hadNestedBreak)
+					continue;
+				deferredLocalAssignData = breakLocalAssignData;
+			}
+			else if (hadNestedBreak)
+				deferredLocalAssignData->SetIntersection(*breakLocalAssignData);
 
 			if (mergedDeferredLocalAssignData == NULL)
 				mergedDeferredLocalAssignData = deferredLocalAssignData;
@@ -5769,6 +5811,22 @@ void BfModule::Visit(BfBreakStatement* breakStmt)
 			break;
 		checkBreakData = checkBreakData->mPrevBreakData;
 	}
+
+	// Breaks in unreachable code or in branches excluded by a constant condition never reach the target
+	if ((breakData->mBreakLocalAssignData != NULL) &&
+		(!mCurMethodState->mInPostReturn) && ((mCurMethodState->mCurScope == NULL) || (!mCurMethodState->mCurScope->mInConstIgnore)))
+	{
+		// What's assigned here is held by the nearest assign data that LocalDefined records into, which includes what
+		//  was assigned in the enclosing blocks
+		auto curLocalAssignData = mCurMethodState->mDeferredLocalAssignData;
+		while ((curLocalAssignData != NULL) && ((curLocalAssignData->mIsChained) || (curLocalAssignData->mIsUnconditional)))
+			curLocalAssignData = curLocalAssignData->mChainedAssignData;
+
+		BfDeferredLocalAssignData breakPointAssignData;
+		if (curLocalAssignData != NULL)
+			breakPointAssignData.mAssignedLocals = curLocalAssignData->mAssignedLocals;
+		breakData->mBreakLocalAssignData->SetIntersection(breakPointAssignData);
+	}
 }
 
 void BfModule::Visit(BfContinueStatement* continueStmt)
@@ -5881,6 +5939,12 @@ void BfModule::Visit(BfFallthroughStatement* fallthroughStmt)
 		{
 			if (breakData->mIRFallthroughBlock)
 				break;
+			if (breakData->mIRBreakBlock)
+			{
+				// Catches the cases where we have a falltrhough in a 'default:' block
+				breakData = NULL;
+				break;
+			}
 			breakData = breakData->mPrevBreakData;
 		}
 	}
@@ -6001,13 +6065,15 @@ void BfModule::Visit(BfUsingStatement* usingStmt)
 			exprEvaluator.mFunctionBindResult = &functionBindResult;
 			SizedArray<BfResolvedArg, 0> resolvedArgs;
 			BfMethodMatcher methodMatcher(usingStmt->mVariableDeclaration, this, dispMethod.mMethodInstance, resolvedArgs, BfMethodGenericArguments());
-			methodMatcher.CheckType(iDisposableType, embeddedValue, false);
-			methodMatcher.TryDevirtualizeCall(embeddedValue);
-			auto retVal = exprEvaluator.CreateCall(&methodMatcher, embeddedValue);
-			if (functionBindResult.mMethodInstance != NULL)
+			if (methodMatcher.CheckType(iDisposableType, embeddedValue, false))
 			{
-				moduleMethodInstance = BfModuleMethodInstance(functionBindResult.mMethodInstance, functionBindResult.mFunc);
-				AddDeferredCall(moduleMethodInstance, functionBindResult.mIRArgs, mCurMethodState->mCurScope, NULL, false, mayBeNull);
+				methodMatcher.TryDevirtualizeCall(embeddedValue);
+				auto retVal = exprEvaluator.CreateCall(&methodMatcher, embeddedValue);
+				if (functionBindResult.mMethodInstance != NULL)
+				{
+					moduleMethodInstance = BfModuleMethodInstance(functionBindResult.mMethodInstance, functionBindResult.mFunc);
+					AddDeferredCall(moduleMethodInstance, functionBindResult.mIRArgs, mCurMethodState->mCurScope, NULL, false, mayBeNull);
+				}
 			}
 		}
 	}
@@ -6388,9 +6454,7 @@ void BfModule::DoForLess(BfForEachStatement* forEachStmt)
 {
 	UpdateSrcPos(forEachStmt);
 
-	auto startBB = mBfIRBuilder->GetInsertBlock();
 	auto condBB = mBfIRBuilder->CreateBlock("forless.cond", true);
-	mBfIRBuilder->SetInsertPoint(condBB);
 
 	BfScopeData scopeData;
 	// We set mIsLoop later
@@ -6398,6 +6462,10 @@ void BfModule::DoForLess(BfForEachStatement* forEachStmt)
 		scopeData.mLabelNode = forEachStmt->mLabelNode->mLabel;
 	mCurMethodState->AddScope(&scopeData);
 	NewScopeState();
+
+	// Loop-scoped defers accumulate until the loop exits.
+	auto startBB = mBfIRBuilder->GetInsertBlock();
+	mBfIRBuilder->SetInsertPoint(condBB);
 
 	auto autoComplete = mCompiler->GetAutoComplete();
 
@@ -7279,7 +7347,8 @@ void BfModule::Visit(BfForEachStatement* forEachStmt)
 				arrayItem = BfTypedValue(arrayItem.mValue, CreateRefType(arrayItem.mType));
 		}
 		arrayItem = Cast(forEachStmt->mCollectionExpression, arrayItem, varType, BfCastFlags_Explicit);
-		if ((arrayItem) && (!arrayItem.mValue.IsFake()))
+		// A valueless element has no storage to store into (varInst is a fake value)
+		if ((arrayItem) && (!arrayItem.mValue.IsFake()) && (!arrayItem.mType->IsValuelessType()))
 		{
 			arrayItem = LoadValue(arrayItem);
 			if (arrayItem)
@@ -7401,6 +7470,12 @@ void BfModule::Visit(BfForEachStatement* forEachStmt)
 	mCurMethodState->mLeftBlockCond = false;
 
 	RestoreScopeState();
+
+	// Leaving the outer scope runs the enumerator's implicit Dispose (and frees any 'scope' allocations from the
+	//  collection expression). That's not user code, so don't give the debugger a statement to stop at there -
+	//  it would stop on the loop body's closing brace a second time as the loop exits
+	SetAndRestoreValue<bool> prevSetIllegalSrcPos(mSetIllegalSrcPosition, true);
+	SetIllegalSrcPos();
 	RestoreScopeState();
 }
 
@@ -7451,7 +7526,14 @@ void BfModule::Visit(BfDeferStatement* deferStmt)
 			mCompiler->mResolvePassData->mAutoComplete->CheckLabel(targetIdentifier, deferStmt->mColonToken, scope);
 	}
 
-	if ((scope == mCurMethodState->mCurScope) && (scope->mCloseNode == NULL))
+	// While checking a mixin declaration there is no invocation scope yet.
+	// FindScope uses the current scope as a placeholder for 'mixin' in that case.
+	bool unresolvedMixinScope = false;
+	if (auto scopeToken = BfNodeDynCast<BfTokenNode>(scopeNameNode))
+		unresolvedMixinScope = (scopeToken->GetToken() == BfToken_Mixin) &&
+			(mCurMethodState->mMixinState == NULL) && (mCurMethodInstance != NULL) && (mCurMethodInstance->IsMixin());
+
+	if ((!unresolvedMixinScope) && (scope == mCurMethodState->mCurScope) && (scope->mCloseNode == NULL))
 	{
 		auto parser = deferStmt->GetParser();
 		if ((parser == NULL) || (!parser->mIsEmitted))

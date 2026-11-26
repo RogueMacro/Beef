@@ -40,6 +40,15 @@ namespace Beefy.theme.dark
 
         public const float cShadowSize = 8;
 
+        public override void Describe(Beefy.utils.StructuredData data)
+        {
+            base.Describe(data);
+            if (mText != null)
+                data.Add("text", mText);
+            if (mRelWidget != null)
+                data.Add("forWidget", mRelWidget.mWidgetId);
+        }
+
         public this(String text, Widget relWidget, float x, float y, float minWidth, float minHeight, bool allowResize, bool mouseVisible)
         {
             DarkTooltipContainer container = new DarkTooltipContainer();
@@ -71,7 +80,7 @@ namespace Beefy.theme.dark
             screenX += relWidget.mWidgetWindow.mClientX;
             screenY += relWidget.mWidgetWindow.mClientY;
             
-            BFWindow.Flags windowFlags = BFWindow.Flags.ClientSized | BFWindow.Flags.PopupPosition | BFWindow.Flags.NoActivate | BFWindow.Flags.DestAlpha;                                        
+            BFWindow.Flags windowFlags = BFWindow.Flags.ClientSized | BFWindow.Flags.PopupPosition | BFWindow.Flags.NoActivate | BFWindow.Flags.DestAlpha | BFWindow.Flags.Tooltip;                                        
             WidgetWindow widgetWindow = new WidgetWindow(relWidget.mWidgetWindow,
                 "Tooltip",
                 (int32)(screenX), (int32)(screenY),
@@ -260,8 +269,8 @@ namespace Beefy.theme.dark
 				return;
 			}
 
-            if (mWidgetWindow == null)
-                return;
+			if ((mHasClosed) || (mWidgetWindow == null) || (mRelWidget == null))
+				return;
 
 			if (mAllowMouseOutside)
 				return;

@@ -2,8 +2,6 @@
 #define HEAPHOOK
 
 
-//#define USE_CHARCONV
-
 #include <stdio.h>
 
 //#include <crtdefs.h>
@@ -12,9 +10,11 @@
 #include <string.h>
 //#include <intrin.h>
 
-#ifdef USE_CHARCONV
-#include <charconv>
-#endif
+extern "C"
+{
+#include "zmij-c.h"
+}
+#include "fast_float.h"
 
 //#define OBJECT_GUARD_END_SIZE 8
 #define OBJECT_GUARD_END_SIZE 0
@@ -41,12 +41,21 @@
 #include "BeefySysLib/platform/PlatformHelper.h"
 #ifndef BF_DISABLE_FFI
 #include "ffi.h"
+#elif defined(__EMSCRIPTEN__)
+// The dynamic call that stands in for libffi on wasm.
+#include "BeefySysLib/platform/wasm/WasmFFI.h"
 #endif
 #include "Thread.h"
 
 #ifdef BF_PLATFORM_WINDOWS
 #include <fcntl.h>
 #include <io.h>
+#endif
+
+#if defined(BF_PLATFORM_LINUX) && !defined(__EMSCRIPTEN__)
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 USING_NS_BF;
@@ -173,7 +182,14 @@ namespace bf
 		namespace FFI
 		{
 			enum FFIABI : int32;
-			enum FFIResult : int32;
+			enum FFIResult : int32
+			{
+				FFIResult_OK,
+				FFIResult_BadTypeDef,
+				FFIResult_BadABI,
+				FFIResult_NoBeefCRT,
+				FFIResult_NoFFI
+			};
 
 			struct FFIType;
 
@@ -190,13 +206,17 @@ namespace bf
 		struct Float
 		{
 		private:
+			BFRT_EXPORT static int ToString_RoundTripFast(float f, char* outStr);
 			BFRT_EXPORT static int ToString(float f, char* outStr, bool roundTrip);
+			BFRT_EXPORT static bool Parse(char* str, int strLen, char decimalSeparator, float* outResult);
 		};
 
 		struct Double
 		{
 		private:
-			BFRT_EXPORT static int ToString(double f, char* outStr, bool roundTrip);
+			BFRT_EXPORT static int ToString_RoundTripFast(double d, char* outStr);
+			BFRT_EXPORT static int ToString(double d, char* outStr, bool roundTrip);
+			BFRT_EXPORT static bool Parse(char* str, int strLen, char decimalSeparator, double* outResult);
 		};
 	}
 }
@@ -214,6 +234,38 @@ using namespace bf::System;
 
 bool IsDebuggerPresent()
 {
+
+#if defined(BF_PLATFORM_LINUX) && !defined(__EMSCRIPTEN__)
+	// A debugger shows up as a nonzero TracerPid. (PTRACE_TRACEME can't be used to ask: when nothing traces us it
+	//  succeeds and makes our parent our tracer for good, after which every signal stops us instead of being handled)
+	int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+
+	char buf[4096];
+	intptr len = 0;
+	while (len < (intptr)sizeof(buf) - 1)
+	{
+		ssize_t readLen = read(fd, buf + len, sizeof(buf) - 1 - len);
+		if ((readLen < 0) && (errno == EINTR))
+			continue;
+		if (readLen <= 0)
+			break;
+		len += readLen;
+	}
+	close(fd);
+	buf[len] = 0;
+
+	const char* tracerPid = strstr(buf, "TracerPid:");
+	if (tracerPid == NULL)
+		return false;
+	tracerPid += strlen("TracerPid:");
+	while ((*tracerPid == ' ') || (*tracerPid == '\t'))
+		tracerPid++;
+	return (*tracerPid >= '1') && (*tracerPid <= '9');
+
+#endif // BF_PLATFORM_LINUX
+
     return false;
 }
 
@@ -733,6 +785,8 @@ void TestFailed(const Beefy::StringView& error, int stackOffset)
 
 void Internal::Test_Init(char* testData)
 {
+	// Die silently on a crash by default so an automated run never blocks on a dialog. The test
+	//  manager can opt into a crash report per-run via the 'CrashReport' option of :TestRun.
 	BfpSystem_SetCrashReportKind(BfpCrashReportKind_None);
 
 	Beefy::String args = GetCommandLineArgs();
@@ -818,6 +872,12 @@ int32 Internal::Test_Query()
 
 		gTestMethodIdx = atoi(param.c_str());
 		gTestBreakOnFailure = options.Contains("FailBreak");
+		if (options.Contains("CrashReport"))
+		{
+			// Print the crash report and callstack to stderr before terminating, so the test
+			//  manager can show why we died. Still no dialog and no minidump.
+			BfpSystem_SetCrashReportKind(BfpCrashReportKind_PrintOnly);
+		}
 		return gTestMethodIdx;
 	}
 	else if (result == ":TestFinish")
@@ -995,8 +1055,10 @@ bf::System::FFI::FFIResult bf::System::FFI::FFILIB::PrepCif(bf::System::FFI::FFI
 {
 #ifndef BF_DISABLE_FFI
 	return (bf::System::FFI::FFIResult)ffi_prep_cif((ffi_cif*)cif, (ffi_abi)abi, nargs, (ffi_type*)rtype, (ffi_type**)argTypes);
+#elif defined(__EMSCRIPTEN__)
+	return (bf::System::FFI::FFIResult)BfWasmFFI_PrepCif(cif, (int32)abi, nargs, rtype, (void**)argTypes);
 #else
-	return (bf::System::FFI::FFIResult)0;
+	return bf::System::FFI::FFIResult::FFIResult_NoFFI;
 #endif
 }
 
@@ -1004,6 +1066,8 @@ void bf::System::FFI::FFILIB::Call(bf::System::FFI::FFILIB::FFICIF* cif, void* f
 {
 #ifndef BF_DISABLE_FFI
 	ffi_call((ffi_cif*)cif, (void(*)())funcPtr, rvalue, args);
+#elif defined(__EMSCRIPTEN__)
+	BfWasmFFI_Call(cif, funcPtr, rvalue, args);
 #endif
 }
 
@@ -1199,20 +1263,84 @@ static int ToString(double d, char* outStr, bool roundTrip)
 
 int Float::ToString(float f, char* outStr, bool roundTrip)
 {
-#ifdef USE_CHARCONV
-	auto result = std::to_chars(outStr, outStr + 256, f);
-	return (int)(result.ptr - outStr);
-#else
 	return ::ToString(f, outStr, roundTrip);
-#endif
+}
+
+int Float::ToString_RoundTripFast(float d, char* outStr)
+{
+	// Shortest string that round-trips, via zmij (rt/zmij.c)
+	uint32 bits;
+	memcpy(&bits, &d, sizeof(bits));
+	if ((bits & 0x7F800000) == 0x7F800000)
+	{
+		if ((bits & 0x007FFFFF) != 0)
+		{
+			strcpy(outStr, "NaN");
+			return 3;
+		}
+		if ((bits & 0x80000000) != 0)
+		{
+			strcpy(outStr, "-Infinity");
+			return 9;
+		}
+		strcpy(outStr, "Infinity");
+		return 8;
+	}
+	char* endPtr = zmij_write_float(outStr, zmij_float_buffer_size, d);
+	*endPtr = 0;
+	return (int)(endPtr - outStr);
 }
 
 int Double::ToString(double d, char* outStr, bool roundTrip)
 {
-#ifdef USE_CHARCONV
-	auto result = std::to_chars(outStr, outStr + 256, d);
-	return (int)(result.ptr - outStr);
-#else
 	return ::ToString(d, outStr, roundTrip);
-#endif
+}
+
+int Double::ToString_RoundTripFast(double d, char* outStr)
+{
+	// Shortest string that round-trips, via zmij (rt/zmij.c)
+	uint64 bits;
+	memcpy(&bits, &d, sizeof(bits));
+	if ((bits & 0x7FF0000000000000ULL) == 0x7FF0000000000000ULL)
+	{
+		if ((bits & 0x000FFFFFFFFFFFFFULL) != 0)
+		{
+			strcpy(outStr, "NaN");
+			return 3;
+		}
+		if ((bits & 0x8000000000000000ULL) != 0)
+		{
+			strcpy(outStr, "-Infinity");
+			return 9;
+		}
+		strcpy(outStr, "Infinity");
+		return 8;
+	}
+	char* endPtr = zmij_write_double(outStr, zmij_double_buffer_size, d);
+	*endPtr = 0;
+	return (int)(endPtr - outStr);
+}
+
+// Correctly rounded decimal parsing via fast_float (rt/fast_float.h). The
+// string must not have a sign or be an infinity/NaN symbol - the caller
+// handles those. Returns false unless the entire string parses; overflow to
+// infinity and underflow to zero count as success.
+bool Float::Parse(char* str, int strLen, char decimalSeparator, float* outResult)
+{
+	fast_float::parse_options options(
+		fast_float::chars_format::general | fast_float::chars_format::no_infnan, decimalSeparator);
+	auto result = fast_float::from_chars_advanced(str, str + strLen, *outResult, options);
+	if ((result.ec != std::errc()) && (result.ec != std::errc::result_out_of_range))
+		return false;
+	return result.ptr == str + strLen;
+}
+
+bool Double::Parse(char* str, int strLen, char decimalSeparator, double* outResult)
+{
+	fast_float::parse_options options(
+		fast_float::chars_format::general | fast_float::chars_format::no_infnan, decimalSeparator);
+	auto result = fast_float::from_chars_advanced(str, str + strLen, *outResult, options);
+	if ((result.ec != std::errc()) && (result.ec != std::errc::result_out_of_range))
+		return false;
+	return result.ptr == str + strLen;
 }

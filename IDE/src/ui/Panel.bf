@@ -17,6 +17,13 @@ namespace IDE.ui
 
     public class Panel : Widget
     {
+		public enum ActivateKind
+		{
+			Passive,
+			Active,
+			Explicit
+		}
+
         public int32 mLastFocusAppUpdateCnt;
 		public bool mAutoDelete = true;
 		public List<Widget> mTabWidgets = new List<Widget>() ~ delete _;
@@ -62,6 +69,12 @@ namespace IDE.ui
 			base.RemovedFromParent(previousParent, window);
 		}
 
+		public virtual void Activate(ActivateKind activateKind)
+		{
+			if (activateKind >= .Active)
+				SetFocus();
+		}
+
 		public virtual void FocusForKeyboard()
 		{
 
@@ -89,100 +102,7 @@ namespace IDE.ui
 #endif
 
 
-            if (type == "CallStackPanel")
-                panel = gApp.mCallStackPanel;
-            else if (type == "BreakpointPanel")
-                panel = gApp.mBreakpointPanel;
-			else if (type == "ProfilePanel")
-				panel = gApp.mProfilePanel;
-            else if (type == "OutputPanel")
-            {                
-                panel = gApp.mOutputPanel;
-            }
-			else if (type == "TerminalPanel")
-			{
-#if BF_PLATFORM_WINDOWS
-			    panel = gApp.mTerminalPanel;
-#endif
-			}
-            else if (type == "ImmediatePanel")
-            {                
-                panel = gApp.mImmediatePanel;
-            }
-			else if (type == "ErrorsPanel")
-			{                
-			    panel = gApp.mErrorsPanel;
-			}
-            else if (type == "FindResultsPanel")
-            {                
-                panel = gApp.mFindResultsPanel;
-            }
-            else if (type == "ProjectPanel")
-            {             
-                panel = gApp.mProjectPanel;
-            }
-			else if (type == "ClassViewPanel")
-			{             
-			    panel = gApp.mClassViewPanel;
-			}
-            else if (type == "PropertiesPanel")
-            {                
-                panel = gApp.mPropertiesPanel;
-            }
-            else if (type == "SourceViewPanel")
-            {
-                panel = new SourceViewPanel();
-            }
-            else if (type == "DisassemblyPanel")
-            {
-                var disassemblyPanel = new DisassemblyPanel();
-                disassemblyPanel.mIsInitialized = true;
-                panel = disassemblyPanel;
-            }
-            else if (type == "ThreadPanel")
-            {
-                panel = gApp.mThreadPanel;
-            }
-            else if (type == "WatchPanel")
-            {
-                panel = gApp.mWatchPanel;
-            }
-            else if (type == "AutoWatchPanel")
-            {
-                panel = gApp.mAutoWatchPanel;
-            }
-            else if (type == "MemoryPanel")
-            {
-                panel = gApp.mMemoryPanel;
-            }
-			else if (type == "DiagnosticsPanel")
-			{
-			    panel = gApp.mDiagnosticsPanel;
-			}
-			else if (type == "AutoCompletePanel")
-			{
-			    panel = gApp.mAutoCompletePanel;
-			}
-			else if (type == "ModulePanel")
-			{
-			    panel = gApp.mModulePanel;
-			}
-			else if (type == "BookmarksPanel")
-			{                
-			    panel = gApp.mBookmarksPanel;
-			}
-			else if (type == "TerminalPanel")
-			{
-#if BF_PLATFORM_WINDOWS
-			    panel = gApp.mTerminalPanel;
-#endif
-			}
-			else if (type == "ConsolePanel")
-			{
-#if BF_PLATFORM_WINDOWS
-			    panel = gApp.mConsolePanel;
-#endif
-			}
+            panel = gApp.GetPanel(type);
 
             if (panel != null)
             {
@@ -191,10 +111,9 @@ namespace IDE.ui
 					delete panel;
                     return null;
 				}
-            }
 
-            Debug.Assert(panel.mParent == null);
-            Debug.Assert(panel != null);
+				Debug.Assert(panel.mParent == null);
+            }
 
             return panel;
         }
@@ -271,6 +190,11 @@ namespace IDE.ui
 		public virtual bool HandleTab(int dir)
 		{
 		    return Widget.HandleTab(dir, mTabWidgets);
+		}
+
+		// Fallback for Cmd_RenameItem, which otherwise only knows the panel types declared in IDEApp.
+		public virtual void TryRenameItem()
+		{
 		}
     }
 }

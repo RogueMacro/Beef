@@ -160,7 +160,7 @@ void BfSourceClassifier::Visit(BfFieldDeclaration* fieldDecl)
 	VisitChild(fieldDecl->mReadOnlySpecifier);
 	VisitChild(fieldDecl->mTypeRef);
 	VisitChild(fieldDecl->mNameNode);
-	SetElementType(fieldDecl->mNameNode, BfSourceElementType_Member);
+	SetElementType(fieldDecl->mNameNode, fieldDecl->mStaticSpecifier != NULL ? BfSourceElementType_Static : BfSourceElementType_Member);
 }
 
 void BfSourceClassifier::Visit(BfFieldDtorDeclaration* fieldDtorDecl)
@@ -264,8 +264,8 @@ void BfSourceClassifier::Visit(BfAttributeDirective* attributeDirective)
 		VisitChild(arg);
 	for (auto& comma : attributeDirective->mCommas)
 		VisitChild(comma);
-
-	VisitChild(attributeDirective->mNextAttribute);
+	
+	// mNextAttribute is handled in BfElementVisitor
 }
 
 void BfSourceClassifier::Visit(BfIdentifierNode* identifier)
@@ -410,6 +410,24 @@ void BfSourceClassifier::Visit(BfVariableDeclaration* varDecl)
 
 	if (!varDecl->IsA<BfParameterDeclaration>())
 		SetElementType(varDecl->mNameNode, BfSourceElementType_Local);
+}
+
+void BfSourceClassifier::Visit(BfForEachStatement* forEachStmt)
+{
+	BfElementVisitor::Visit(forEachStmt);
+
+	if (forEachStmt->mVariableName != NULL)
+	{
+		if (auto tupleExpr = BfNodeDynCast<BfTupleExpression>(forEachStmt->mVariableName))
+		{
+			for (auto val : tupleExpr->mValues)
+				SetElementType(val, BfSourceElementType_Local);
+		}
+		else
+		{
+			SetElementType(forEachStmt->mVariableName, BfSourceElementType_Local);
+		}
+	}
 }
 
 void BfSourceClassifier::Visit(BfLambdaBindExpression* lambdaBindExpr)
@@ -656,7 +674,7 @@ void BfSourceClassifier::Visit(BfPropertyDeclaration* propertyDeclaration)
 
 	BfElementVisitor::Visit(propertyDeclaration);
 
-	SetElementType(propertyDeclaration->mNameNode, BfSourceElementType_Member);
+	SetElementType(propertyDeclaration->mNameNode, propertyDeclaration->mStaticSpecifier != NULL ? BfSourceElementType_Static : BfSourceElementType_Member);
 
 	if (auto expr = BfNodeDynCast<BfPropertyBodyExpression>(propertyDeclaration->mDefinitionBlock))
 		return;
@@ -839,7 +857,7 @@ bool BfSourceClassifier::WantsSkipParentMethod(BfAstNode* node)
 		for (auto methodDeclaration : propDecl->mMethods)
 		{
 			if (node == methodDeclaration->mBody)
-			 	return true;
+				return true;
 		}
 	}
 

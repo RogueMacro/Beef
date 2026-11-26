@@ -12,6 +12,7 @@ using Beefy.res;
 using Beefy.geom;
 using System.Threading;
 using Beefy.sound;
+using res;
 #if MONOTOUCH
 using MonoTouch;
 #endif
@@ -47,6 +48,7 @@ namespace Beefy
         public delegate void UpdateDelegate(bool batchStart);
 		public delegate void UpdateFDelegate(float updatePct);
         public delegate void DrawDelegate(bool forceDraw);
+		public delegate bool IdleUpdateDelegate();
 
         public static BFApp sApp;
         public int32 mUpdateCnt;
@@ -98,7 +100,28 @@ namespace Beefy
         static extern void BFApp_SetRefreshRate(int32 rate);
 
         [CallingConvention(.Stdcall), CLink]
+        static extern void BFApp_SetExternalPacing(char8* eventName);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern void BFApp_SetFramePacer(void* pacer, float refreshRate);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern void BFApp_TakeFramePacerStats(int32* waits, int32* signaled, int64* waitMicros);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern void BFApp_SetVirtualFocus(bool virtualFocus);
+
+        [CallingConvention(.Stdcall), CLink]
         public static extern void BFApp_SetDrawEnabled(int32 enabled);
+
+        [CallingConvention(.Stdcall), CLink]
+        public static extern void BFApp_SetUnthrottledRendering(int32 enabled);
+
+        [CallingConvention(.Stdcall), CLink]
+        public static extern void BFApp_ResetSlowStart();
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern void BFApp_NotifyOffscreenRender(void* window, int32 allowInstall);
 
         [CallingConvention(.Stdcall), CLink]
         static extern void BFApp_Init();
@@ -111,6 +134,9 @@ namespace Beefy
 
         [CallingConvention(.Stdcall), CLink]
         static extern void BFApp_SetCallbacks(void* updateDelegate, void* updateFDelegate, void* drawDelegate);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BFApp_SetIdleUpdateFunc(void* idleUpdateDelegate);
 
         [CallingConvention(.Stdcall), CLink]
         static extern char8* BFApp_GetInstallDir();
@@ -142,6 +168,7 @@ namespace Beefy
         UpdateDelegate mUpdateDelegate ~ delete _;
 		UpdateFDelegate mUpdateFDelegate ~ delete _;
         DrawDelegate mDrawDelegate ~ delete _;
+		IdleUpdateDelegate mIdleUpdateDelegate ~ delete _;
 		
 #if STUDIO_CLIENT
         public bool mTrackingDraw = false;
@@ -192,6 +219,11 @@ namespace Beefy
 		    sApp.UpdateF(updatePct);
 		}
 
+		static bool Static_IdleUpdate()
+		{
+			return sApp.IdleUpdate();
+		}
+
         float mLastUpdateDelta; // In seconds
 
         public this()
@@ -219,6 +251,10 @@ namespace Beefy
 			mDrawDelegate = new => Static_Draw;
 #endif
             BFApp_SetCallbacks(mUpdateDelegate.GetFuncPtr(), mUpdateFDelegate.GetFuncPtr(),  mDrawDelegate.GetFuncPtr());
+#if !STUDIO_CLIENT
+			mIdleUpdateDelegate = new => Static_IdleUpdate;
+			BFApp_SetIdleUpdateFunc(mIdleUpdateDelegate.GetFuncPtr());
+#endif
         }
 
 #if STUDIO_CLIENT
@@ -308,7 +344,48 @@ namespace Beefy
                 mRefreshRate = value;
                 BFApp_SetRefreshRate(mRefreshRate);
             }
-        }        
+        }
+
+		// Automation mode: the app keeps its logical focus even when another application is the OS
+		// foreground window, so popup menus stay open and injected input routes normally. The
+		// native side stops treating "not the foreground window" as focus loss; genuine focus
+		// gains are still processed.
+		public void SetVirtualFocus(bool virtualFocus)
+		{
+			BFApp_SetVirtualFocus(virtualFocus);
+		}
+
+		// Only shared rendering should arm the presenter; other off-screen draws may keep it active.
+		public void NotifyOffscreenRender(BFWindow window, bool allowInstall)
+		{
+			if ((window != null) && (!window.mNativeWindowClosed))
+				BFApp_NotifyOffscreenRender(window.mNativeWindow, allowInstall ? 1 : 0);
+		}
+
+		// One frame per signal of the named event; null restores internal pacing
+		public void SetExternalPacing(StringView eventName)
+		{
+			if (eventName.IsEmpty)
+				BFApp_SetExternalPacing(null);
+			else
+				BFApp_SetExternalPacing(eventName.ToScopeCStr!());
+		}
+
+		// One frame per wait on a native pacer (CompositionTarget.FramePacer); null restores internal
+		// pacing. refreshRate > 0 replaces the head window's for update timing.
+		public void SetFramePacer(void* pacer, float refreshRate = 0)
+		{
+			BFApp_SetFramePacer(pacer, refreshRate);
+		}
+
+		// Pacer waits since the previous call: count, how many were signaled (not timed out), time waited.
+		public void TakeFramePacerStats(out int32 waits, out int32 signaled, out int64 waitMicros)
+		{
+			waits = 0;
+			signaled = 0;
+			waitMicros = 0;
+			BFApp_TakeFramePacerStats(&waits, &signaled, &waitMicros);
+		}
 
         // Simulation seconds since last update
         public float UpdateDelta
@@ -346,6 +423,14 @@ namespace Beefy
 				}
 				return null;
 			}
+		}
+
+		public virtual void Run(String[] args)
+		{
+			ParseCommandLine(args);
+			Init();
+			Run();
+			Shutdown();
 		}
 
 		public static void Startup(String[] args, Action startupCallback)
@@ -518,6 +603,22 @@ namespace Beefy
             return false;
         }
 
+        public void ClosePopupMenus()
+        {
+            List<MenuWidget> menuWidgets = scope .();
+            for (var window in mWindows)
+            {
+                if (var menuContainer = (window as WidgetWindow)?.mRootWidget as MenuContainer)
+                {
+                    if (var menuWidget = menuContainer.mScrollContent as MenuWidget)
+                        menuWidgets.Add(menuWidget);
+                }
+            }
+            // Submenus open after their parents; close them first.
+            for (var menuWidget in menuWidgets.Reversed)
+                menuWidget.Close();
+        }
+
         public virtual void Init()
         {
 			scope AutoBeefPerf("BFApp.Init");
@@ -536,9 +637,19 @@ namespace Beefy
 			mSoundManager.[Friend]mNativeSoundManager = BFApp_GetSoundManager();
 
             Interlocked.Fence();
-       
-            mInstallDir = new String(BFApp_GetInstallDir());
-            mUserDataDir = new String(mInstallDir);
+
+			mInstallDir = new String(BFApp_GetInstallDir());
+			mUserDataDir = new String(mInstallDir);
+
+#if BF_DEPENDS_MINIZ
+			var zipFilePath = scope $"{mInstallDir}Beefy.zip";
+			if (File.Exists(zipFilePath))
+			{
+				var zipFilePack = new ZipFilePack();
+				zipFilePack.Init(zipFilePath, mInstallDir);
+				FilePackManager.AddFilePack(zipFilePack);
+			}
+#endif
 
             mResourceManager = new ResourceManager();
             String resFileName = scope String();
@@ -712,6 +823,13 @@ namespace Beefy
 
             //Utils.BFRT_CPP("gBFGC.MutatorSectionExit()");
         }        
+
+		// Called between updates while the app waits for its next frame. Return true to keep being
+		// called about once a millisecond, for work that shouldn't wait a whole frame.
+		public virtual bool IdleUpdate()
+		{
+			return false;
+		}
 
 		public virtual void UpdateF(float updatePct)
 		{

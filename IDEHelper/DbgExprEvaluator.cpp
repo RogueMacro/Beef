@@ -1,5 +1,6 @@
 #include "DbgExprEvaluator.h"
-#include "WinDebugger.h"
+#include "DbgTargetHost.h"
+#include "DebugTarget.h"
 #include "Compiler/BfUtil.h"
 #include "Compiler/BfSystem.h"
 #include "Compiler/BfParser.h"
@@ -727,12 +728,12 @@ bool DwMethodMatcher::CheckType(DbgType* typeInstance, bool isFailurePass)
 
 //////////////////////////////////////////////////////////////////////////
 
-DbgExprEvaluator::DbgExprEvaluator(WinDebugger* winDebugger, DbgModule* dbgModule, BfPassInstance* passInstance, int callStackIdx, int cursorPos)
+DbgExprEvaluator::DbgExprEvaluator(DbgTargetHost* debugger, DbgModule* dbgModule, BfPassInstance* passInstance, int callStackIdx, int cursorPos)
 {
 	mCountResultOverride = -1;
 	mCapturingChildRef = true;
 	mPassInstance = passInstance;
-	mDebugger = winDebugger;
+	mDebugger = debugger;
 	mLanguage = DbgLanguage_NotSet;
 	mOrigDbgModule = dbgModule;
 	if (dbgModule != NULL)
@@ -1025,7 +1026,8 @@ DbgType* DbgExprEvaluator::ResolveTypeRef(BfTypeReference* typeRef)
 
 DbgType* DbgExprEvaluator::ResolveTypeRef(BfAstNode* typeRef, BfAstNode** parentChildRef)
 {
-	StringT<128> name = typeRef->ToString();
+	StringT<128> name;
+	typeRef->ToString(name);
 	if ((name.StartsWith("_T_")) && ((int)name.IndexOf('.') == -1))
 	{
 		int endIdx = name.length();
@@ -1202,8 +1204,41 @@ DbgTypedValue DbgExprEvaluator::GetBeefTypeById(int typeId)
 	{
 		DbgTypedValue typedVal;
 		typedVal.mType = mDebugTarget->mTargetBinary->mBfTypeType;
-		addr_target addr = mDebugTarget->mTargetBinary->mBfTypesInfoAddr + typeId * sizeof(addr_target);
-		typedVal.mSrcAddress = mDebugger->ReadMemory<addr_target>(addr);
+
+		mDebugTarget->GetCompilerSettings();
+		int objectSize = mDebugTarget->mBfObjectSize;
+
+		// Hot-loaded vdata modules contain new type tables which hold entries for the types emitted
+		//  during that hot compile (including types the original binary doesn't know about), so check
+		//  those newest-first before falling back to the original binary's table. Hot tables are sparse
+		//  and older tables may be too small for newer typeIds, so we validate each candidate entry
+		//  against the requested typeId.
+		SizedArray<addr_target, 8> typeTableAddrs;
+		for (int moduleIdx = (int)mDebugTarget->mDbgModules.size() - 1; moduleIdx >= 0; moduleIdx--)
+		{
+			auto dbgModule = mDebugTarget->mDbgModules[moduleIdx];
+			if ((dbgModule->IsHotSwapObjectFile()) && (dbgModule->mBfTypesInfoAddr > 0))
+				typeTableAddrs.Add((addr_target)dbgModule->mBfTypesInfoAddr);
+		}
+		typeTableAddrs.Add((addr_target)mDebugTarget->mTargetBinary->mBfTypesInfoAddr);
+
+		for (auto typesInfoAddr : typeTableAddrs)
+		{
+			addr_target typeAddr = mDebugger->ReadMemory<addr_target>(typesInfoAddr + typeId * sizeof(addr_target));
+			if (typeAddr == 0)
+				continue;
+			if (objectSize > 0)
+			{
+				int32 storedTypeId = -1;
+				if (!mDebugger->ReadMemory(typeAddr + objectSize + sizeof(int32), sizeof(int32), &storedTypeId))
+					continue;
+				if (storedTypeId != typeId)
+					continue;
+			}
+			typedVal.mSrcAddress = typeAddr;
+			break;
+		}
+
 		return typedVal;
 	}
 
@@ -2221,7 +2256,7 @@ DbgTypedValue DbgExprEvaluator::Cast(BfAstNode* srcNode, const DbgTypedValue& ty
 				{
 					// Never allow this
 				}
-				else if ((fromTypeCode == BfTypeCode_UInt64) && (srcVal < 0))
+				else if ((fromTypeCode == DbgType_u64) && (srcVal < 0))
 				{
 					// There's nothing that this could fit into
 				}
@@ -3074,12 +3109,12 @@ DbgTypedValue DbgExprEvaluator::ReadTypedValue(BfAstNode* targetSrc, DbgType* db
 
 	if (addrType == DbgAddrType_NoValue)
 	{
-		mPassInstance->Fail(StrFormat("No value", valAddr));
+		mPassInstance->Fail("No value");
 		return DbgTypedValue();
 	}
 	else if (addrType == DbgAddrType_OptimizedOut)
 	{
-		mPassInstance->Fail(StrFormat("Optimized out", valAddr));
+		mPassInstance->Fail("Optimized out");
 		return DbgTypedValue();
 	}
 
@@ -3539,7 +3574,7 @@ void DbgExprEvaluator::AutocompleteAddTopLevelTypes(const StringImpl& filter)
 				mAutoComplete->AddEntry(AutoCompleteEntry("valuetype", primType->mName), filter);
 		}
 
-		char* primNames[2] = { "int", "uint" };
+		const char* primNames[2] = { "int", "uint" };
 		for (auto primName : primNames)
 			mAutoComplete->AddEntry(AutoCompleteEntry("valuetype", primName), filter);
 	}
@@ -3606,9 +3641,9 @@ DbgTypedValue DbgExprEvaluator::DoLookupIdentifier(BfAstNode* identifierNode, bo
 		if (findName == "$this")
 			return GetThis();
 		else if (findName == "$ThreadId")
-			return GetInt(mDebugger->mActiveThread->mThreadId);
+			return GetInt(mDebugger->GetActiveThreadId());
 		else if (findName == "$ThreadName")
-			return GetString(mDebugger->mActiveThread->mName);
+			return GetString(mDebugger->GetActiveThreadName());
 		else if (findName == "$TargetName")
 			return GetString(GetFileName(mDebugTarget->mTargetPath));
 		else if (findName == "LaunchName")
@@ -3620,19 +3655,11 @@ DbgTypedValue DbgExprEvaluator::DoLookupIdentifier(BfAstNode* identifierNode, bo
 		else if (findName == "$ModulePath")
 			return GetString(mDbgModule->mFilePath);
 		else if (findName == "$HitCount")
-		{
-			if (mDebugger->mActiveBreakpoint != NULL)
-				return GetInt(mDebugger->mActiveBreakpoint->GetHeadBreakpoint()->mHitCount);
-			return GetInt(0);
-		}
+			return GetInt(mDebugger->GetActiveBreakpointHitCount());
 		else if (findName == "$BreakpointCondition")
-		{
-			if ((mDebugger->mActiveBreakpoint != NULL) && (mDebugger->mActiveBreakpoint->mCondition != NULL))
-				return GetString(mDebugger->mActiveBreakpoint->GetHeadBreakpoint()->mCondition->mExpr);
-			return GetString("");
-		}
+			return GetString(mDebugger->GetActiveBreakpointCondition());
 		else if (findName == "$ProcessId")
-			return GetInt(mDebugger->mProcessInfo.dwProcessId);
+			return GetInt(mDebugger->GetTargetProcessId());
 
 		bool mayBeRegister = true;
 		for (int i = 1; i < findName.length(); i++)
@@ -4148,7 +4175,7 @@ void DbgExprEvaluator::Visit(BfAssignmentExpression* assignExpr)
 	auto ptr = mResult;
 	mResult = DbgTypedValue();
 
-	if (binaryOp != NULL)
+	if (binaryOp != BfBinaryOp_None)
 	{
 		PerformBinaryOperation(assignExpr->mLeft, assignExpr->mRight, binaryOp, assignExpr->mOpToken, true);
 	}
@@ -6092,9 +6119,9 @@ void DbgExprEvaluator::PerformBinaryOperation(ASTREF(BfExpression*)& leftExpress
 
 			mResult.mType = mDbgModule->GetPrimitiveType(DbgType_Bool, GetLanguage());
 			if (binaryOp == BfBinaryOp_Equality)
-				mResult.mBool = resultTypedValue->mPtr == NULL;
+				mResult.mBool = resultTypedValue->mPtr == 0;
 			else
-				mResult.mBool = resultTypedValue->mPtr != NULL;
+				mResult.mBool = resultTypedValue->mPtr != 0;
 			return;
 		}
 
@@ -6150,9 +6177,9 @@ void DbgExprEvaluator::PerformBinaryOperation(ASTREF(BfExpression*)& leftExpress
 		{
 			mResult.mType = mDbgModule->GetPrimitiveType(DbgType_Bool, GetLanguage());
 			if ((binaryOp == BfBinaryOp_Equality) || (binaryOp == BfBinaryOp_StrictEquality))
-				mResult.mBool = resultTypedValue->mPtr == NULL;
+				mResult.mBool = resultTypedValue->mPtr == 0;
 			else
-				mResult.mBool = resultTypedValue->mPtr != NULL;
+				mResult.mBool = resultTypedValue->mPtr != 0;
 		}
 		else
 		{
@@ -6286,9 +6313,9 @@ void DbgExprEvaluator::PerformBinaryOperation(ASTREF(BfExpression*)& leftExpress
 		}
 	}
 
-	if (convLeftValue == NULL)
+	if (!convLeftValue)
 		convLeftValue = Cast(leftExpression, leftValue, resultType, explicitCast);
-	if (convRightValue == NULL)
+	if (!convRightValue)
 		convRightValue = Cast(rightExpression, rightValue, resultType, explicitCast);
 
 	PerformBinaryOperation(resultType, convLeftValue, convRightValue, binaryOp, opToken);
@@ -6317,7 +6344,7 @@ void DbgExprEvaluator::PerformBinaryOperation(DbgType* resultType, DbgTypedValue
 		return;
 	}
 
-	if ((convLeftValue == NULL) || (convRightValue == NULL))
+	if ((!convLeftValue) || (!convRightValue))
 		return;
 
 	if ((resultType->IsEnum()) || (resultType->IsTypedPrimitive()))
@@ -6653,7 +6680,7 @@ void DbgExprEvaluator::PerformUnaryExpression(BfAstNode* opToken, BfUnaryOp unar
 			val.mDouble += add;
 			break;
 		default:
-			Fail(StrFormat("Unable to perform operation on type '%s'", ptr.mType->ToString()), expr);
+			Fail(StrFormat("Unable to perform operation on type '%s'", ptr.mType->ToString().c_str()), expr);
 			return;
 		}
 
@@ -6983,7 +7010,7 @@ DbgTypedValue DbgExprEvaluator::CreateCall(DbgSubprogram* method, DbgTypedValue 
 
 	mDebugger->SaveAllRegisters();
 
-	BfLogDbg("Starting RunState_DebugEval on thread %d\n", mDebugger->mActiveThread->mThreadId);
+	BfLogDbg("Starting RunState_DebugEval on thread %d\n", mDebugger->GetActiveThreadId());
 
 	addr_target prevSP = registers->GetSP();
 
@@ -7019,10 +7046,10 @@ DbgTypedValue DbgExprEvaluator::CreateCall(DbgSubprogram* method, DbgTypedValue 
 // 	mDebugger->mActiveThread->mBreakpointAddressContinuing = 0;
 	auto prevRunState = mDebugger->mRunState;
 	mDebugger->mRunState = RunState_DebugEval;
-	mDebugger->mExplicitStopThread = NULL;
+	mDebugger->ClearExplicitStopThread();
 	mDebugger->mRequestedStackFrameIdx = -1;
 
-	BfLogDbg("DbgExprEvaluator::CreateCall %p in thread %d\n", startAddr, mDebugger->mActiveThread->mThreadId);
+	BfLogDbg("DbgExprEvaluator::CreateCall %p in thread %d\n", startAddr, mDebugger->GetActiveThreadId());
 
 	DbgCallResult callResult;
 	callResult.mSubProgram = method;

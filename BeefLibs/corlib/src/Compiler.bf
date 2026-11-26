@@ -12,7 +12,7 @@ namespace System
 		{
 			public static HashSet<String> sReservedNameSet = new .() ~ delete _;
 
-			const String[?] cReservedNames = .("abstract", "alignof", "alloctype", "append", "as", "asm", "base", "break",
+			const String[?] cReservedNames = .("abstract", "alignof", "alloctype", "append", "as", "asm", "base", "box", "break",
 				"case", "catch", "checked", "class", "comptype", "const", "continue", "decltype", "default", "defer", "delegate",
 				"delete", "do", "else", "enum", "explicit", "extension", "extern", "false", "finally", "fixed", "for", "function",
 				"if", "implicit", "in", "interface", "internal", "is", "isconst", "mixin", "namespace", "new", "null", "nullable",
@@ -39,7 +39,8 @@ namespace System
 			public enum Flags
 			{
 				None = 0,
-				AllowRegenerate = 1
+				AllowRegenerate = 1,
+				AllowFileExt = 2
 			}
 
 			public String mCmdInfo = new String() ~ delete _;
@@ -181,6 +182,23 @@ namespace System
 				String outText = scope .();
 				Flags flags = .None;
 				val.Generate(fileName, outText, ref flags);
+
+				if (flags.HasFlag(.AllowFileExt))
+				{
+					String origFileName = scope .(fileName);
+
+					var fileExt = Path.GetExtension(origFileName, .. scope .());
+					if (!fileExt.IsEmpty)
+					{
+						val.mCmdInfo.Append("fileExt\t");
+						fileExt.Quote(val.mCmdInfo);
+						val.mCmdInfo.Append("\n");
+					}
+
+					fileName.Clear();
+					Path.GetFileNameWithoutExtension(origFileName, fileName);
+				}
+
 				val.mCmdInfo.Append("fileName\t");
 				fileName.Quote(val.mCmdInfo);
 				val.mCmdInfo.Append("\n");
@@ -255,8 +273,62 @@ namespace System
 
 		public static class Options
 		{
+			public enum PlatformType : int32
+			{
+				Unknown,
+				Windows,
+				Linux,
+				macOS,
+				iOS,
+				Android,
+				Wasm,
+			}
+
+			public enum MachineType : int32
+			{
+				Unknown,
+				x86,
+				x64,
+				ARM,
+				AArch64,
+				Wasm32,
+				Wasm64,
+			}
+
+			public enum ToolsetType : int32
+			{
+				GNU,
+				Microsoft,
+				LLVM
+			}
+
+			public enum OptLevel : int32
+			{
+				O0,
+				O1,
+				O2,
+				O3,
+				Og,
+				OgPlus
+			}
+
 			[LinkName("#AllocStackCount")]
 			public static extern int32 AllocStackCount;
+
+			[LinkName("#Platform")]
+			public static extern PlatformType Platform;
+
+			[LinkName("#Architecture")]
+			public static extern MachineType Architecture;
+
+			[LinkName("#Toolset")]
+			public static extern ToolsetType Toolset;
+
+			[LinkName("#TargetTriple")]
+			public static extern String TargetTriple;
+
+			[LinkName("#OptimizationLevel")]
+			public static extern OptLevel OptimizationLevel;
 		}
 
 		[LinkName("#CallerLineNum")]
@@ -313,6 +385,26 @@ namespace System
 		[LinkName("#NextId")]
 		public static extern int64 NextId;
 
+		[LinkName("#ProjectDir")]
+		public static extern String ProjectDir;
+
+		[LinkName("#BuildDir")]
+		public static extern String BuildDir;
+
+		/// Full path of the compiler executable (BeefBuild or BeefIDE)
+		[LinkName("#CompilerPath")]
+		public static extern String CompilerPath;
+
+		/// Version of the compiler executable
+		[LinkName("#CompilerVersion")]
+		public static extern String CompilerVersion;
+
+		[LinkName("#CompilerBuildDate")]
+		private static extern int64 sCompilerBuildDateTicks;
+
+		/// Build time of the compiler executable, in UTC
+		public static DateTime CompilerBuildDate => .(sCompilerBuildDateTicks, .Utc);
+
 		[Comptime(ConstEval=true)]
 		public static void Assert(bool cond)
 		{
@@ -336,7 +428,9 @@ namespace System
 		static extern void Comptime_EmitMethodEntry(int64 methodHandle, StringView text);
 		static extern void Comptime_EmitMethodExit(int64 methodHandle, StringView text);
 		static extern void Comptime_EmitMixin(StringView text);
+		static extern void Comptime_Output(StringView text);
 		static extern String Comptime_GetStringById(int32 id);
+		static extern int32 Comptime_GetIdByString(StringView str);
 
 		[Comptime(OnlyFromComptime=true)]
 		public static MethodBuilder CreateMethod(Type owner, StringView methodName, Type returnType, MethodFlags methodFlags)
@@ -344,6 +438,12 @@ namespace System
 			MethodBuilder builder = .();
 			builder.[Friend]mNative = Comptime_CreateMethod((.)owner.TypeId, methodName, returnType, methodFlags);
 			return builder;
+		}
+
+		[Comptime(OnlyFromComptime=true)]
+		public static void Output(StringView text)
+		{
+			Comptime_Output(text);
 		}
 
 		[Comptime(OnlyFromComptime=true)]
@@ -396,7 +496,7 @@ namespace System
 				Comptime_EmitMixin(text);
 		}
 
-		[Comptime]
+		[Comptime(ConstEval=true)]
 		public static Span<uint8> ReadBinary(StringView path)
 		{
 			List<uint8> data = scope .();
@@ -404,7 +504,7 @@ namespace System
 			return data;
 		}
 
-		[Comptime]
+		[Comptime(ConstEval=true)]
 		public static String ReadText(StringView path)
 		{
 			String data = scope .();

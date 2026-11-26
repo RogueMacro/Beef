@@ -424,7 +424,7 @@ namespace System
 			flags |= .DebugAlloc;
 #endif
 			Init(cVersion, (int32)flags, &BfRtCallbacks.sCallbacks);
-#if !BF_RUNTIME_REDUCED && BF_PLATFORM_WINDOWS
+#if !BF_RUNTIME_REDUCED && (BF_PLATFORM_WINDOWS || BF_PLATFORM_LINUX)
 			InitCrashCatcher((int32)flags);
 #endif
 #if BF_DBG_RUNTIME
@@ -668,7 +668,7 @@ namespace System
 
 		public static void Shutdown()
 		{
-#if !BF_RUNTIME_REDUCED && BF_PLATFORM_WINDOWS
+#if !BF_RUNTIME_REDUCED && (BF_PLATFORM_WINDOWS || BF_PLATFORM_LINUX)
 			ShutdownCrashCatcher();
 #endif
 		}
@@ -771,9 +771,16 @@ namespace System
 			return 0;
 		}
 
-		/*[LinkName(.C), AlwaysInclude]
-		static extern void WinMain(void* module, void* prevModule, char8* args, int32 showCmd);*/
+#if BF_DEFINE_CRT_WINMAIN
+		[LinkName(.C), AlwaysInclude]
+		static extern void WinMain(void* module, void* prevModule, char8* args, int32 showCmd);
 
+		[LinkName(.C), AlwaysInclude]
+		static void WinMainCRTStartup()
+		{
+			WinMain(null, null, "", 0);
+		}
+#else
 		[LinkName(.C), AlwaysInclude]
 		static extern int32 main(int argc, char8** argv);
 
@@ -782,12 +789,7 @@ namespace System
 		{
 			main(0, null);
 		}
-
-		/*[LinkName(.C), AlwaysInclude]
-		static void WinMainCRTStartup()
-		{
-			//WinMain(null, null, "hi", 1);
-		}*/
+#endif
 
 		[LinkName(.C), Export]
 		static int32 _tls_index;

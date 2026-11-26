@@ -30,6 +30,8 @@
 #pragma warning (push)
 #pragma warning (disable:4005)
 #include <d3d11.h>
+#include <d3d11_1.h>
+#include <dxgi1_3.h>
 #pragma warning (pop)
 
 #ifdef BF_MINGW
@@ -38,6 +40,7 @@
 #endif
 
 #include "Common.h"
+#include "BFApp.h"
 #include "gfx/Shader.h"
 #include "gfx/Texture.h"
 #include "gfx/RenderDevice.h"
@@ -52,6 +55,26 @@ NS_BF_BEGIN;
 class WinBFWindow;
 class BFApp;
 class DXRenderDevice;
+class DXCompositionHost;
+class DXCompositionTarget;
+
+// What one texture holds, for Gfx_GetTextureStats. mKey is the underlying D3D resource, so views
+// over a shared one (CreateDepthRef, CreateRawRef) count once. A color target's own depth plane is
+// mDepthBytes; mCpuBytes is system-side copies (content bits, staging).
+struct TextureMemoryStats
+{
+	const char* mKind;
+	void* mKey;
+	int64 mGpuBytes;
+	int64 mDepthBytes;
+	int64 mCpuBytes;
+	int mWidth;
+	int mHeight;
+	int mDepth;
+	int mMips;
+	int mSamples;
+	int mFormat;
+};
 
 class DXTexture : public Texture
 {
@@ -63,7 +86,24 @@ public:
 	ID3D11RenderTargetView*	mD3DRenderTargetView;
 	ID3D11Texture2D*		mD3DDepthBuffer;
 	ID3D11DepthStencilView*	mD3DDepthStencilView;
+	IDXGIKeyedMutex*		mD3DKeyedMutex;
+	// Mip-0 unordered access view when created GPU-writable (see GetUAV); NULL otherwise.
+	ID3D11UnorderedAccessView* mD3DUAV;
+	// The uploaded pixels, only for a TextureFlag_KeepPixels load; NULL otherwise.
 	uint32*					mContentBits;
+	// What LoadTexture was asked for, so a raw ref or a device re-create can load the file again.
+	int						mLoadFlags;
+	bool					mLoadedImage;
+	// An sRGB image with translucent texels stores linear-premultiplied color, which no raw view
+	// can undo.
+	bool					mTranslucentSrgb;
+	// Created with only mip 0 filled; RegisterTexture generates the rest.
+	bool					mPendingMips;
+	DXGI_FORMAT				mD3DFormat;
+	int						mSampleCount;
+	// Scene depth is reverse-Z (cleared to 0); shadow atlases stay standard-Z (cleared to 1).
+	bool					mStandardDepthClear;
+	bool					mHasStencil;
 
 public:
 	DXTexture();
@@ -72,10 +112,101 @@ public:
 	void					ReleaseNative();
 	void					ReinitNative();
 
+	virtual ID3D11UnorderedAccessView* GetUAV(int mipLevel) { return (mipLevel == 0) ? mD3DUAV : NULL; }
+
+	virtual void			Release() override;
 	virtual void			PhysSetAsTarget() override;
 	virtual void			Blt(ImageData* imageData, int x, int y) override;
 	virtual void			SetBits(int destX, int destY, int destWidth, int destHeight, int srcPitch, uint32* bits) override;
 	virtual void			GetBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits) override;
+	virtual void			GetDepthBits(int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits) override;
+	virtual Texture*		CreateDepthRef() override;
+	virtual Texture*		CreateRawRef() override;
+	virtual void*			GetSharedHandle() override;
+	virtual bool			AcquireKeyedMutex(uint64 key, uint32 timeoutMs) override;
+	virtual void			ReleaseKeyedMutex(uint64 key) override;
+	virtual void			ResolveTo(Texture* dest) override;
+	virtual void			GenerateMips() override;
+	virtual void			CopyToMip(int mipLevel, Texture* src, int width, int height) override;
+	virtual void			GetMemoryStats(TextureMemoryStats& stats);
+	void					EnsureDepthPlane();
+};
+
+// Structured buffer posing as a texture: mD3DResourceView is the buffer SRV, so DXSetTextureCmd
+// binds it into a t-slot unchanged; every other DXTexture member stays NULL. mWidth = element count.
+// GPU-writable buffers are USAGE_DEFAULT with a UAV (mD3DUAV) and upload via UpdateSubresource
+// instead of Map; mD3DStaging is created on the first readback.
+class DXStructuredBuffer : public DXTexture
+{
+public:
+	ID3D11Buffer*			mD3DBuffer;
+	ID3D11Buffer*			mD3DStaging;
+	ID3D11Buffer*			mD3DAsyncStaging;
+	bool					mReadbackPending;
+	int						mStride;
+	bool					mGpuWritable;
+	bool					mDefaultUsage;
+	bool					mStreaming;
+	ID3D11Buffer*			mD3DUpdateStaging[3];
+	int						mUpdateStagingIdx;
+	// Batched upload: one DISCARD-mapped dynamic buffer per flush, scattered writes, then one
+	// CopySubresourceRegion per dirty range (see UpdateBufferRange / FlushUpdates).
+	ID3D11Buffer*			mD3DUploadBuffer;
+	void*					mUploadPtr;
+	std::vector<int>		mPendingRanges;
+	virtual void			FlushBufferUpdates() override; // GPU-writable or CPU-updatable: written with UpdateSubresource, never mapped
+
+public:
+	DXStructuredBuffer();
+	~DXStructuredBuffer();
+
+	virtual void			PhysSetAsTarget() override;
+	virtual bool			GetBufferData(void* outData, int size) override;
+	virtual bool			BeginBufferReadback() override;
+	virtual int				PollBufferReadback(void* outData, int size) override;
+	virtual void			UpdateBufferRange(int offset, void* data, int size) override;
+	virtual void			GetMemoryStats(TextureMemoryStats& stats) override;
+};
+
+// Volume texture: SRV over the whole mip chain, one UAV per mip for compute writes. Not a render
+// target. mWidth/mHeight/mDepth are mip 0.
+class DXTexture3D : public DXTexture
+{
+public:
+	static const int		cMaxMips = 16;
+
+	ID3D11Texture3D*		mD3DTexture3D;
+	ID3D11Texture3D*		mD3DStaging;
+	ID3D11UnorderedAccessView* mD3DUAVs[cMaxMips];
+	int						mDepth;
+	int						mMipLevels;
+	int						mBytesPerTexel;
+
+public:
+	DXTexture3D();
+	~DXTexture3D();
+
+	virtual ID3D11UnorderedAccessView* GetUAV(int mipLevel) override { return ((mipLevel >= 0) && (mipLevel < mMipLevels)) ? mD3DUAVs[mipLevel] : NULL; }
+	virtual void			PhysSetAsTarget() override;
+	virtual void			SetData3D(int mipLevel, void* data, int rowPitch, int slicePitch) override;
+	virtual bool			GetData3D(int mipLevel, void* outData, int outSize) override;
+	virtual void			GetMemoryStats(TextureMemoryStats& stats) override;
+	virtual void			GenerateMips() override;
+};
+
+class DXComputeShader : public ComputeShader
+{
+public:
+	DXRenderDevice*			mRenderDevice;
+	String					mSrcPath;
+	String					mEntry;
+	ID3D11ComputeShader*	mD3DComputeShader;
+
+public:
+	DXComputeShader();
+	~DXComputeShader();
+
+	bool					Load();
 };
 
 class DXShaderParam : public ShaderParam
@@ -98,14 +229,21 @@ class DXShader : public Shader
 public:
 	DXRenderDevice*			mRenderDevice;
 	String					mSrcPath;
+	String					mEntrySuffix; // "" = the plain VS/PS entries
 	VertexDefinition*		mVertexDef;
 
 	ID3D11InputLayout*		mD3DLayout;
+	ID3D11InputLayout*		mD3DInstLayout; // the instance element from slot 1 (per-instance); NULL if the vertex def has none
+	// The compact depth stream's layout (position + bone slots only). Built only for shaders loaded
+	// with ShaderFlags_DepthStream, whose vertex stage declares nothing beyond that subset; NULL
+	// for every other shader, which keeps the full stream.
+	ID3D11InputLayout*		mD3DDepthLayout;
 	ID3D11VertexShader*		mD3DVertexShader;
 	ID3D11PixelShader*		mD3DPixelShader;
 	DXShaderParamMap		mParamsMap;
 	ID3D11Buffer*			mConstBuffer;
 	bool					mHas2DPosition;
+	int						mShaderFlags; // ShaderFlags bits, part of the shader cache key
 
 public:
 	DXShader();
@@ -114,7 +252,7 @@ public:
 	void					ReleaseNative();
 	void					ReinitNative();
 
-	bool					Load();
+	virtual int				Load() override;
 	virtual ShaderParam*	GetShaderParam(const StringImpl& name) override;
 };
 
@@ -134,12 +272,71 @@ class DXDrawLayer : public DrawLayer
 public:
 	virtual DrawBatch*		CreateDrawBatch();
 	virtual RenderCmd*		CreateSetTextureCmd(int textureIdx, Texture* texture) override;
+	virtual void			SetBufferData(Texture* buffer, void* data, int size) override;
+	virtual void			SetComputeTexture(int slot, Texture* texture) override;
+	virtual void			SetComputeUAV(int slot, Texture* texture, int mipLevel) override;
+	virtual void			Dispatch(ComputeShader* shader, int groupsX, int groupsY, int groupsZ) override;
+	virtual void			SetPixelUAV(int slot, Texture* texture) override;
+	virtual void			ClearBufferUint(Texture* buffer, uint32 value) override;
 	virtual void			SetShaderConstantData(int usageIdx, int slotIdx, void* constData, int size) override;
 	virtual void			SetShaderConstantDataTyped(int usageIdx, int slotIdx, void* constData, int size, int* typeData, int typeCount) override;
+	virtual void			DrawStaticMeshInstanced(StaticMesh* mesh, int instBase, int instCount) override;
 
 public:
 	DXDrawLayer();
 	~DXDrawLayer();
+};
+
+class DXStaticMesh : public StaticMesh
+{
+public:
+	ID3D11Buffer*			mD3DVertexBuffer;
+	ID3D11Buffer*			mD3DIndexBuffer;
+	// Position + bone slots over the SAME index buffer, 24 bytes a vertex (see
+	// Gfx_StaticMesh_SetDepthStream). NULL when the mesh was not given one.
+	ID3D11Buffer*			mD3DDepthVertexBuffer;
+
+public:
+	DXStaticMesh();
+	~DXStaticMesh();
+};
+
+class DXStaticMeshDrawCmd : public RenderCmd
+{
+public:
+	DXStaticMesh*			mMesh;
+	int						mInstBase;
+	int						mInstCount;
+
+public:
+	virtual void CommandQueued(DrawLayer* drawLayer) override;
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+};
+
+// Paces frames on a swapchain's frame-latency waitable: a semaphore released once per present (capped at 40).
+// A frame is due once a count has been taken for every present so far. Uncapped presents start the count over.
+class DXFrameLatencyPacer : public FramePacer
+{
+public:
+	HANDLE					mWaitable;
+	HWND					mHWnd;
+	int64					mPresentCount;
+	int64					mAcquiredCount;
+	// mPresentCount when WaitForFrame last said a frame was due; still equal means that frame was never presented.
+	int64					mDuePresentCount;
+	// Clock pacing for when no release is coming (about one refresh).
+	int						mIdleWaitMS;
+	// A wait timed out: releases stopped (an occluded window). Pace on the clock until they come back.
+	bool					mStalled;
+
+public:
+	DXFrameLatencyPacer();
+	~DXFrameLatencyPacer();
+
+	void					Reset(HANDLE waitable);
+	void					TakeReleases();
+	void					WriteOff();
+	virtual bool			WaitForFrame(int timeoutMS) override;
 };
 
 class DXRenderWindow : public RenderWindow
@@ -149,10 +346,16 @@ public:
 	DXRenderDevice*			mDXRenderDevice;
 	IDXGISwapChain*			mDXSwapChain;
 	ID3D11Texture2D*		mD3DBackBuffer;
+	// Flip-model swapchains can't be multisampled, so an MSAA window renders here and resolves on Present.
+	ID3D11Texture2D*		mD3DMsaaTarget;
 	ID3D11RenderTargetView*	mD3DRenderTargetView;
 	ID3D11Texture2D*		mD3DDepthBuffer;
 	ID3D11DepthStencilView*	mD3DDepthStencilView;
-	HANDLE					mFrameWaitObject;
+	bool					mFlipModel;
+	// Uncapped presents happened: the waitable's count can't be trusted until the swapchain is replaced.
+	bool					mPacerCountLost;
+	UINT					mSwapChainFlags;
+	DXFrameLatencyPacer		mPacer;
 	float					mRefreshRate;
 	bool					mResizePending;
 	bool					mWindowed;
@@ -169,6 +372,9 @@ public:
 
 	void ReleaseNative();
 	void ReinitNative();
+	bool					CreateFlipSwapChain(int frameLatency);
+	void					CreateTargets(int msaaSamples);
+	void					ResetSwapChain();
 
 	void					SetAsTarget() override;
 	void					Resized() override;
@@ -182,6 +388,11 @@ public:
 typedef std::vector<DXDrawBatch*> DXDrawBatchVector;
 
 #define DX_VTXBUFFER_SIZE 1024*1024
+// Slots at or above this are mirrored to the vertex stage on every bind and unbind. 13 is the
+// skinning palette; t14/t15 are free and t26+ are reserved for user surface shaders.
+#define DX_VS_TEXTURE_SLOT 13
+// The compact depth stream: Vector3 position, uint32 bone indices, uint64 bone weights.
+#define DX_DEPTH_VERTEX_SIZE 24
 #define DX_IDXBUFFER_SIZE 64*1024
 
 class DXDrawBufferPool
@@ -218,10 +429,13 @@ public:
 	void IndalidateDepthStencilState();
 
 	virtual void SetClipped(bool clipped);
-	virtual void SetTexWrap(bool clipped);
+	virtual void SetSamplerKind(SamplerKind samplerKind);
 	virtual void SetClipRect(const RectF& rect);
 	virtual void SetWriteDepthBuffer(bool writeDepthBuffer);
 	virtual void SetDepthFunc(DepthFunc depthFunc);
+	virtual void SetStencilMode(StencilMode mode);
+	virtual void SetCullMode(CullMode cullMode);
+	virtual void SetFrontFace(FrontFace frontFace);
 };
 
 class DXModelPrimitives
@@ -230,7 +444,10 @@ public:
 	String					mMaterialName;
 	int						mNumIndices;
 	int						mNumVertices;
+	// Slot-indexed, and sparse: a NULL entry is a slot the def left unbound (see ModelDef_SetTexture).
 	Array<DXTexture*>		mTextures;
+	// Per-instance overrides (see ModelInstance::SetTexture), consulted first at bind time.
+	Array<DXTexture*>		mOverrideTextures;
 
 	ID3D11Buffer*			mD3DIndexBuffer;
 	//TODO: Split the vertex buffer up into static and dynamic buffers
@@ -251,14 +468,18 @@ class DXModelInstance : public ModelInstance
 {
 public:
 	DXRenderDevice*			mD3DRenderDevice;
-	Array<DXModelMesh>		mDXModelMeshs;
+	Array<DXModelMesh>		mDXModelMeshs;	
 
 public:
 	DXModelInstance(ModelDef* modelDef);
 	~DXModelInstance();
 
-	virtual void CommandQueued(DrawLayer* drawLayer) override;
-	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+	// The per-instance vertex/index copy, created at the first native queue. A model that batches
+	// never queues natively and so never pays for one (a character is several MB).
+	void EnsureBuffers();
+	virtual void SetTexture(int meshIdx, int primIdx, int texIdx, Texture* texture) override;
+	virtual void CommandQueued(RenderCmd* renderCmd, DrawLayer* drawLayer) override;
+	virtual void Render(RenderCmd* renderCmd, RenderDevice* renderDevice, RenderWindow* renderWindow) override;
 };
 
 class DXVertexDefinition : public VertexDefinition
@@ -289,35 +510,199 @@ public:
 	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
 };
 
+// Upload snapshots live until their queued commands are cleared.
+class DXSetBufferDataCmd : public RenderCmd
+{
+public:
+	DXStructuredBuffer* mBuffer;
+	uint8* mData;
+	MemoryPool* mUploadPool;
+	int mSize;
+
+public:
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+	virtual void Free() override;
+};
+
+class DXSetComputeTextureCmd : public RenderCmd
+{
+public:
+	int mSlot;
+	DXTexture* mTexture;
+
+public:
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+};
+
+class DXSetComputeUAVCmd : public RenderCmd
+{
+public:
+	int mSlot;
+	int mMipLevel;
+	DXTexture* mTexture;
+
+public:
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+};
+
+// Rebinds the current render targets with a pixel-stage UAV attached (see
+// DXRenderDevice::BindRenderTargets); a NULL texture drops it again.
+class DXSetPixelUAVCmd : public RenderCmd
+{
+public:
+	int mSlot;
+	DXTexture* mTexture;
+
+public:
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+};
+
+class DXClearUAVCmd : public RenderCmd
+{
+public:
+	DXTexture* mTexture;
+	uint32 mValue;
+
+public:
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+};
+
+class DXDispatchCmd : public RenderCmd
+{
+public:
+	DXComputeShader* mShader;
+	int mGroupsX;
+	int mGroupsY;
+	int mGroupsZ;
+
+public:
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+};
+
+// D3D11 timestamp queries for one frame: a disjoint query covering the frame plus a begin/end pair
+// per span. Frames are read back from a ring so the CPU never waits on the GPU.
+class DXGpuTimerFrame
+{
+public:
+	ID3D11Query*			mDisjoint;
+	Array<ID3D11Query*>		mBeginQueries;
+	Array<ID3D11Query*>		mEndQueries;
+	Array<int>				mTags;
+	int						mSpanCount;
+	int64					mFrameId;
+	int						mNotReadyFetches;
+	bool					mOpen;
+	bool					mPending;
+
+public:
+	DXGpuTimerFrame();
+	~DXGpuTimerFrame();
+	void ReleaseNative();
+};
+
+#define DX_GPUTIMER_FRAMES 4
+#define DX_GPUTIMER_MAX_SPANS 1024
+
 class DXRenderDevice : public RenderDevice
 {
 public:
+	static const int cUploadBlockSize = 128 * 1024;
+	MemoryPool mBufferUploadPool;
+
+	ID3D11InfoQueue*		mD3DInfoQueue;
+	Texture*				mPSBoundTextures[32];
+	void					DrainDebugMessages();
 	IDXGIFactory*			mDXGIFactory;
 	ID3D11Device*			mD3DDevice;
 	ID3D11DeviceContext*	mD3DDeviceContext;
+	ID3D11DeviceContext1*	mD3DDeviceContext1; // 11.1 interface for rect clears; NULL on 11.0 runtimes
 	ID3D11BlendState*		mD3DNormalBlendState;
+	ID3D11BlendState*		mD3DA2CBlendState;
 	ID3D11SamplerState*		mD3DDefaultSamplerState;
 	ID3D11SamplerState*		mD3DWrapSamplerState;
+	ID3D11SamplerState*		mD3DNearestSamplerState;
+	ID3D11SamplerState*		mD3DShadowSamplerState;
+	ID3D11SamplerState*		mD3DTrilinearSamplerState;
 	bool					mNeedsReinitNative;
+	bool					mOffscreenPresentationAllowed;
+	bool					mOffscreenPresentationArmed;
+	HWND					mOffscreenSourceWindow;
+	HWND					mOffscreenPresentWindow;
+	IDXGISwapChain*			mOffscreenSwapChain;
+	ID3D11RenderTargetView*	mOffscreenPresentView;
+	uint64					mOffscreenPresentTick;
+	uint64					mOffscreenPresentCount;
 
 	ID3D11Buffer*			mMatrix2DBuffer;
 	ID3D11Buffer*			mD3DVertexBuffer;
 	ID3D11Buffer*			mD3DIndexBuffer;
 	int						mVtxByteIdx;
 	int						mIdxByteIdx;
+	// Per-instance stream for DXStaticMeshDrawCmd: float k+1 at element k, so an instanced draw bound at
+	// offset instBase*4 feeds instance i the value instBase+i+1 (the same encoding as a stamped vertex).
+	ID3D11Buffer*			mInstIotaBuffer;
+	int						mInstIotaCount;
+	
+	ID3D11RenderTargetView*	mCurD3DRTV;
+	ID3D11DepthStencilView*	mCurD3DDSV;
+	// The texture bound as the target, NULL while a window is (see EnsureTargetDepthFor).
+	DXTexture*				mCurTargetTexture;
+
+	DXGpuTimerFrame			mGpuTimerFrames[DX_GPUTIMER_FRAMES];
+	int						mGpuTimerWriteIdx;
+	int						mGpuTimerCurTag;
+	int						mGpuTimerOpenSpan;
+	bool					mGpuTimerEnabled;
 
 	HashSet<DXRenderState*>	mRenderStates;
 	HashSet<DXTexture*>		mTextures;
+	// Everything alive, targets and buffers included, for Gfx_GetTextureStats; mTextures is only what
+	// ReinitNative can rebuild.
+	HashSet<DXTexture*>		mAllTextures;
+	HashSet<DXModelInstance*> mModelInstances;
 	HashSet<DXShader*>		mShaders;
+	HashSet<DXComputeShader*> mComputeShaders;
 	Dictionary<String, DXTexture*> mTextureMap;
 	Dictionary<int, ID3D11Buffer*> mBufferMap;
+	// Refcount-zero textures wait here until FrameEnd has flushed every layer: queued draw
+	// commands may still reference them (the texture analog of Scene's retired GpuBuffers).
+	Array<DXTexture*>		mRetiredTextures;
+	Array<ModelInstance*>	mRetiredModelInstances;
+	// Rebuilt by ReinitNative (see DXComposition.h).
+	HashSet<DXCompositionHost*> mCompositionHosts;
+	HashSet<DXCompositionTarget*> mCompositionTargets;
+	// Compute slots bound since the last dispatch (bit per slot); the dispatch unbinds them.
+	uint32					mCSBoundSRVs;
+	uint32					mCSBoundUAVs;
+	// Pixel-stage UAV, re-attached by every render-target bind until it is dropped again.
+	ID3D11UnorderedAccessView* mCurPSUAV;
+	int						mCurPSUAVSlot;
 
 public:
+	// The one place render targets reach the device: attaches mCurPSUAV when one is set.
+	void					BindRenderTargets(int rtvCount, ID3D11RenderTargetView* const* rtvs, ID3D11DepthStencilView* dsv);
 	virtual void			PhysSetRenderState(RenderState* renderState) override;
 	virtual void			PhysSetRenderWindow(RenderWindow* renderWindow);
 	virtual void			PhysSetRenderTarget(Texture* renderTarget) override;
+	virtual void			PhysSetViewportRect(int x, int y, int width, int height, bool clear) override;
 	virtual RenderState*	CreateRenderState(RenderState* srcRenderState) override;
+	virtual void			ReleaseRenderState(RenderState* renderState) override;
 	virtual ModelInstance*	CreateModelInstance(ModelDef* modelDef, ModelCreateFlags flags) override;
+	virtual StaticMesh*		CreateStaticMesh(int vertexSize, void* vtxData, int vtxCount, void* idxData, int idxCount, bool idx32) override;
+	virtual void			SetStaticMeshDepthStream(StaticMesh* mesh, void* data, int vtxCount) override;
+	virtual int64			GetStaticMeshBytes(StaticMesh* mesh) override;
+	virtual void			GetTextureStats(String& outStats) override;
+	virtual void			ProcessRetired() override;
+	virtual void			GpuTimerSetEnabled(bool enabled) override;
+	virtual bool			GpuTimerBeginFrame(int64 frameId) override;
+	virtual void			GpuTimerSetTag(int tag) override;
+	virtual int				GpuTimerSpanBegin() override;
+	virtual void			GpuTimerSpanRetag(int tag) override;
+	virtual void			GpuTimerSpanEnd(int spanId) override;
+	virtual void			GpuTimerEndFrame() override;
+	virtual int				GpuTimerFetch(int64* outFrameId, GpuTimerSpan* outSpans, int maxSpans) override;
+	ID3D11Query*			GetTimestampQuery(Array<ID3D11Query*>& queries, int idx);
+	void					EnsureInstIota(int count);
 
 public:
 	DXRenderDevice();
@@ -329,12 +714,31 @@ public:
 
 	void					FrameStart() override;
 	void					FrameEnd() override;
+	void					NotifyOffscreenRender(RenderWindow* window, bool allowInstall) override;
+	void					PresentOffscreen();
+	void					ReleaseOffscreenPresentation();
+	void					RetireTexture(DXTexture* texture);
+	void					ProcessRetiredTextures();
+	void					ProcessRetiredModelInstances();
+	void					EnsureTargetDepthFor(RenderState* renderState);
+	virtual void			DeleteModelInstance(ModelInstance* modelInstance) override;
 
 	Texture*				LoadTexture(const StringImpl& fileName, int flags) override;
 	Texture*				LoadTexture(ImageData* imageData, int flags) override;
+	DXTexture*				CreateDetachedTexture(ImageData* imageData, int flags);
+	Texture*				LoadTextureDetached(const StringImpl& fileName, int flags) override;
+	Texture*				CreateTextureDetached(ImageData* imageData, int flags) override;
+	void					RegisterTexture(Texture* texture) override;
 	Texture*				CreateDynTexture(int width, int height) override;
-	Shader*					LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition) override;
-	Texture*				CreateRenderTarget(int width, int height, bool destAlpha) override;
+	Shader*					LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition, const StringImpl& entrySuffix, int shaderFlags) override;
+	void					ReleaseShader(Shader* shader) override;
+	Texture*				CreateRenderTarget(int width, int height, int flags, int sampleCount) override;
+	Texture*				CreateDepthTarget(int width, int height, bool is16Bit) override;
+	Texture*				CreateStructuredBuffer(int stride, int count, int flags) override;
+	Texture*				CreateTexture3D(int width, int height, int depth, int flags) override;
+	Texture*				OpenSharedRenderTarget(void* handle, int width, int height) override;
+	ComputeShader*			LoadComputeShader(const StringImpl& fileName, const StringImpl& entry) override;
+	void					ReleaseComputeShader(ComputeShader* shader) override;
 
 	void					SetRenderState(RenderState* renderState) override;
 };

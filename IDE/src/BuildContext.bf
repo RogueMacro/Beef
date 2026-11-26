@@ -10,13 +10,15 @@ using Beefy.theme.dark;
 
 namespace IDE
 {
-	enum CompileKind
+	enum CompileKind : IDisposable
 	{
 		case Normal;
+		case NormalTargeted(String projectName);
 		case RunAfter;
 		case DebugAfter;
 		case DebugComptime;
 		case Test;
+		case TestTargeted;
 		case WhileRunning;
 
 		public bool WantsRunAfter
@@ -24,6 +26,16 @@ namespace IDE
 			get
 			{
 				return (this == .RunAfter) || (this == .DebugAfter);
+			}
+		}
+
+		public void Dispose()
+		{
+			switch (this)
+			{
+			case .NormalTargeted(let projectName):
+				delete projectName;
+			default:
 			}
 		}
 	}
@@ -62,18 +74,20 @@ namespace IDE
 		public this()
 		{
 			Workspace.Options workspaceOptions = gApp.GetCurWorkspaceOptions();
-			mToolset = workspaceOptions.mToolsetType;
+			mToolset = gApp.GetBuildToolset(workspaceOptions);
 			mPlatformType = Workspace.PlatformType.GetFromName(gApp.mPlatformName, workspaceOptions.mTargetTriple);
 			mPtrSize = Workspace.PlatformType.GetPtrSizeByName(gApp.mPlatformName);
 		}
 
-		public CustomBuildCommandResult QueueProjectCustomBuildCommands(Project project, String targetPath, Project.BuildCommandTrigger trigger, List<String> cmdList)
+		public CustomBuildCommandResult QueueProjectCustomBuildCommands(Project project, String targetPath, Project.BuildCommandTrigger trigger, List<String> cmdList, bool isPostBuild = false)
 		{
 			if (cmdList.IsEmpty)
 				return .NoCommands;
 
 			if (trigger == .Never)
 				return .NoCommands;
+
+			bool isWSL = mPlatformType.IsWSL;
 
 			List<Project> depProjectList = scope .();
 			gApp.GetDependentProjectList(project, depProjectList);
@@ -82,7 +96,7 @@ namespace IDE
 			{
 				int64 highestDateTime = 0;
 
-				int64 targetDateTime = File.GetLastWriteTime(targetPath).Get().ToFileTime();
+				int64 targetDateTime = File.GetLastWriteTime(targetPath).GetValueOrDefault().ToFileTime().GetValueOrDefault();
 
 				bool forceRebuild = false;
 
@@ -145,6 +159,8 @@ namespace IDE
 				else
 				{
 					customCmd.Append("%exec ");
+					if (isWSL)
+						customCmd.Append("wsl.exe ");
 					gApp.ResolveConfigString(gApp.mPlatformName, workspaceOptions, project, options, origCustomCmd, "custom command", customCmd);
 
 					// For multi-line execs
@@ -166,6 +182,7 @@ namespace IDE
 				let scriptCmd = new IDEApp.ScriptCmd();
 				scriptCmd.mCmd = new String(customCmd);
 				scriptCmd.mPath = new $"project {project.mProjectName}";
+				scriptCmd.mSkipIfBuildFailed = (isPostBuild) && (!options.mBuildOptions.mPostBuildOnFailure);
 				gApp.mExecutionQueue.Add(scriptCmd);
 				continue;
 			}
@@ -173,7 +190,90 @@ namespace IDE
 			return didCommands ? .HadCommands : .NoCommands;
 		}
 
-		bool QueueProjectGNUArchive(Project project, String targetPath, Workspace.Options workspaceOptions, Project.Options options, String objectsArg)
+		public static Result<void> FindExecutableInPath(String filename, String outPath)
+		{
+			String PATH = scope .();
+			String filenameBuffer = scope .(64);
+			Try!(Environment.GetEnvironmentVariable("PATH", PATH));
+			for (let directory in PATH.Split(
+#if BF_PLATFORM_WINDOWS
+					';'
+#else
+					':'
+#endif
+				))
+			{
+				for (let file in Directory.EnumerateFiles(directory))
+				{
+					file.GetFileName(filenameBuffer..Clear());
+					if (filenameBuffer == filename)
+					{
+						file.GetFilePath(outPath);
+						return .Ok;
+					}	
+				}
+			}
+			return .Err;
+		}
+
+		public static Result<void> FindLinuxLLVMTool(String name, String outPath, bool requireLLVM22)
+		{
+			for (let candidate in scope String[](scope String(name, "-22"), name))
+			{
+				outPath.Clear();
+				if (FindExecutableInPath(candidate, outPath) case .Err)
+					continue;
+
+				let startInfo = scope ProcessStartInfo();
+				startInfo.SetFileName(outPath);
+				startInfo.SetArguments("--version");
+				startInfo.UseShellExecute = false;
+				startInfo.CreateNoWindow = true;
+				startInfo.RedirectStandardOutput = true;
+				startInfo.RedirectStandardError = true;
+				let process = scope SpawnedProcess();
+				if (process.Start(startInfo) case .Err)
+					continue;
+				let outputStream = scope FileStream();
+				let errorStream = scope FileStream();
+				process.AttachStandardOutput(outputStream).IgnoreError();
+				process.AttachStandardError(errorStream).IgnoreError();
+				// Version output is small; bound the wait for broken tool installations.
+				if (!process.WaitFor(2000))
+				{
+					process.Kill();
+					process.WaitFor();
+					continue;
+				}
+				if (process.ExitCode != 0)
+					continue;
+				if (requireLLVM22)
+				{
+					let reader = scope StreamReader(outputStream);
+					String output = scope .();
+					if (reader.ReadToEnd(output) case .Err)
+						continue;
+					int versionStart = output.IndexOf("version ");
+					if (versionStart >= 0)
+						versionStart += 8;
+					else
+					{
+						versionStart = output.IndexOf("LLD ");
+						if (versionStart < 0)
+							continue;
+						versionStart += 4;
+					}
+					int versionEnd = output.IndexOf('.', versionStart);
+					if ((versionEnd < 0) || (int.Parse(output.Substring(versionStart, versionEnd - versionStart)).GetValueOrDefault() < 22))
+						continue;
+				}
+				return .Ok;
+			}
+			outPath.Clear();
+			return .Err;
+		}
+
+		bool QueueProjectGNUArchive(Project project, String targetPath, Workspace.Options workspaceOptions, Project.Options options, String objectsArg, CompileKind compileKind)
 		{
 #if BF_PLATFORM_WINDOWS
 			String llvmDir = scope String(IDEApp.sApp.mInstallDir);
@@ -300,7 +400,11 @@ namespace IDE
 
 			UpdateCacheStr(project, "", workspaceOptions, options, null, null);
 
-		    if (project.mNeedsTargetRebuild)
+			if (!WantsProjectBuild(project, compileKind))
+			{
+				// We will catch the mNeedsTargetRebuild later when we do a proper build
+			}
+		    else if (project.mNeedsTargetRebuild)
 		    {
 		        if (File.Delete(targetPath) case .Err)
 				{
@@ -316,7 +420,18 @@ namespace IDE
 #elif BF_PLATFORM_MACOS
 				arPath.Append("llvm/bin/llvm-ar");
 #else
-				arPath.Append("/usr/bin/ar");
+				if ((mPlatformType == .Linux) && (gApp.GetBuildToolset(workspaceOptions) == .LLVM))
+				{
+					arPath.Set(gApp.mLinuxArPath);
+				}
+				else if ((mPlatformType == .Linux) && (gApp.mLinuxLLVMFallback))
+				{
+					if (FindExecutableInPath("ar", arPath) case .Err)
+						arPath.Append("/usr/bin/ar");
+				}
+				else if (FindExecutableInPath("llvm-ar", arPath) case .Err)
+					if (FindExecutableInPath("ar", arPath) case .Err)
+						arPath.Append("/usr/bin/ar");
 #endif
 
 				String workingDir = scope String();
@@ -358,33 +473,7 @@ namespace IDE
 			return true;
 		}
 
-		void WSLPathFix(String str)
-		{
-			for (int i = 1; i < str.Length - 1; i++)
-			{
-				if (str[i] == ':')
-				{
-					if (str[i - 1].IsLetter)
-					{
-						int j = i;
-						for ( ; j < str.Length; j++)
-						{
-							char8 cj = str[j];
-							if (cj == '\\')
-								str[j] = '/';
-							if ((cj.IsWhiteSpace) || (cj == '"'))
-								break;
-						}
-
-						str.Remove(i);
-						str[i - 1] = str[i - 1].ToLower;
-						str.Insert(i - 1, "/mnt/");
-					}
-				}
-			}
-		}
-
-		bool QueueProjectGNULink(Project project, String targetPath, Workspace.Options workspaceOptions, Project.Options options, String objectsArg)
+		bool QueueProjectGNULink(Project project, String targetPath, Workspace.Options workspaceOptions, Project.Options options, String objectsArg, CompileKind compileKind)
 		{
 			if (options.mBuildOptions.mBuildKind == .Intermediate)
 				return true;
@@ -393,15 +482,22 @@ namespace IDE
 
 			bool isMinGW = false;
 
-#if BF_PLATFORM_WINDOWS
-			bool isWSL = mPlatformType == .Linux;
-			String llvmDir = scope String(IDEApp.sApp.mInstallDir);
-			IDEUtils.FixFilePath(llvmDir);
-			llvmDir.Append("llvm/");
-#else
-		    String llvmDir = "";
-			bool isWSL = false;
-#endif
+			bool isWSL = mPlatformType.IsWSL;
+
+			String llvmDir = scope String();
+
+			if (isWSL)
+			{
+				llvmDir.Set(IDEApp.sApp.mInstallDir);
+				IDEUtils.FixFilePath(llvmDir);
+				llvmDir.Append("llvm/");
+
+				if (gApp.mSettings.mWSLBeefBinPath.IsEmpty)
+				{
+					gApp.OutputLineSmart($"ERROR: '{project}' Linux compilation on Windows requires WSL settings to be configured in BeefSettings.toml");
+					return false;
+				}
+			}
 
 		    //String error = scope String();
 
@@ -437,6 +533,15 @@ namespace IDE
 				if (isDynLib)
 				{
 					linkLine.Append("-shared ");
+
+					if (mPlatformType == .macOS)
+					{
+						// Without an explicit install name it defaults to the absolute build path,
+						// which would then be baked into anything that links against this library.
+						String dynLibFileName = scope String();
+						Path.GetFileName(targetPath, dynLibFileName);
+						linkLine.AppendF("-Wl,-install_name,@rpath/{0} ", dynLibFileName);
+					}
 				}
 
 				if ((mPlatformType == .Windows) &&
@@ -446,7 +551,7 @@ namespace IDE
 			        linkLine.Append("-mwindows ");
 			    }
 
-				if (mPlatformType == .Linux)
+				if ((mPlatformType == .Linux) && (!isDynLib))
 					linkLine.Append("-no-pie ");
 
 				if (mPlatformType == .macOS)
@@ -512,33 +617,71 @@ namespace IDE
 					linkLine.Append(" ");
 				}
 
-				String gccExePath;
-				String clangExePath;
+				String gccExePath = scope .();
+				String clangExePath = scope .();
 				if (isMinGW)
 				{
-				    gccExePath = "c:/mingw/bin/g++.exe";
-				    clangExePath = scope String(llvmDir, "bin/clang++.exe");
+				    gccExePath.Set("c:/mingw/bin/g++.exe");
+				    clangExePath.Append(llvmDir, "bin/clang++.exe");
+				}
+				else if ((mPlatformType == .Linux) && (gApp.GetBuildToolset(workspaceOptions) == .LLVM))
+				{
+					clangExePath.Set(gApp.mLinuxClangPath);
+					let lldPath = gApp.mLinuxLLDPath;
+					IDEUtils.AppendWithOptionalQuotes(linkLine, scope String("-fuse-ld=", lldPath));
+					linkLine.Append(" ");
+
+					var ltoType = gApp.GetBuildLTOType(workspaceOptions, options);
+					if (ltoType == .Thin)
+					{
+						linkLine.Append("-flto=thin ");
+						String cachePath = scope .();
+						Path.GetDirectoryPath(targetPath, cachePath);
+						cachePath.Append("/ltocache");
+						IDEUtils.AppendWithOptionalQuotes(linkLine, scope String("-Wl,--thinlto-cache-dir=", cachePath));
+						linkLine.Append(" ");
+					}
+				}
+				else if ((mPlatformType == .Linux) && (gApp.mLinuxLLVMFallback))
+				{
+					// Do not select a broken Clang again after the preflight rejected it.
+					if ((FindExecutableInPath("c++", gccExePath) case .Err) &&
+						(FindExecutableInPath("g++", gccExePath) case .Err))
+					{
+						if (!gApp.mLinuxClangPath.IsEmpty)
+							gccExePath.Set(gApp.mLinuxClangPath);
+						else
+							gccExePath.Set("/usr/bin/c++");
+					}
+					clangExePath.Set(gccExePath);
 				}
 				else
 				{
-			        gccExePath = "/usr/bin/c++";
-			        clangExePath = scope String("/usr/bin/c++");
-
-			        if (File.Exists("/usr/bin/clang++"))
-			        {
-						gccExePath = "/usr/bin/clang++";
-			        	clangExePath = scope String("/usr/bin/clang++");
-			        }
+					String buffer = scope .(128);
+					if (FindExecutableInPath("clang++", buffer) case .Ok)
+					{
+						gccExePath.Set(buffer);
+						clangExePath.Set(buffer);
+					}
+			        else if (FindExecutableInPath("c++", buffer..Clear()) case .Ok)
+					{
+						gccExePath.Set(buffer);
+						clangExePath.Set(buffer);
+					}
 			        else
 			        {
-						gccExePath = "/usr/bin/c++";
-			        	clangExePath = scope String("/usr/bin/c++");
+						gccExePath.Set("/usr/bin/c++");
+			        	clangExePath.Set("/usr/bin/c++");
 			        }
 				}
 
 				UpdateCacheStr(project, linkLine, workspaceOptions, options, depPaths, libPaths);
 
-			    if (project.mNeedsTargetRebuild)
+				if (!WantsProjectBuild(project, compileKind))
+				{
+					// We will catch the mNeedsTargetRebuild later when we do a proper build
+				}
+			    else if (project.mNeedsTargetRebuild)
 			    {
 			        if (File.Delete(targetPath) case .Err)
 					{
@@ -546,7 +689,7 @@ namespace IDE
 					    return false;
 					}
 
-					if (workspaceOptions.mToolsetType == .GNU)
+					if (gApp.GetBuildToolset(workspaceOptions) == .GNU)
 					{
 			            if (mPtrSize == 4)
 			            {
@@ -559,7 +702,7 @@ namespace IDE
 							linkLine.Append(" ");*/
 			            }
 					}
-					else // Microsoft
+					else if (mPlatformType == .Windows)
 					{
 						if (mPtrSize == 4)
 						{
@@ -589,7 +732,7 @@ namespace IDE
 						linkLine.Append(linkFlags, " ");
 					}
 
-			        String compilerExePath = (workspaceOptions.mToolsetType == .GNU) ? gccExePath : clangExePath;
+			        String compilerExePath = (gApp.GetBuildToolset(workspaceOptions) == .GNU) ? gccExePath : clangExePath;
 					String workingDir = scope String();
 					if (!llvmDir.IsEmpty)
 					{
@@ -604,8 +747,10 @@ namespace IDE
 					{
 						linkLine.Insert(0, " ");
 						linkLine.Insert(0, compilerExePath);
-						compilerExePath = "wsl.exe";
-						WSLPathFix(linkLine);
+						compilerExePath = "@wsl";
+						IDEUtils.WSLPathFix(linkLine);
+
+						linkLine.Insert(0, scope $"cd {gApp.mSettings.mWSLBeefBinPath}; ");
 					}
 
 			        var runCmd = gApp.QueueRun(compilerExePath, linkLine, workingDir, .UTF8);
@@ -635,7 +780,7 @@ namespace IDE
 			return true;
 		}
 
-		bool QueueProjectWasmLink(Project project, String targetPath, Workspace.Options workspaceOptions, Project.Options options, String objectsArg)
+		bool QueueProjectWasmLink(Project project, String targetPath, Workspace.Options workspaceOptions, Project.Options options, String objectsArg, CompileKind compileKind)
 		{
 			//bool isDebug = gApp.mConfigName.IndexOf("Debug", true) != -1;
 
@@ -647,7 +792,7 @@ namespace IDE
 			bool isExe = ((project.mGeneralOptions.mTargetType != Project.TargetType.BeefLib) && (project.mGeneralOptions.mTargetType != Project.TargetType.BeefTest)) || (isTest);
 			bool isDynLib = (project.mGeneralOptions.mTargetType == Project.TargetType.BeefLib) && (options.mBuildOptions.mBuildKind == .DynamicLib);
 
-			if (workspaceOptions.mToolsetType != .GNU)
+			if (gApp.GetBuildToolset(workspaceOptions) != .GNU)
 			{
 				gApp.OutputErrorLine("Workspace Build Toolset options must be set to GNU for WASM builds");
 				return false;
@@ -676,18 +821,67 @@ namespace IDE
 					linkLine.Append(" ");
 				}
 				
+				// These used to be appended down in the rebuild branch, which put them after the
+				//  project's own flags and, worse, after UpdateCacheStr: the link line is the
+				//  cache key, so anything added past that point was invisible to the rebuild
+				//  decision and toggling EmitDebugInfo relinked nothing. Emitted here they are
+				//  hashed, and the project's flags land last, where a later -O or -g wins.
+				//linkLine.Append(" c:\\Beef\\wasm\\BeefRT.a -s STRICT=1 -s USE_PTHREADS=1 -s ALIASING_FUNCTION_POINTERS=1 -s ASSERTIONS=0 -s DISABLE_EXCEPTION_CATCHING=0 -s DEMANGLE_SUPPORT=0 -s EVAL_CTORS=1 -s WASM=1 -s \"EXPORTED_FUNCTIONS=['_BeefMain','_BeefDone','_pthread_mutexattr_init','_pthread_mutex_init','_emscripten_futex_wake','_calloc','_sbrk']\"");
+				// BeefRT uses C++ runtime support even though the inputs are object files.
+				linkLine.Append("-s DEFAULT_TO_CXX=1 -s DISABLE_EXCEPTION_CATCHING=0");
+
+				// emcc defaults to -O0, and nothing here ever said otherwise, so a Release
+				//  wasm build linked unoptimized: binaryen left the module alone and the JS
+				//  glue went out unminified. The objects being linked are the Beef backend's,
+				//  so its optimization level is the one that applies.
+				switch (workspaceOptions.mBfOptimizationLevel)
+				{
+				case .O0: linkLine.Append(" -O0");
+				case .O1: linkLine.Append(" -O1");
+				case .O2: linkLine.Append(" -O2");
+				case .O3: linkLine.Append(" -O3");
+				case .Og, .OgPlus: linkLine.Append(" -Og");
+				}
+
+				// The function table, which is how the runtime makes a dynamic call without
+				// libffi: wasmTable.get(ptr) is what MethodInfo.Invoke and every reflection
+				// constructed attribute go through. Without the export the table is not in
+				// scope for the runtime's JS and the call throws "wasmTable is not defined".
+				linkLine.Append(" -s EXPORTED_RUNTIME_METHODS=wasmTable");
+
+				if (project.mWasmOptions.mEnableThreads)
+					linkLine.Append(" -pthread");
+
+				if (workspaceOptions.mEmitDebugInfo != .No)
+					linkLine.Append(" -gseparate-dwarf -gsource-map");
+
+				if (!workspaceOptions.mRuntimeChecks)
+					linkLine.Append(" -s ASSERTIONS=0");
+
 				if (options.mBuildOptions.mOtherLinkFlags.Length != 0)
 				{
 					var linkFlags = scope String();
 					gApp.ResolveConfigString(gApp.mPlatformName, workspaceOptions, project, options, options.mBuildOptions.mOtherLinkFlags, "link flags", linkFlags);
+					// Separate explicitly. What used to precede this was the library loop, which
+					//  leaves a trailing space; the flags above do not, so without this the first
+					//  project flag fuses onto the last one. $(LinkFlags) starts with the Beef
+					//  runtime archive, so the fused result silently dropped it from the link and
+					//  the module came out short every symbol in BeefRT.
+					linkLine.Append(" ");
 					linkLine.Append(linkFlags, " ");
 				}
+
+				linkLine.Replace('\\', '/');
 
 				UpdateCacheStr(project, linkLine, workspaceOptions, options, depPaths, libPaths);
 
 				String emsdkPath = scope .(gApp.mSettings.mEmscriptenPath);
 
-			    if (project.mNeedsTargetRebuild)
+				if (!WantsProjectBuild(project, compileKind))
+				{
+					// We will catch the mNeedsTargetRebuild later when we do a proper build
+				}
+			    else if (project.mNeedsTargetRebuild)
 			    {
 			        if (File.Delete(targetPath) case .Err)
 					{
@@ -703,11 +897,22 @@ namespace IDE
 						Path.GetAbsolutePath("../../wasm", gApp.mInstallDir, wasmPath..Clear());
 					IDEUtils.FixFilePath(wasmPath);
 
+					// The marker says fetch_wasm.bat finished unpacking the bundled emsdk into
+					//  wasm/emsdk, so it only means something for that emsdk. It used to be required
+					//  for any configured path, so an Emscripten the user installed and pointed at
+					//  could never link: nothing but fetch_wasm.bat (Windows only) writes the marker.
+					//  A user's Emscripten is checked by its emcc instead, below.
+					String bundledEmsdkPath = scope $"{wasmPath}/emsdk";
+					IDEUtils.FixFilePath(bundledEmsdkPath);
+					String configuredEmsdkPath = scope .(gApp.mSettings.mEmscriptenPath);
+					IDEUtils.FixFilePath(configuredEmsdkPath);
+					configuredEmsdkPath.TrimEnd(Path.DirectorySeparatorChar);
+
 					if (gApp.mSettings.mEmscriptenPath.IsEmpty)
 					{
 						gApp.mSettings.mEmscriptenPendingInstall = true;
 					}
-					else if (!File.Exists(scope $"{wasmPath}/EmsdkDep1_Done.txt"))
+					else if ((Path.Equals(configuredEmsdkPath, bundledEmsdkPath)) && (!File.Exists(scope $"{wasmPath}/{IDEApp.cEmSdkDep}")))
 					{
 						gApp.mSettings.mEmscriptenPendingInstall = true;
 					}
@@ -760,27 +965,37 @@ namespace IDE
 
 					if (!gApp.mSettings.mEmscriptenPendingInstall)
 					{
-						if (!File.Exists(scope $"{gApp.mInstallDir}/Beef{IDEApp.sRTVersionStr}RT32_wasm.a"))
+						// The runtime this project links, not always the plain one: the threaded
+						//  and debug runtimes are separate archives that may not have been built.
+						String rtPath = scope .(gApp.mInstallDir);
+						if ((!rtPath.EndsWith('\\')) && (!rtPath.EndsWith('/')))
+							rtPath.Append("/");
+						GetWasmRtLibName(project, options, rtPath);
+						if (!File.Exists(rtPath))
 						{
-							gApp.OutputErrorLine("Wasm runtime libraries not found. Build with 'wasm/build_wasm.bat'.");
+#if BF_PLATFORM_WINDOWS
+							gApp.OutputErrorLine("Wasm runtime library '{}' not found. Build with 'wasm/build_wasm.bat'.", rtPath);
+#else
+							gApp.OutputErrorLine("Wasm runtime library '{}' not found. Build with 'wasm/build_wasm.sh'.", rtPath);
+#endif
 							return false;
 						}
 					}
 
-					compilerExePath.Append(@"/upstream/emscripten/emcc.bat");
-					//linkLine.Append(" c:\\Beef\\wasm\\BeefRT.a -s STRICT=1 -s USE_PTHREADS=1 -s ALIASING_FUNCTION_POINTERS=1 -s ASSERTIONS=0 -s DISABLE_EXCEPTION_CATCHING=0 -s DEMANGLE_SUPPORT=0 -s EVAL_CTORS=1 -s WASM=1 -s \"EXPORTED_FUNCTIONS=['_BeefMain','_BeefDone','_pthread_mutexattr_init','_pthread_mutex_init','_emscripten_futex_wake','_calloc','_sbrk']\"");
-					linkLine.Append("-s DISABLE_EXCEPTION_CATCHING=0");
-
-					if (project.mWasmOptions.mEnableThreads)
-						linkLine.Append(" -pthread");
-
-					if (workspaceOptions.mEmitDebugInfo != .No)
-						linkLine.Append(" -gseparate-dwarf");
-
-					if (!workspaceOptions.mRuntimeChecks)
-						linkLine.Append(" -s ASSERTIONS=0");
-
-					linkLine.Replace('\\', '/');
+					// The emsdk ships emcc.exe on Windows and a plain emcc everywhere else, so the
+					//  suffix cannot be part of the literal: hardcoding it made every POSIX wasm
+					//  link fail with "Failed to execute ...emcc.exe" after a successful compile.
+#if BF_PLATFORM_WINDOWS
+					compilerExePath.Append(@"upstream/emscripten/emcc.exe");
+#else
+					compilerExePath.Append(@"upstream/emscripten/emcc");
+#endif
+					// A pending install has no emcc yet; the queued fetch_wasm.bat brings it.
+					if ((!gApp.mSettings.mEmscriptenPendingInstall) && (!File.Exists(compilerExePath)))
+					{
+						gApp.OutputErrorLine("Emscripten compiler not found at '{}'. Check Wasm configuration in File\\Preferences\\Settings.", compilerExePath);
+						return false;
+					}
 
 					var targetDir = Path.GetDirectoryPath(actualTargetPath, .. scope .());
 			        var runCmd = gApp.QueueRun(compilerExePath, linkLine, targetDir, .UTF8);
@@ -816,9 +1031,25 @@ namespace IDE
 			if (lastDotPos == -1)
 				return;
 			outPdbPath.Append(targetPath, 0, lastDotPos);
-			if (workspaceOptions.mToolsetType == .LLVM)
+			if (gApp.GetBuildToolset(workspaceOptions) == .LLVM)
 				outPdbPath.Append("_lld");
 			outPdbPath.Append(".pdb");
+		}
+
+		// The wasm runtime a project links: Beef<ver>RT32_wasm[_pthread][_d].a in the install
+		//  directory (wasm/build_wasm.sh / .bat build them all). As on Linux and macOS, where
+		//  DynamicDebug selects libBeefRT_d.a, the debug runtime is the Beef Lib Type setting's
+		//  choice, not the config's: other configs get the optimized runtime.
+		public static void GetWasmRtLibName(Project project, Project.Options options, String outName)
+		{
+			outName.Append("Beef", IDEApp.sRTVersionStr, "RT");
+			outName.Append((Workspace.PlatformType.GetPtrSizeByName(gApp.mPlatformName) == 4) ? "32" : "64");
+			outName.Append("_wasm");
+			if (project.mWasmOptions.mEnableThreads)
+				outName.Append("_pthread");
+			if (options.mBuildOptions.mBeefLibType == .DynamicDebug)
+				outName.Append("_d");
+			outName.Append(".a");
 		}
 
 		public static void GetRtLibNames(Workspace.PlatformType platformType, Workspace.Options workspaceOptions, Project.Options options, bool dynName, String outRt, String outDbg, String outAlloc)
@@ -880,6 +1111,13 @@ namespace IDE
 
 		bool CopyLibFiles(String targetPath, Workspace.Options workspaceOptions, Project.Options options)
 		{
+#if BF_PLATFORM_WINDOWS
+			bool isWSL = mPlatformType == .Linux;
+#else
+			bool isWSL = false;
+#endif
+
+
 		    List<String> stdLibFileNames = scope .(2);
 		    String fromDir;
 		    
@@ -895,7 +1133,21 @@ namespace IDE
 				toPath.Append("/", dllName);
 				if (File.CopyIfNewer(fromPath, toPath) case .Err(let err))
 				{
-					gApp.OutputLine("Failed to copy lib file '{0}' to '{1}'", fromPath, toPath);
+					do
+					{
+						if (isWSL)
+						{
+							String beefPath = @"/home/brian/Beef/IDE/dist";
+							fromPath.Set(beefPath);
+							if (!fromPath.EndsWith('/'))
+								fromPath.Append('/');
+							fromPath.Append(dllName);
+							if (IDEUtils.WSLCopy(fromPath, toPath) case .Ok)
+								break;
+						}
+
+						gApp.OutputLine("Failed to copy lib file '{0}' to '{1}'", fromPath, toPath);
+					}
 					return false;
 				}
 				return true;
@@ -1018,12 +1270,12 @@ namespace IDE
 
 				int64 fileTime = 0;
 				if (!filePath.IsEmpty)
-					fileTime = File.GetLastWriteTime(filePath).GetValueOrDefault().ToFileTime();
+					fileTime = File.GetLastWriteTime(filePath).GetValueOrDefault().ToFileTime().GetValueOrDefault();
 				cacheStr.AppendF("{}\t{}\n", filePath, fileTime);
 			}
 
 			cacheStr.AppendF("Args\t{}\n", linkLine);
-			cacheStr.AppendF("Toolset\t{}\n", workspaceOptions.mToolsetType);
+			cacheStr.AppendF("Toolset\t{}\n", gApp.GetBuildToolset(workspaceOptions));
 			AddBuildFileDependency(project.mWindowsOptions.mIconFile);
 			AddBuildFileDependency(project.mWindowsOptions.mManifestFile);
 
@@ -1068,7 +1320,7 @@ namespace IDE
 			}
 		}
 
-		bool QueueProjectMSLink(Project project, String targetPath, String configName, Workspace.Options workspaceOptions, Project.Options options, String objectsArg)
+		bool QueueProjectMSLink(Project project, String targetPath, String configName, Workspace.Options workspaceOptions, Project.Options options, String objectsArg, CompileKind compileKind)
 		{
 			if (options.mBuildOptions.mBuildKind == .Intermediate)
 				return true;
@@ -1198,8 +1450,15 @@ namespace IDE
 					linkLine.Append("-debug ");
 
 				if (workspaceOptions.mBfOptimizationLevel.IsOptimized())
+				{
 					//linkLine.Append("-opt:ref -verbose ");
 					linkLine.Append("-opt:ref ");
+#if !CLI
+					// -opt:ref implies -opt:icf, and folded functions can't be individually hot-patched
+					if (workspaceOptions.mAllowHotSwapping)
+						linkLine.Append("-opt:noicf ");
+#endif
+				}
 				else
 					linkLine.Append("-opt:noref ");
 
@@ -1237,7 +1496,11 @@ namespace IDE
 
 				UpdateCacheStr(project, linkLine, workspaceOptions, options, depPaths, libPaths);
 
-				if (project.mNeedsTargetRebuild)
+				if (!WantsProjectBuild(project, compileKind))
+				{
+					// We will catch the mNeedsTargetRebuild later when we do a proper build
+				}
+				else if (project.mNeedsTargetRebuild)
 				{
 					String projectBuildDir = scope String();
 					gApp.GetProjectBuildDir(project, projectBuildDir);
@@ -1313,7 +1576,7 @@ namespace IDE
 					}
 
 					String linkerPath = scope String();
-					if (workspaceOptions.mToolsetType == .LLVM)
+					if (gApp.GetBuildToolset(workspaceOptions) == .LLVM)
 					{
 						linkerPath.Clear();
 						linkerPath.Append(gApp.mInstallDir);
@@ -1364,6 +1627,22 @@ namespace IDE
 						gApp.mExecutionQueue.Add(writeEmitCmd);
 					}
 
+					// LLDB can hold onto file references. Deleting those files clears that up.
+					void CheckFileWrite(StringView path)
+					{
+						// With no sharing, read access still fails on any other handle; a write handle makes this slow on large files
+						switch (scope UnbufferedFileStream().Open(path, .Read))
+						{
+						case .Ok:
+							return;
+						case .Err(let err):
+							if (err == .SharingViolation)
+								File.Delete(path).IgnoreError();
+						}
+					}
+					CheckFileWrite(pdbName);
+					CheckFileWrite(targetPath);
+
 			        var runCmd = gApp.QueueRun(linkerPath, linkLine, gApp.mInstallDir, .UTF16WithBom);
 					runCmd.mReference = new .(project.mProjectName);
 					runCmd.mEnvVars = new .() { (new String("VSLANG"), new String("1033")) };
@@ -1388,6 +1667,32 @@ namespace IDE
 				var tagetCompletedCmd = new IDEApp.TargetCompletedCmd(project);
 				tagetCompletedCmd.mOnlyIfNotFailed = true;
 				gApp.mExecutionQueue.Add(tagetCompletedCmd);
+			}
+
+			return true;
+		}
+
+		public bool WantsProjectBuild(Project project, CompileKind compileKind)
+		{
+			Project targetedProject = null;
+
+			switch (compileKind)
+			{
+			case .NormalTargeted(let projectName):
+				targetedProject = gApp.mWorkspace.FindProject(projectName);
+			case .DebugAfter, .RunAfter, .WhileRunning:
+				targetedProject = gApp.mWorkspace.mStartupProject;
+			case .Test:
+				if ((gApp.mTestManager != null) && (gApp.mTestManager.mTargetTestProject != null))
+					targetedProject = gApp.mWorkspace.FindProject(gApp.mTestManager.mTargetTestProject);
+			default:
+			}
+
+			if (targetedProject != null)
+			{
+				if (targetedProject == project)
+					return true;
+				return targetedProject.HasDependency(project.mProjectName);
 			}
 
 			return true;
@@ -1496,7 +1801,7 @@ namespace IDE
 
 			mTargetPathMap[project] = new String(targetPath);
 
-			if (hotProject == null)
+			if ((hotProject == null) && (WantsProjectBuild(project, compileKind)))
 			{
 				switch (QueueProjectCustomBuildCommands(project, targetPath, compileKind.WantsRunAfter ? options.mBuildOptions.mBuildCommandsOnRun : options.mBuildOptions.mBuildCommandsOnCompile, options.mBuildOptions.mPreBuildCmds))
 				{
@@ -1634,7 +1939,11 @@ namespace IDE
 		    }
 
 		    String objectsArg = scope String();
-			var argBuilder = scope IDEApp.ArgBuilder(objectsArg, workspaceOptions.mToolsetType != .GNU);
+			bool useLinuxLLVM = (mPlatformType == .Linux) && (gApp.GetBuildToolset(workspaceOptions) == .LLVM);
+			// macOS links dynamic libraries through the GNU path below (which passes -shared to
+			// clang), so a DynamicLib must not be routed to the static archiver there.
+			bool canLinkDynLib = useLinuxLLVM || (mPlatformType == .macOS);
+			var argBuilder = scope IDEApp.ArgBuilder(objectsArg, (gApp.GetBuildToolset(workspaceOptions) != .GNU) && (!useLinuxLLVM));
 		    for (var bfFileName in bfFileNames)
 		    {
 				argBuilder.AddFileName(bfFileName);
@@ -1649,17 +1958,18 @@ namespace IDE
 
 			if (mPlatformType == .Wasm)
 			{
-				if (!QueueProjectWasmLink(project, targetPath, workspaceOptions, options, objectsArg))
+				if (!QueueProjectWasmLink(project, targetPath, workspaceOptions, options, objectsArg, compileKind))
 					return false;
 			}
-			else if (workspaceOptions.mToolsetType == .GNU)
+			else if ((gApp.GetBuildToolset(workspaceOptions) == .GNU) || (useLinuxLLVM))
 			{
-				if ((options.mBuildOptions.mBuildKind == .StaticLib) || (options.mBuildOptions.mBuildKind == .DynamicLib))
+				if ((options.mBuildOptions.mBuildKind == .StaticLib) ||
+					((options.mBuildOptions.mBuildKind == .DynamicLib) && (!canLinkDynLib)))
 				{
-					if (!QueueProjectGNUArchive(project, targetPath, workspaceOptions, options, objectsArg))
+					if (!QueueProjectGNUArchive(project, targetPath, workspaceOptions, options, objectsArg, compileKind))
 						return false;
 				}
-				else if (!QueueProjectGNULink(project, targetPath, workspaceOptions, options, objectsArg))
+				else if (!QueueProjectGNULink(project, targetPath, workspaceOptions, options, objectsArg, compileKind))
 					return false;
 			}
 			else // MS
@@ -1673,12 +1983,12 @@ namespace IDE
 				{
 					if (options.mBuildOptions.mBuildKind == .StaticLib)
 					{
-						if (!QueueProjectGNUArchive(project, targetPath, workspaceOptions, options, objectsArg))
+						if (!QueueProjectGNUArchive(project, targetPath, workspaceOptions, options, objectsArg, compileKind))
 							return false;
 					}
 					else
 					{
-						if (!QueueProjectMSLink(project, targetPath, configSelection.mConfig, workspaceOptions, options, objectsArg))
+						if (!QueueProjectMSLink(project, targetPath, configSelection.mConfig, workspaceOptions, options, objectsArg, compileKind))
 							return false;
 					}
 				}
@@ -1701,12 +2011,15 @@ namespace IDE
 			if (targetPath == null)
 				return false;
 
-			switch (QueueProjectCustomBuildCommands(project, targetPath, compileKind.WantsRunAfter ? options.mBuildOptions.mBuildCommandsOnRun : options.mBuildOptions.mBuildCommandsOnCompile, options.mBuildOptions.mPostBuildCmds))
+			if (WantsProjectBuild(project, compileKind))
 			{
-			case .NoCommands:
-			case .HadCommands:
-			case .Failed:
-				completedCompileCmd.mFailed = true;
+				switch (QueueProjectCustomBuildCommands(project, targetPath, compileKind.WantsRunAfter ? options.mBuildOptions.mBuildCommandsOnRun : options.mBuildOptions.mBuildCommandsOnCompile, options.mBuildOptions.mPostBuildCmds, true))
+				{
+				case .NoCommands:
+				case .HadCommands:
+				case .Failed:
+					completedCompileCmd.mFailed = true;
+				}
 			}
 
 			return true;

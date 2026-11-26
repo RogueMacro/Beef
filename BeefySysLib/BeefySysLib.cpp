@@ -15,9 +15,9 @@
 
 #include "util/AllocDebug.h"
 
-#ifdef BF_PLATFORM_WINDOWS
-#include "platform/sdl/SdlBFApp.h"
-#endif
+//#ifdef BF_PLATFORM_WINDOWS
+//#include "platform/sdl/SdlBFApp.h"
+//#endif
 
 //#include "third_party/freetype/include/ft2build.h"
 //#include FT_FREETYPE_H
@@ -92,23 +92,23 @@ BF_EXPORT void BF_CALLTYPE BFApp_GetWorkspaceRectFrom(int fromX, int fromY, int 
 
 static bool gForceSDL = false;
 
-BF_EXPORT void BF_CALLTYPE BFApp_SetOptionString(const char* name, const char* value)
-{
-	if (strcmp(name, "SDL") == 0)
-	{
-		gForceSDL = strcmp(value, "1") == 0;
-	}
-}
+//BF_EXPORT void BF_CALLTYPE BFApp_SetOptionString(const char* name, const char* value)
+//{
+//	if (strcmp(name, "SDL") == 0)
+//	{
+//		gForceSDL = strcmp(value, "1") == 0;
+//	}
+//}
 
 BF_EXPORT void BF_CALLTYPE BFApp_Create()
 {
-#ifdef BF_PLATFORM_WINDOWS
-	if (gForceSDL)
-	{
-		new SdlBFApp();
-		return;
-	}
-#endif
+//#ifdef BF_PLATFORM_WINDOWS
+//	if (gForceSDL)
+//	{
+//		new SdlBFApp();
+//		return;
+//	}
+//#endif
 
 	new PlatformBFApp();
 }
@@ -219,9 +219,55 @@ BF_EXPORT void BF_CALLTYPE BFApp_SetDrawEnabled(int enabled)
 	gBFApp->mDrawEnabled = enabled != 0;
 }
 
+BF_EXPORT void BF_CALLTYPE BFApp_SetUnthrottledRendering(int enabled)
+{
+	gBFApp->mUnthrottledRendering = enabled != 0;
+}
+
+// Catch-up updates ramp up again as they do at startup, so the long frames after a load don't burst into a run of them.
+BF_EXPORT void BF_CALLTYPE BFApp_ResetSlowStart()
+{
+	gBFApp->mSlowStartItr = 0;
+}
+
+BF_EXPORT void BF_CALLTYPE BFApp_NotifyOffscreenRender(BFWindow* window, int allowInstall)
+{
+	if ((window != NULL) && (gBFApp->mRenderDevice != NULL))
+		gBFApp->mRenderDevice->NotifyOffscreenRender(window->mRenderWindow, allowInstall != 0);
+}
+
 BF_EXPORT void BF_CALLTYPE BFApp_SetRefreshRate(int rate)
 {
 	gBFApp->mRefreshRate = (float) rate;
+}
+
+BF_EXPORT void BF_CALLTYPE BFApp_SetExternalPacing(const char* eventName)
+{
+	gBFApp->SetExternalPacing(eventName);
+}
+
+// NULL clears. The pacer's owner clears it before deleting it.
+BF_EXPORT void BF_CALLTYPE BFApp_SetFramePacer(FramePacer* pacer, float refreshRate)
+{
+	gBFApp->mFramePacer = pacer;
+	gBFApp->mFramePacerRefreshRate = refreshRate;
+}
+
+// Pacer waits since the previous call (then resets): how many, how many were signaled rather than
+// timing out, and the time spent waiting.
+BF_EXPORT void BF_CALLTYPE BFApp_TakeFramePacerStats(int* waits, int* signaled, int64* waitMicros)
+{
+	*waits = gBFApp->mFramePacerWaits;
+	*signaled = gBFApp->mFramePacerSignaled;
+	*waitMicros = gBFApp->mFramePacerWaitMicros;
+	gBFApp->mFramePacerWaits = 0;
+	gBFApp->mFramePacerSignaled = 0;
+	gBFApp->mFramePacerWaitMicros = 0;
+}
+
+BF_EXPORT void BF_CALLTYPE BFApp_SetVirtualFocus(bool virtualFocus)
+{
+	gBFApp->mVirtualFocus = virtualFocus;
 }
 
 BF_EXPORT const char* BF_CALLTYPE BFApp_GetInstallDir()
@@ -242,7 +288,12 @@ BF_EXPORT void BF_CALLTYPE BFApp_SetCallbacks(BFApp_UpdateFunc updateFunc, BFApp
 	//public delegate void UpdateProc();
 }
 
-BF_EXPORT BFWindow* BF_CALLTYPE BFApp_CreateWindow(BFWindow* parent, const char* title, int x, int y, int width, int height, int windowFlags)
+BF_EXPORT void BF_CALLTYPE BFApp_SetIdleUpdateFunc(BFApp_IdleUpdateFunc idleUpdateFunc)
+{
+	gBFApp->mIdleUpdateFunc = idleUpdateFunc;
+}
+
+BF_EXPORT BFWindow* BF_CALLTYPE BFApp_CreateWindow(BFWindow* parent, const char* title, int x, int y, int width, int height, int64 windowFlags)
 {
 	return gBFApp->CreateNewWindow(parent, title, x, y, width, height, windowFlags);
 }
@@ -313,7 +364,8 @@ BF_EXPORT void BF_CALLTYPE BFWindow_SetCallbacks(BFWindow* window, BFWindow_Move
 	BFWindow_KeyCharFunc keyCharFunc, BFWindow_KeyDownFunc keyDownFunc, BFWindow_KeyUpFunc keyUpFunc, BFWindow_HitTestFunc hitTestFunc,
 	BFWindow_MouseMove mouseMoveFunc, BFWindow_MouseProxyMove mouseProxyMoveFunc,
 	BFWindow_MouseDown mouseDownFunc, BFWindow_MouseUp mouseUpFunc, BFWindow_MouseWheel mouseWheelFunc, BFWindow_MouseLeave mouseLeaveFunc,
-	BFWindow_MenuItemSelectedFunc menuItemSelectedFunc, BFWindow_DragDropFileFunc dragDropFileFunc)
+	BFWindow_MenuItemSelectedFunc menuItemSelectedFunc, BFWindow_DragDropFileFunc dragDropFileFunc, BFWindow_MouseDelta mouseDeltaFunc,
+	BFWindow_RelativeMouseModeAbortedFunc relativeMouseModeAbortedFunc)
 {
 	window->mMovedFunc = movedFunc;
 	window->mCloseQueryFunc = closeQueryFunc;
@@ -332,6 +384,8 @@ BF_EXPORT void BF_CALLTYPE BFWindow_SetCallbacks(BFWindow* window, BFWindow_Move
 	window->mMouseLeaveFunc = mouseLeaveFunc;
 	window->mMenuItemSelectedFunc = menuItemSelectedFunc;
 	window->mDragDropFileFunc = dragDropFileFunc;
+	window->mMouseDeltaFunc = mouseDeltaFunc;
+	window->mRelativeMouseModeAbortedFunc = relativeMouseModeAbortedFunc;
 }
 
 BF_EXPORT void* BFWindow_GetNativeUnderlying(BFWindow* window)
@@ -409,6 +463,31 @@ BF_EXPORT void BF_CALLTYPE BFWindow_SetMouseVisible(BFWindow* window, bool mouse
 	window->SetMouseVisible(mouseVisible);
 }
 
+BF_EXPORT void BF_CALLTYPE BFWindow_StartRelativeMouseMode(BFWindow* window)
+{
+	window->StartRelativeMouseMode();
+}
+
+BF_EXPORT void BF_CALLTYPE BFWindow_EndRelativeMouseMode(BFWindow* window)
+{
+	window->EndRelativeMouseMode();
+}
+
+BF_EXPORT bool BF_CALLTYPE BFWindow_IsInRelativeMouseMode(BFWindow* window)
+{
+	return window->IsInRelativeMouseMode();
+}
+
+BF_EXPORT void BF_CALLTYPE BFWindow_SetBorderlessFullscreen(BFWindow* window, bool fullscreen)
+{
+	window->SetBorderlessFullscreen(fullscreen);
+}
+
+BF_EXPORT bool BF_CALLTYPE BFWindow_IsBorderlessFullscreen(BFWindow* window)
+{
+	return window->IsBorderlessFullscreen();
+}
+
 BF_EXPORT void BF_CALLTYPE BFWindow_SetClientPosition(BFWindow* window, int x, int y)
 {
 	window->SetClientPosition(x, y);
@@ -443,16 +522,270 @@ BF_EXPORT int BF_CALLTYPE BFWindow_GetDPI(BFWindow* window)
 	return window->GetDPI();
 }
 
+BF_EXPORT float BF_CALLTYPE BFWindow_GetMonitorRefreshRate(BFWindow* window)
+{
+	return window->GetMonitorRefreshRate();
+}
+
+BF_EXPORT bool BF_CALLTYPE BFWindow_CaptureClientBits(BFWindow* window, uint32* outBits, int width, int height)
+{
+	return window->CaptureClientBits(outBits, width, height);
+}
+
 ///
 
-BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateRenderTarget(int width, int height, int destAlpha)
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateRenderTarget(int width, int height, int flags, int sampleCount)
 {
-	Texture* texture = gBFApp->mRenderDevice->CreateRenderTarget(width, height, destAlpha != 0);	
+	Texture* texture = gBFApp->mRenderDevice->CreateRenderTarget(width, height, flags, sampleCount);
 	texture->mResetClear = true;
 
 	TextureSegment* aTextureSegment = new TextureSegment();
-	aTextureSegment->InitFromTexture(texture);	
+	aTextureSegment->InitFromTexture(texture);
 	return aTextureSegment;
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateDepthImageRef(TextureSegment* textureSegment)
+{
+	Texture* texture = textureSegment->mTexture->CreateDepthRef();
+	if (texture == NULL)
+		return NULL;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateRawImageRef(TextureSegment* textureSegment)
+{
+	Texture* texture = textureSegment->mTexture->CreateRawRef();
+	if (texture == NULL)
+		return NULL;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateDepthTarget(int width, int height, int is16Bit)
+{
+	Texture* texture = gBFApp->mRenderDevice->CreateDepthTarget(width, height, is16Bit != 0);
+	if (texture == NULL)
+		return NULL;
+	texture->mResetClear = true;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateStructuredBuffer(int stride, int count, int flags)
+{
+	Texture* texture = gBFApp->mRenderDevice->CreateStructuredBuffer(stride, count, flags);
+	if (texture == NULL)
+		return NULL;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+// Queued on the current draw layer, so it lands between the draws issued before and after it.
+BF_EXPORT void BF_CALLTYPE Gfx_Buffer_SetData(TextureSegment* textureSegment, void* data, int size)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->SetBufferData(textureSegment->mTexture, data, size);
+}
+
+// Immediate: reads whatever the GPU has finished, so flush the draw layer that wrote it first.
+BF_EXPORT bool BF_CALLTYPE Gfx_Buffer_GetData(TextureSegment* textureSegment, void* outData, int size)
+{
+	return textureSegment->mTexture->GetBufferData(outData, size);
+}
+
+BF_EXPORT bool BF_CALLTYPE Gfx_Buffer_BeginReadback(TextureSegment* textureSegment)
+{
+	return textureSegment->mTexture->BeginBufferReadback();
+}
+
+BF_EXPORT int BF_CALLTYPE Gfx_Buffer_PollReadback(TextureSegment* textureSegment, void* outData, int size)
+{
+	return textureSegment->mTexture->PollBufferReadback(outData, size);
+}
+
+// Immediate (not queued): writes [offset, offset+size) of a CPU-updatable buffer now, ahead of every
+// draw still waiting in any draw layer -- how a pass publishes data those queued draws will read.
+BF_EXPORT void BF_CALLTYPE Gfx_Buffer_FlushUpdates(TextureSegment* textureSegment)
+{
+	textureSegment->mTexture->FlushBufferUpdates();
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Buffer_UpdateRange(TextureSegment* textureSegment, int offset, void* data, int size)
+{
+	textureSegment->mTexture->UpdateBufferRange(offset, data, size);
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateTexture3D(int width, int height, int depth, int flags)
+{
+	Texture* texture = gBFApp->mRenderDevice->CreateTexture3D(width, height, depth, flags);
+	if (texture == NULL)
+		return NULL;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture3D_SetData(TextureSegment* textureSegment, int mipLevel, void* data, int rowPitch, int slicePitch)
+{
+	textureSegment->mTexture->SetData3D(mipLevel, data, rowPitch, slicePitch);
+}
+
+BF_EXPORT bool BF_CALLTYPE Gfx_Texture3D_GetData(TextureSegment* textureSegment, int mipLevel, void* outData, int outSize)
+{
+	return textureSegment->mTexture->GetData3D(mipLevel, outData, outSize);
+}
+
+BF_EXPORT ComputeShader* BF_CALLTYPE Gfx_LoadComputeShader(const char* fileName, const char* entry)
+{
+	return gBFApp->mRenderDevice->LoadComputeShader(fileName, entry);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_ComputeShader_Delete(ComputeShader* shader)
+{
+	if ((gBFApp != NULL) && (gBFApp->mRenderDevice != NULL))
+		gBFApp->mRenderDevice->ReleaseComputeShader(shader);
+	else
+		delete shader;
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_SetComputeTexture(int slot, TextureSegment* textureSegment)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->SetComputeTexture(slot, (textureSegment != NULL) ? textureSegment->mTexture : NULL);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_SetComputeUAV(int slot, TextureSegment* textureSegment, int mipLevel)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->SetComputeUAV(slot, (textureSegment != NULL) ? textureSegment->mTexture : NULL, mipLevel);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_SetPixelUAV(int slot, TextureSegment* textureSegment)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->SetPixelUAV(slot, (textureSegment != NULL) ? textureSegment->mTexture : NULL);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Buffer_Clear(TextureSegment* textureSegment, uint32 value)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->ClearBufferUint(textureSegment->mTexture, value);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Dispatch(ComputeShader* shader, int groupsX, int groupsY, int groupsZ)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->Dispatch(shader, groupsX, groupsY, groupsZ);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_ResolveTo(TextureSegment* srcSegment, TextureSegment* destSegment)
+{
+	// Timed like a layer flush: it's real GPU work outside any draw layer.
+	int gpuSpan = gBFApp->mRenderDevice->GpuTimerSpanBegin();
+	srcSegment->mTexture->ResolveTo(destSegment->mTexture);
+	if (gpuSpan >= 0)
+		gBFApp->mRenderDevice->GpuTimerSpanEnd(gpuSpan);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_GpuTimer_SetEnabled(int enabled)
+{
+	gBFApp->mRenderDevice->GpuTimerSetEnabled(enabled != 0);
+}
+
+BF_EXPORT int BF_CALLTYPE Gfx_SubmissionStats_SetCategory(int category)
+{
+	auto device = gBFApp->mRenderDevice;
+	int previous = device->mStatsCategory;
+	if (previous != category)
+	{
+		if (device->mCurDrawLayer != NULL)
+			device->mCurDrawLayer->CloseDrawBatch();
+		device->mStatsCategory = category;
+	}
+	return previous;
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_SubmissionStats_Get(int category, int64* triangles, int64* draws, int64* instances)
+{
+	if ((category < 1) || (category > 3))
+		return;
+	auto& counts = gBFApp->mRenderDevice->mSubmissionStats[category - 1];
+	*triangles = counts[0];
+	*draws = counts[1];
+	*instances = counts[2];
+}
+
+BF_EXPORT int BF_CALLTYPE Gfx_GpuTimer_BeginFrame(int64 frameId)
+{
+	return gBFApp->mRenderDevice->GpuTimerBeginFrame(frameId) ? 1 : 0;
+}
+
+// Spans opened from here on are attributed to this tag (see Brisk's FramePerf sections).
+BF_EXPORT void BF_CALLTYPE Gfx_GpuTimer_SetTag(int tag)
+{
+	gBFApp->mRenderDevice->GpuTimerSetTag(tag);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_GpuTimer_EndFrame()
+{
+	gBFApp->mRenderDevice->GpuTimerEndFrame();
+}
+
+BF_EXPORT int BF_CALLTYPE Gfx_GpuTimer_Fetch(int64* outFrameId, GpuTimerSpan* outSpans, int maxSpans)
+{
+	return gBFApp->mRenderDevice->GpuTimerFetch(outFrameId, outSpans, maxSpans);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_GenerateMips(TextureSegment* textureSegment)
+{
+	textureSegment->mTexture->GenerateMips();
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_SetSecondaryTarget(TextureSegment* textureSegment, TextureSegment* secondarySegment)
+{
+	textureSegment->mTexture->mSecondaryTarget = (secondarySegment != NULL) ? secondarySegment->mTexture : NULL;
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_CopyToMip(TextureSegment* destSegment, int mipLevel, TextureSegment* srcSegment, int width, int height)
+{
+	destSegment->mTexture->CopyToMip(mipLevel, srcSegment->mTexture, width, height);
+}
+
+// Sample count for window swapchains -- must be called before window creation.
+BF_EXPORT void BF_CALLTYPE Gfx_SetWindowMsaaSamples(int sampleCount)
+{
+	gBFApp->mRenderDevice->mWindowMsaaSampleCount = sampleCount;
+}
+
+BF_EXPORT void* BF_CALLTYPE Gfx_RenderTarget_GetSharedHandle(TextureSegment* textureSegment)
+{
+	return textureSegment->mTexture->GetSharedHandle();	
+}
+
+BF_EXPORT bool BF_CALLTYPE Gfx_RenderTarget_KeyedMutex_Acquire(TextureSegment* textureSegment, uint64 key, uint32 timeoutMs)
+{
+	return textureSegment->mTexture->AcquireKeyedMutex(key, timeoutMs);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_RenderTarget_KeyedMutex_Release(TextureSegment* textureSegment, uint64 key)
+{
+	textureSegment->mTexture->ReleaseKeyedMutex(key);	
+}
+
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_OpenSharedRenderTarget(void* handle, int width, int height)
+{
+	Texture* texture = gBFApp->mRenderDevice->OpenSharedRenderTarget(handle, width, height);
+	if (texture == NULL)
+		return NULL;
+	texture->mResetClear = true;
+
+	TextureSegment* seg = new TextureSegment();
+	seg->InitFromTexture(texture);
+	return seg;
 }
 
 BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateDynTexture(int width, int height)
@@ -475,6 +808,61 @@ BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_LoadTexture(const char* fileName, int 
 	return aTextureSegment;
 }
 
+// Safe off the main thread; the texture isn't drawable until Gfx_RegisterTexture. NULL when the file can't load this
+// way (or at all).
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_LoadTextureDetached(const char* fileName, int flags)
+{
+	Texture* texture = gBFApp->mRenderDevice->LoadTextureDetached(fileName, flags);
+	if (texture == NULL)
+		return NULL;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+// Safe off the main thread, like Gfx_LoadTextureDetached. bits is width * height RGBA, copied.
+BF_EXPORT TextureSegment* BF_CALLTYPE Gfx_CreateTextureDetached(int width, int height, uint32* bits, int flags)
+{
+	ImageData* imageData = new ImageData();
+	imageData->CreateNew(width, height, false);
+	memcpy(imageData->mBits, bits, width * height * sizeof(uint32));
+	Texture* texture = gBFApp->mRenderDevice->CreateTextureDetached(imageData, flags);
+	imageData->Deref();
+	if (texture == NULL)
+		return NULL;
+
+	TextureSegment* aTextureSegment = new TextureSegment();
+	aTextureSegment->InitFromTexture(texture);
+	return aTextureSegment;
+}
+
+// Safe off the main thread: the file's pixels as width * height RGBA, with no texture made. Free with
+// Gfx_FreeImageBits. NULL when it can't be decoded.
+BF_EXPORT uint32* BF_CALLTYPE Gfx_DecodeImageBits(const char* fileName, int flags, int* outWidth, int* outHeight)
+{
+	ImageData* imageData = gBFApp->mRenderDevice->DecodeImage(fileName, flags);
+	if (imageData == NULL)
+		return NULL;
+	int count = imageData->mWidth * imageData->mHeight;
+	uint32* bits = new uint32[count];
+	memcpy(bits, imageData->mBits, count * sizeof(uint32));
+	*outWidth = imageData->mWidth;
+	*outHeight = imageData->mHeight;
+	imageData->Deref();
+	return bits;
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_FreeImageBits(uint32* bits)
+{
+	delete [] bits;
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_RegisterTexture(TextureSegment* textureSegment)
+{
+	gBFApp->mRenderDevice->RegisterTexture(textureSegment->mTexture);
+}
+
 BF_EXPORT void BF_CALLTYPE Gfx_Texture_SetBits(TextureSegment* textureSegment, int destX, int destY, int destWidth, int destHeight, int srcPitch, uint32* bits)
 {
 	textureSegment->SetBits(destX, destY, destWidth, destHeight, srcPitch, bits);
@@ -483,6 +871,16 @@ BF_EXPORT void BF_CALLTYPE Gfx_Texture_SetBits(TextureSegment* textureSegment, i
 BF_EXPORT void BF_CALLTYPE Gfx_Texture_GetBits(TextureSegment* textureSegment, int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits)
 {
 	textureSegment->GetBits(srcX, srcY, srcWidth, srcHeight, destPitch, bits);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_GetDepthBits(TextureSegment* textureSegment, int srcX, int srcY, int srcWidth, int srcHeight, int destPitch, uint32* bits)
+{
+	textureSegment->GetDepthBits(srcX, srcY, srcWidth, srcHeight, destPitch, bits);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_Texture_Clear(TextureSegment* textureSegment)
+{
+	textureSegment->mTexture->mWantsClear = true;	
 }
 
 BF_EXPORT void BF_CALLTYPE Gfx_Texture_Delete(TextureSegment* textureSegment)
@@ -734,53 +1132,174 @@ BF_EXPORT void BF_CALLTYPE Gfx_DrawQuads(TextureSegment* textureSegment, Default
 	}
 }
 
+// The largest vtxCount/idxCount a single AllocIndexed call can ever satisfy -- DrawLayer's pooled
+// vertex/index buffers are fixed-size (DRAWBUFFER_VTXBUFFER_SIZE/DRAWBUFFER_IDXBUFFER_SIZE), and
+// AllocateBatch asserts if a single request exceeds what a fresh buffer could hold.
+// Rounded down to a multiple of 6: the oversized path below chunks on exactly this many indices, so
+// a boundary that isn't a multiple of the primitive's index count (2 for lines, 3 for triangles,
+// 6 for quads) splits a primitive and every later chunk draws garbage.
+static int DrawIndexedVerticesMaxPerBatch(int vertexSize)
+{
+	int maxPerBatch = BF_MIN(DRAWBUFFER_VTXBUFFER_SIZE / vertexSize, DRAWBUFFER_IDXBUFFER_SIZE / (int)sizeof(uint16));
+	return maxPerBatch - (maxPerBatch % 6);
+}
+
 BF_EXPORT void BF_CALLTYPE Gfx_DrawIndexedVertices(int vertexSize, void* vtxData, int vtxCount, uint16* idxData, int idxCount)
 {
 	DrawLayer* drawLayer = gBFApp->mRenderDevice->mCurDrawLayer;
+	int maxPerBatch = DrawIndexedVerticesMaxPerBatch(vertexSize);
 
-	uint16 idxOfs;
-	void* drawBatchVtxPtr;
-	uint16* drawBatchIdxPtr;
-	gBFApp->mRenderDevice->mCurDrawLayer->AllocIndexed(vtxCount, idxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
-	BF_ASSERT(gBFApp->mRenderDevice->mCurDrawLayer->mCurDrawBatch->mVtxSize == vertexSize);
+	if ((vtxCount <= maxPerBatch) && (idxCount <= maxPerBatch))
+	{
+		uint16 idxOfs;
+		void* drawBatchVtxPtr;
+		uint16* drawBatchIdxPtr;
+		drawLayer->AllocIndexed(vtxCount, idxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
+		BF_ASSERT(drawLayer->mCurDrawBatch->mVtxSize == vertexSize);
 
-	uint16* idxPtr = idxData;
-	for (int idxIdx = 0; idxIdx < idxCount; idxIdx++)
-		*(drawBatchIdxPtr++) = *(idxPtr++) + idxOfs;
+		uint16* idxPtr = idxData;
+		for (int idxIdx = 0; idxIdx < idxCount; idxIdx++)
+			*(drawBatchIdxPtr++) = *(idxPtr++) + idxOfs;
 
-	memcpy(drawBatchVtxPtr, vtxData, vertexSize * vtxCount);
+		memcpy(drawBatchVtxPtr, vtxData, vertexSize * vtxCount);
+		return;
+	}
+
+	// Too big for one native draw batch -- split into idxCount-bounded chunks, each a fully
+	// self-contained AllocIndexed call. A vertex referenced across a chunk boundary gets duplicated
+	// once per chunk rather than reused, since indices can reference vertices in any order.
+	int idxStart = 0;
+	while (idxStart < idxCount)
+	{
+		int chunkIdxCount = BF_MIN(maxPerBatch, idxCount - idxStart);
+
+		uint16 idxOfs;
+		void* drawBatchVtxPtr;
+		uint16* drawBatchIdxPtr;
+		drawLayer->AllocIndexed(chunkIdxCount, chunkIdxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
+		BF_ASSERT(drawLayer->mCurDrawBatch->mVtxSize == vertexSize);
+
+		for (int i = 0; i < chunkIdxCount; i++)
+		{
+			uint16 srcIdx = idxData[idxStart + i];
+			memcpy((uint8*)drawBatchVtxPtr + i * vertexSize, (uint8*)vtxData + srcIdx * vertexSize, vertexSize);
+			drawBatchIdxPtr[i] = (uint16)(idxOfs + i);
+		}
+
+		idxStart += chunkIdxCount;
+	}
+}
+
+// Gfx_DrawIndexedVertices plus a per-vertex stamp: the float at byte offset instOfs of every copied
+// vertex is set to instValue (the source vertices are left alone, so a cached mesh can be shared).
+BF_EXPORT void BF_CALLTYPE Gfx_DrawIndexedVerticesInst(int vertexSize, void* vtxData, int vtxCount, uint16* idxData, int idxCount, float instValue, int instOfs)
+{
+	DrawLayer* drawLayer = gBFApp->mRenderDevice->mCurDrawLayer;
+	int maxPerBatch = DrawIndexedVerticesMaxPerBatch(vertexSize);
+
+	if ((vtxCount <= maxPerBatch) && (idxCount <= maxPerBatch))
+	{
+		uint16 idxOfs;
+		void* drawBatchVtxPtr;
+		uint16* drawBatchIdxPtr;
+		drawLayer->AllocIndexed(vtxCount, idxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
+		BF_ASSERT(drawLayer->mCurDrawBatch->mVtxSize == vertexSize);
+
+		uint16* idxPtr = idxData;
+		for (int idxIdx = 0; idxIdx < idxCount; idxIdx++)
+			*(drawBatchIdxPtr++) = *(idxPtr++) + idxOfs;
+
+		memcpy(drawBatchVtxPtr, vtxData, vertexSize * vtxCount);
+		uint8* stampPtr = (uint8*)drawBatchVtxPtr + instOfs;
+		for (int vtxIdx = 0; vtxIdx < vtxCount; vtxIdx++, stampPtr += vertexSize)
+			*(float*)stampPtr = instValue;
+		return;
+	}
+
+	int idxStart = 0;
+	while (idxStart < idxCount)
+	{
+		int chunkIdxCount = BF_MIN(maxPerBatch, idxCount - idxStart);
+
+		uint16 idxOfs;
+		void* drawBatchVtxPtr;
+		uint16* drawBatchIdxPtr;
+		drawLayer->AllocIndexed(chunkIdxCount, chunkIdxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
+		BF_ASSERT(drawLayer->mCurDrawBatch->mVtxSize == vertexSize);
+
+		for (int i = 0; i < chunkIdxCount; i++)
+		{
+			uint16 srcIdx = idxData[idxStart + i];
+			uint8* destVtx = (uint8*)drawBatchVtxPtr + i * vertexSize;
+			memcpy(destVtx, (uint8*)vtxData + srcIdx * vertexSize, vertexSize);
+			*(float*)(destVtx + instOfs) = instValue;
+			drawBatchIdxPtr[i] = (uint16)(idxOfs + i);
+		}
+
+		idxStart += chunkIdxCount;
+	}
 }
 
 BF_EXPORT void BF_CALLTYPE Gfx_DrawIndexedVertices2D(int vertexSize, void* vtxData, int vtxCount, uint16* idxData, int idxCount, float a, float b, float c, float d, float tx, float ty, float z)
 {
 	DrawLayer* drawLayer = gBFApp->mRenderDevice->mCurDrawLayer;
+	int maxPerBatch = DrawIndexedVerticesMaxPerBatch(vertexSize);
 
-	uint16 idxOfs;
-	void* drawBatchVtxPtr;
-	uint16* drawBatchIdxPtr;
-	gBFApp->mRenderDevice->mCurDrawLayer->AllocIndexed(vtxCount, idxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
-	BF_ASSERT(gBFApp->mRenderDevice->mCurDrawLayer->mCurDrawBatch->mVtxSize == vertexSize);
-
-	uint16* idxPtr = idxData;
-	for (int idxIdx = 0; idxIdx < idxCount; idxIdx++)
-		*(drawBatchIdxPtr++) = *(idxPtr++) + idxOfs;
-
-	//memcpy(drawBatchIdxPtr, idxData, sizeof(uint16) * idxCount);
-	//memcpy(drawBatchVtxPtr, vtxData, vertexSize * vtxCount);
-
-	void* vtxPtr = vtxData;
-	for (int vtxIdx = 0; vtxIdx < vtxCount; vtxIdx++)
+	auto TransformVertex = [&](void* srcVtx, void* destVtx)
 	{
-		Vector3* srcPos = (Vector3*)vtxPtr;
-		Vector3* destPos = (Vector3*)drawBatchVtxPtr;
+		Vector3* srcPos = (Vector3*)srcVtx;
+		Vector3* destPos = (Vector3*)destVtx;
 
 		destPos->mX = srcPos->mX * a + srcPos->mY * c + tx;
 		destPos->mY = srcPos->mX * b + srcPos->mY * d + ty;
 		destPos->mZ = srcPos->mZ + z;
 
-		memcpy((uint8*)drawBatchVtxPtr + sizeof(Vector3), (uint8*)vtxPtr + sizeof(Vector3), vertexSize - sizeof(Vector3));
-		drawBatchVtxPtr = (uint8*)drawBatchVtxPtr + vertexSize;
-		vtxPtr = (uint8*)vtxPtr + vertexSize;
+		memcpy((uint8*)destVtx + sizeof(Vector3), (uint8*)srcVtx + sizeof(Vector3), vertexSize - sizeof(Vector3));
+	};
+
+	if ((vtxCount <= maxPerBatch) && (idxCount <= maxPerBatch))
+	{
+		uint16 idxOfs;
+		void* drawBatchVtxPtr;
+		uint16* drawBatchIdxPtr;
+		drawLayer->AllocIndexed(vtxCount, idxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
+		BF_ASSERT(drawLayer->mCurDrawBatch->mVtxSize == vertexSize);
+
+		uint16* idxPtr = idxData;
+		for (int idxIdx = 0; idxIdx < idxCount; idxIdx++)
+			*(drawBatchIdxPtr++) = *(idxPtr++) + idxOfs;
+
+		void* vtxPtr = vtxData;
+		for (int vtxIdx = 0; vtxIdx < vtxCount; vtxIdx++)
+		{
+			TransformVertex(vtxPtr, drawBatchVtxPtr);
+			drawBatchVtxPtr = (uint8*)drawBatchVtxPtr + vertexSize;
+			vtxPtr = (uint8*)vtxPtr + vertexSize;
+		}
+		return;
+	}
+
+	// See Gfx_DrawIndexedVertices -- same idxCount-bounded chunking, applying the same per-vertex
+	// transform to whichever source vertex each chunk copies.
+	int idxStart = 0;
+	while (idxStart < idxCount)
+	{
+		int chunkIdxCount = BF_MIN(maxPerBatch, idxCount - idxStart);
+
+		uint16 idxOfs;
+		void* drawBatchVtxPtr;
+		uint16* drawBatchIdxPtr;
+		drawLayer->AllocIndexed(chunkIdxCount, chunkIdxCount, (void**)&drawBatchVtxPtr, &drawBatchIdxPtr, &idxOfs);
+		BF_ASSERT(drawLayer->mCurDrawBatch->mVtxSize == vertexSize);
+
+		for (int i = 0; i < chunkIdxCount; i++)
+		{
+			uint16 srcIdx = idxData[idxStart + i];
+			TransformVertex((uint8*)vtxData + srcIdx * vertexSize, (uint8*)drawBatchVtxPtr + i * vertexSize);
+			drawBatchIdxPtr[i] = (uint16)(idxOfs + i);
+		}
+
+		idxStart += chunkIdxCount;
 	}
 }
 
@@ -799,6 +1318,11 @@ BF_EXPORT void BF_CALLTYPE Gfx_QueueRenderCmd(RenderCmd* renderCmd)
 	gBFApp->mRenderDevice->mCurDrawLayer->QueueRenderCmd(renderCmd);
 }
 
+BF_EXPORT void BF_CALLTYPE Gfx_QueueRenderable(Renderable* renderable)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->QueueRenderable(renderable);
+}
+
 BF_EXPORT VertexDefinition* BF_CALLTYPE Gfx_CreateVertexDefinition(VertexDefData* elementData, int numElements)
 {
 	return gBFApp->mRenderDevice->CreateVertexDefinition(elementData, numElements);
@@ -809,6 +1333,55 @@ BF_EXPORT void BF_CALLTYPE Gfx_VertexDefinition_Delete(VertexDefinition* vertexD
 	delete vertexDefinition;
 }
 
+// Must be set before shaders are created on this definition (the instanced input layout is built with them).
+BF_EXPORT void BF_CALLTYPE Gfx_VertexDefinition_SetInstanceElement(VertexDefinition* vertexDefinition, int elementIdx)
+{
+	vertexDefinition->mInstanceElementIdx = elementIdx;
+}
+
+BF_EXPORT StaticMesh* BF_CALLTYPE Gfx_CreateStaticMesh(int vertexSize, void* vtxData, int vtxCount, void* idxData, int idxCount, int idx32)
+{
+	return gBFApp->mRenderDevice->CreateStaticMesh(vertexSize, vtxData, vtxCount, idxData, idxCount, idx32 != 0);
+}
+
+// Immediate: the caller must know that no queued draw still references the mesh.
+// The compact position+bones stream for depth-only passes, over the mesh's existing index buffer.
+BF_EXPORT void BF_CALLTYPE Gfx_StaticMesh_SetDepthStream(StaticMesh* mesh, void* data, int vtxCount)
+{
+	gBFApp->mRenderDevice->SetStaticMeshDepthStream(mesh, data, vtxCount);
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_StaticMesh_Delete(StaticMesh* mesh)
+{
+	delete mesh;
+}
+
+BF_EXPORT int64 BF_CALLTYPE Gfx_StaticMesh_GetBytes(StaticMesh* mesh)
+{
+	return gBFApp->mRenderDevice->GetStaticMeshBytes(mesh);
+}
+
+// The device's memory report: one line per live texture (see RenderDevice::GetTextureStats).
+BF_EXPORT const char* BF_CALLTYPE Gfx_GetTextureStats()
+{
+	String& outString = *gBeefySys_TLStrReturn.Get();
+	outString.Clear();
+	gBFApp->mRenderDevice->GetTextureStats(outString);
+	return outString.c_str();
+}
+
+// Frees what was retired since the last frame end, as a frame end does. For a caller that ends its
+// own frames (tests) and knows no queued command still references them.
+BF_EXPORT void BF_CALLTYPE Gfx_ProcessRetired()
+{
+	gBFApp->mRenderDevice->ProcessRetired();
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_DrawStaticMeshInstanced(StaticMesh* mesh, int instBase, int instCount)
+{
+	gBFApp->mRenderDevice->mCurDrawLayer->DrawStaticMeshInstanced(mesh, instBase, instCount);
+}
+
 BF_EXPORT void BF_CALLTYPE Gfx_CreateRenderState(RenderState* srcRenderState)
 {
 	gBFApp->mRenderDevice->CreateRenderState(srcRenderState);
@@ -816,12 +1389,15 @@ BF_EXPORT void BF_CALLTYPE Gfx_CreateRenderState(RenderState* srcRenderState)
 
 BF_EXPORT void BF_CALLTYPE RenderState_Delete(RenderState* renderState)
 {
-	delete renderState;
+	if ((gBFApp != NULL) && (gBFApp->mRenderDevice != NULL))
+		gBFApp->mRenderDevice->ReleaseRenderState(renderState);
+	else
+		delete renderState;
 }
 
-BF_EXPORT void BF_CALLTYPE RenderState_SetTexWrap(RenderState* renderState, bool texWrap)
+BF_EXPORT void BF_CALLTYPE RenderState_SetSamplerKind(RenderState* renderState, int32 samplerKind)
 {
-	renderState->SetTexWrap(texWrap);
+	renderState->SetSamplerKind((SamplerKind)samplerKind);
 }
 
 BF_EXPORT void BF_CALLTYPE RenderState_SetWireframe(RenderState* renderState, bool wireframe)
@@ -861,6 +1437,11 @@ BF_EXPORT void BF_CALLTYPE RenderState_SetDepthFunc(RenderState* renderState, in
 	renderState->SetDepthFunc((DepthFunc)depthFunc);
 }
 
+BF_EXPORT void BF_CALLTYPE RenderState_SetStencilMode(RenderState* renderState, int mode)
+{
+	renderState->SetStencilMode((StencilMode)mode);
+}
+
 BF_EXPORT void BF_CALLTYPE RenderState_SetDepthWrite(RenderState* renderState, int depthWrite)
 {
 	renderState->SetWriteDepthBuffer(depthWrite != 0);
@@ -871,9 +1452,62 @@ BF_EXPORT void BF_CALLTYPE RenderState_SetTopology(RenderState* renderState, int
 	renderState->SetTopology((Topology3D)topology);
 }
 
-BF_EXPORT Shader* BF_CALLTYPE Gfx_LoadShader(const char* fileName, VertexDefinition* vertexDefinition)
+BF_EXPORT void BF_CALLTYPE RenderState_SetCullMode(RenderState* renderState, int cullMode)
 {
-	return gBFApp->mRenderDevice->LoadShader(fileName, vertexDefinition);
+	renderState->SetCullMode((CullMode)cullMode);
+}
+
+BF_EXPORT void BF_CALLTYPE RenderState_SetFrontFace(RenderState* renderState, int frontFace)
+{
+	renderState->SetFrontFace((FrontFace)frontFace);
+}
+
+BF_EXPORT void BF_CALLTYPE RenderState_SetDisablePixelShader(RenderState* renderState, bool disable)
+{
+	renderState->SetDisablePixelShader(disable);
+}
+
+BF_EXPORT void BF_CALLTYPE RenderState_SetDisableRenderTarget(RenderState* renderState, bool disable)
+{
+	renderState->SetDisableRenderTarget(disable);
+}
+
+BF_EXPORT void BF_CALLTYPE RenderState_SetDisableBlend(RenderState* renderState, bool disable)
+{
+	renderState->SetDisableBlend(disable);
+}
+
+BF_EXPORT void BF_CALLTYPE RenderState_SetAlphaToCoverage(RenderState* renderState, bool enabled)
+{
+	renderState->SetAlphaToCoverage(enabled);
+}
+
+BF_EXPORT Shader* BF_CALLTYPE Gfx_LoadShader(const char* fileName, VertexDefinition* vertexDefinition, const char* entrySuffix, int32 shaderFlags)
+{
+	return gBFApp->mRenderDevice->LoadShader(fileName, vertexDefinition, entrySuffix, shaderFlags);
+}
+
+// Loads a shader made with ShaderFlags_DeferLoad. Returns how many programs had to compile, -1 on failure (see
+// Gfx_GetShaderError).
+BF_EXPORT int BF_CALLTYPE Gfx_Shader_Load(Shader* shader)
+{
+	int compiled = shader->Load();
+	if ((compiled < 0) && (shader->mCompileError.IsEmpty()))
+		shader->mCompileError = "Shader load failed";
+	return compiled;
+}
+
+// NULL = compiled clean; otherwise the compile error text (valid while the shader lives).
+BF_EXPORT const char* BF_CALLTYPE Gfx_GetShaderError(Shader* shader)
+{
+	if (shader->mCompileError.IsEmpty())
+		return NULL;
+	return shader->mCompileError.c_str();
+}
+
+BF_EXPORT void BF_CALLTYPE Gfx_AddShaderIncludeDir(const char* dir)
+{
+	AddShaderIncludeDir(dir);
 }
 
 BF_EXPORT void BF_CALLTYPE Gfx_SetRenderState(RenderState* renderState)
@@ -884,7 +1518,10 @@ BF_EXPORT void BF_CALLTYPE Gfx_SetRenderState(RenderState* renderState)
 
 BF_EXPORT void BF_CALLTYPE Gfx_Shader_Delete(Shader* shader)
 {
-	delete shader;
+	if ((gBFApp != NULL) && (gBFApp->mRenderDevice != NULL))
+		gBFApp->mRenderDevice->ReleaseShader(shader);
+	else
+		delete shader;
 }
 
 BF_EXPORT ShaderParam* BF_CALLTYPE Gfx_GetShaderParam(Shader* shader, const char* shaderName)

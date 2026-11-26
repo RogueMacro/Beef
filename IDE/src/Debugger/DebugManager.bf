@@ -105,7 +105,7 @@ namespace IDE.Debugger
 		}
 
 		//[Flags]
-		public enum OutputFilterFlags
+		public enum OutputFilterFlags : uint16
 		{
 			None = 0x0,
 			ModuleLoadMessages = 0x1,
@@ -114,7 +114,8 @@ namespace IDE.Debugger
 			ThreadCreateMessages = 0x8,
 			ThreadExitMessages = 0x10,
 			SymbolLoadMessages = 0x20,
-			ProgramOutput = 0x30
+			ProgramOutput = 0x40,
+			FirstChanceExceptions = 0x80,
 		}
 
 		[Reflect]
@@ -143,7 +144,8 @@ namespace IDE.Debugger
 			None,
 			RedirectStdInput = 1,
 			RedirectStdOutput = 2,
-			RedirectStdError = 4
+			RedirectStdError = 4,
+			Minimized = 8
 		}
 
 		public List<Breakpoint> mBreakpointList = new List<Breakpoint>();
@@ -348,6 +350,9 @@ namespace IDE.Debugger
 		static extern char8* Debugger_GetAddressSourceLocation(int addr);
 
 		[CallingConvention(.Stdcall),CLink]
+		static extern int Debugger_GetSymbolAddress(char8* name);
+
+		[CallingConvention(.Stdcall),CLink]
 		static extern char8* Debugger_GetAddressSymbolName(int addr, bool demangle);
 
 		[CallingConvention(.Stdcall),CLink]
@@ -542,16 +547,17 @@ namespace IDE.Debugger
 			Debugger_Run();
 		}
 
-		public void HotLoad(String[] objectFileNames, int hotIdx)
+		public bool HotLoad(String[] objectFileNames, int hotIdx)
 		{
 			String filenamesStr = scope String();
 			filenamesStr.Join("\n", objectFileNames);
-			Debugger_HotLoad(filenamesStr, (int32)hotIdx);
+			bool success = Debugger_HotLoad(filenamesStr, (int32)hotIdx);
 
 			// The hot load will bind breakpoints to any new methods, but the old versions
 			//  need remapped text positions
 			for (var breakpoint in mBreakpointList)
 				breakpoint.CheckBreakpointHotBinding();
+			return success;
 		}
 
 		public void StopDebugging()
@@ -746,6 +752,7 @@ namespace IDE.Debugger
 			var stepFilter = new StepFilter();
 			stepFilter.mFilter = new String(filter);
 			stepFilter.mKind = filterKind;
+			stepFilter.mIsGlobal = isGlobal;
 			mStepFilterList[stepFilter.mFilter] = stepFilter;
 			return stepFilter;
 		}

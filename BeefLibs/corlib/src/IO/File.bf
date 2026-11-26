@@ -18,11 +18,18 @@ namespace System.IO
 		Timeout
 	}
 
+	public enum FileWriteError
+	{
+		Unknown,
+		Timeout
+	}
+
 	public enum FileError
 	{
 		case Unknown;
 		case OpenError(FileOpenError);
 		case ReadError(FileReadError);
+		case WriteError(FileWriteError);
 		case SeekError;
 		case PipeListening;
 	}
@@ -60,7 +67,8 @@ namespace System.IO
 			var result = fs.Open(path, doAppend ? .Append : .Create, .Write);
 			if (result case .Err)
 				return .Err;
-			fs.TryWrite(.((uint8*)data.Ptr, data.Length));
+			if (fs.TryWrite(.((uint8*)data.Ptr, data.Length)) case .Err)
+				return .Err;
 			return .Ok;
 		}
 
@@ -200,12 +208,18 @@ namespace System.IO
 
 		public static Result<DateTime> GetLastWriteTime(StringView fullPath)
 		{
-			return DateTime.FromFileTime((int64)Platform.Hook.BfpFile_GetTime_LastWrite(fullPath.ToScopeCStr!()));
+			var ft = Platform.Hook.BfpFile_GetTime_LastWrite(fullPath.ToScopeCStr!());
+			if (ft == 0)
+				return .Err;
+			return DateTime.FromFileTime((int64)ft);
 		}
 
 		public static Result<DateTime> GetLastWriteTimeUtc(StringView fullPath)
 		{
-			return DateTime.FromFileTimeUtc((int64)Platform.Hook.BfpFile_GetTime_LastWrite(fullPath.ToScopeCStr!()));
+			var ft = Platform.Hook.BfpFile_GetTime_LastWrite(fullPath.ToScopeCStr!());
+			if (ft == 0)
+				return .Err;
+			return DateTime.FromFileTimeUtc((int64)ft);
 		}
 	}
 
@@ -243,4 +257,39 @@ namespace System.IO
 		public int64 GetFileSize() => mFileFindEntry ? mFileFindEntry.GetFileSize() : default;
 		public Platform.BfpFileAttributes GetFileAttributes() => mFileFindEntry ? mFileFindEntry.GetFileAttributes() : default;
 	}
+#if TEST
+	class FileTests
+	{
+		static void GetTempPath(String outPath)
+		{
+			Platform.GetStrHelper(outPath, scope (outPtr, outSize, outResult) =>
+				{
+					Platform.BfpFile_GetTempPath(outPtr, outSize, (Platform.BfpFileResult*)outResult);
+				});
+		}
+
+		[Test]
+		public static void WriteAll_PropagatesResult()
+		{
+			String tempDir = scope .();
+			GetTempPath(tempDir);
+			String path = scope String()..AppendF("{}/bf_test_writeall.tmp", tempDir);
+			defer File.Delete(path);
+
+			uint8[4] data = .(1, 2, 3, 4);
+			let result = File.WriteAll(path, .(&data, 4));
+			Test.Assert(result case .Ok);
+
+			// Verify data was written
+			List<uint8> readData = scope .();
+			if (File.ReadAll(path, readData) case .Ok)
+			{
+				Test.Assert(readData.Count == 4);
+				Test.Assert(readData[0] == 1);
+				Test.Assert(readData[3] == 4);
+			}
+		}
+	}
+#endif
+
 }

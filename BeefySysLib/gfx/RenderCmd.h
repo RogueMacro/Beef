@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Common.h"
+#include "gfx/Renderable.h"
 
 NS_BF_BEGIN;
 
@@ -16,6 +17,7 @@ public:
 	RenderState* mRenderState;
 	bool mIsPoolHead;
 	int mCmdIdx;
+	int mStatsCategory;
 
 public:
 	RenderCmd()
@@ -24,12 +26,45 @@ public:
 		mRenderState = NULL;
 		mIsPoolHead = false;
 		mCmdIdx = -1;
+		mStatsCategory = 0;
 	}
 
 	void SetRenderState();
 	virtual void CommandQueued(DrawLayer* drawLayer) {}
 	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) = 0;
 	virtual void Free();
+};
+
+// From here on, the executing layer's GPU time counts toward this tag (see RenderDevice::GpuTimerSetTag).
+class GpuTagCmd : public RenderCmd
+{
+public:
+	int mTag;
+
+public:
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override;
+};
+
+class RenderableCmd : public RenderCmd
+{
+public:
+	Renderable* mRenderable;
+
+public:
+	RenderableCmd()
+	{
+		mRenderable = NULL;
+	}
+
+	virtual void CommandQueued(DrawLayer* drawLayer) override
+	{
+		mRenderable->CommandQueued(this, drawLayer);
+	}
+
+	virtual void Render(RenderDevice* renderDevice, RenderWindow* renderWindow) override
+	{
+		mRenderable->Render(this, renderDevice, renderWindow);
+	}
 };
 
 NS_BF_END;

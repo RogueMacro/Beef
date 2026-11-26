@@ -20,6 +20,12 @@ namespace Tests
 				return mA + (int)f + 1000;
 			}
 
+			public Result<void> CheckThis(ClassA expected)
+			{
+				Test.Assert(this === expected);
+				return .Ok;
+			}
+
 			public int GetT<T>(T val) where T : var
 			{
 				return mA + (int)val;
@@ -32,6 +38,18 @@ namespace Tests
 			{
 				return mA + (int)f + 2000;
 			}
+		}
+
+		class ClassC : ClassB
+		{
+			public int GetC(float f) => mA + (int)f + 3000;
+			public int BindInherited() => CallBound(this, => GetA);
+			public int BindInheritedVirtual() => CallBound(this, => GetB);
+		}
+
+		static int CallBound<T>(T target, function int(T this, float f) method) where T : class
+		{
+			return method(target, 100.0f);
 		}
 
 		struct StructA
@@ -75,6 +93,11 @@ namespace Tests
 				sa.mB = mB + 2000 + (int)f;
 				return sa;
 			}
+		}
+
+		struct StructD : StructA
+		{
+			public int GetD(float f) => (int)f;
 		}
 
 		struct StructB
@@ -211,6 +234,154 @@ namespace Tests
 		}
 
 		[Test]
+		public static void TestInstanceResultReturn()
+		{
+			ClassA ca = scope ClassA();
+			function Result<void> (ClassA this, ClassA expected) func = => ClassA.CheckThis;
+			Test.Assert(func(ca, ca) case .Ok);
+		}
+
+		struct RetBig
+		{
+			public int64 mA;
+			public int64 mB;
+		}
+
+		struct RetSmall
+		{
+			public int32 mA;
+			public int32 mB;
+		}
+
+		class RetHolder
+		{
+			public int mVal = 7;
+
+			public RetBig GetBig(int64 x) => .() { mA = mVal, mB = x };
+			public RetSmall GetSmall(int32 x) => .() { mA = (int32)mVal, mB = x };
+		}
+
+		// Four fields, so not splattable
+		struct RetWide
+		{
+			public int32 mA, mB, mC, mD;
+
+			public RetBig GetBig(int64 x) => .() { mA = mA + mD, mB = x };
+		}
+
+		// A function with an explicit 'this' must pass the struct-return pointer after 'this', as the instance method
+		//  takes it. Optimized code calls the known target directly, so the call must match the method's signature
+		static mixin CheckInstanceStructReturns()
+		{
+			RetHolder holder = scope .();
+			function RetBig (RetHolder this, int64 x) getBig = => RetHolder.GetBig;
+			RetBig big = getBig(holder, 42);
+			Test.Assert((big.mA == 7) && (big.mB == 42));
+			function RetSmall (RetHolder this, int32 x) getSmall = => RetHolder.GetSmall;
+			RetSmall small = getSmall(holder, 42);
+			Test.Assert((small.mA == 7) && (small.mB == 42));
+
+			RetWide wide = .() { mA = 1, mB = 2, mC = 3, mD = 4 };
+			function RetBig (RetWide this, int64 x) getWideBig = => RetWide.GetBig;
+			RetBig wideBig = getWideBig(wide, 42);
+			Test.Assert((wideBig.mA == 5) && (wideBig.mB == 42));
+		}
+
+		[Test]
+		public static void TestInstanceStructReturns()
+		{
+			CheckInstanceStructReturns!();
+		}
+
+		[Test, UseLLVM]
+		public static void TestInstanceStructReturnsLLVM()
+		{
+			CheckInstanceStructReturns!();
+		}
+
+		[Test, Optimize]
+		public static void TestInstanceStructReturnsOptimized()
+		{
+			CheckInstanceStructReturns!();
+		}
+
+		[Test]
+		public static void TestInheritedThis()
+		{
+			ClassB cb = scope ClassB();
+			function int (ClassB this, float f) funcB = => ClassA.GetA;
+			Test.Assert(funcB(cb, 100.0f) == 223);
+
+			ClassC cc = scope ClassC();
+			function int (ClassC this, float f) funcC = => ClassA.GetA;
+			Test.Assert(funcC(cc, 100.0f) == 223);
+			Test.Assert(CallBound(cc, => cc.GetA) == 223);
+			Test.Assert(cc.BindInherited() == 223);
+
+			function int (ClassB this, float f) funcVirtualB = => ClassA.GetB;
+			Test.Assert(funcVirtualB(cb, 100.0f) == 1223);
+			function int (ClassC this, float f) funcVirtualC = => ClassB.GetB;
+			Test.Assert(funcVirtualC(cc, 100.0f) == 2223);
+			Test.Assert(cc.BindInheritedVirtual() == 2223);
+			Test.Assert(CallBound(cc, => cc.GetB) == 2223);
+
+			function int (ClassA this, float f) funcA = => ClassA.GetA;
+			Test.Assert(!
+				[IgnoreErrors(true)]
+				{
+					funcA = => ClassC.GetC;
+					true
+				});
+
+			ClassA ca = scope ClassA();
+			Test.Assert(!
+				[IgnoreErrors(true)]
+				{
+					CallBound(ca, => ClassC.GetC);
+					true
+				});
+
+			function int (StructA this, float f) funcStruct = => StructA.GetA;
+			Test.Assert(!
+				[IgnoreErrors(true)]
+				{
+					funcStruct = => StructD.GetD;
+					true
+				});
+
+			function void (ITest this) funcInterface = null;
+			Test.Assert(!
+				[IgnoreErrors(true)]
+				{
+					funcInterface = => Zoop.TestFunc;
+					true
+				});
+
+			// A function value converts the same way a method bind does
+			function int (ClassA this, float f) funcBaseA = => ClassA.GetA;
+			function int (ClassB this, float f) funcFromBase = funcBaseA;
+			Test.Assert(funcFromBase(cb, 100.0f) == 223);
+			function int (ClassC this, float f) funcFromBaseC = (function int (ClassC this, float f))funcBaseA;
+			Test.Assert(funcFromBaseC(cc, 100.0f) == 223);
+			Test.Assert(CallBound(cc, funcBaseA) == 223);
+
+			Test.Assert(!
+				[IgnoreErrors(true)]
+				{
+					funcBaseA = funcFromBase;
+					true
+				});
+
+			function int (StructD this, float f) funcStructD = null;
+			Test.Assert(!
+				[IgnoreErrors(true)]
+				{
+					funcStructD = (function int (StructD this, float f))funcStruct;
+					true
+				});
+		}
+
+		[Test]
 		public static void TestBasics()
 		{
 			ClassA ca = scope ClassA();
@@ -231,8 +402,12 @@ namespace Tests
 			Test.Assert(func0(ca, 100.0f) == 2223);
 			func0 = => ClassA.GetB;
 			Test.Assert(func0(ca, 100.0f) == 1223);
-			func0 = => ClassB.GetB;
-			Test.Assert(func0(ca, 100.0f) == 2223);
+			Test.Assert(!
+				[IgnoreErrors(true)]
+				{
+					func0 = => ClassB.GetB;
+					true
+				});
 
 			func0 = => ca.GetA;
 

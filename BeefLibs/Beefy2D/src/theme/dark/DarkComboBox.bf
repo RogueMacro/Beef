@@ -49,6 +49,13 @@ namespace Beefy.theme.dark
 		}
 
         String mLabel ~ delete _;
+
+        public override void Describe(Beefy.utils.StructuredData data)
+        {
+            base.Describe(data);
+            if (mLabel != null)
+                data.Add("label", mLabel);
+        }
         public float mLabelX = GS!(8);
         public FontAlign mLabelAlign = FontAlign.Centered;
         public FrameKind mFrameKind = .OnWindow;
@@ -269,6 +276,15 @@ namespace Beefy.theme.dark
             base.SetFocus();
         }
 
+		bool MenuHasFocus(MenuWidget menu)
+		{
+			if ((menu.mWidgetWindow != null) && (menu.mWidgetWindow.mHasFocus)) return true;
+			if (menu.mOpeningSubMenu) return true;
+			for (let item in menu.mItemWidgets)
+				if ((item.mSubMenu != null) && (MenuHasFocus(item.mSubMenu))) return true;
+			return false;
+		}
+
         public override void Update()
         {
             base.Update();
@@ -278,7 +294,7 @@ namespace Beefy.theme.dark
 			if ((mEditWidget != null) && (mEditWidget.mHasFocus))
 				hasFocus = true;
 			if ((!hasFocus) && (mCurMenuWidget != null))
-				if (mCurMenuWidget.mWidgetWindow.mHasFocus)
+				if (MenuHasFocus(mCurMenuWidget))
 					hasFocus = true;
 			if ((!hasFocus) && (mCurMenuWidget != null))
 			{

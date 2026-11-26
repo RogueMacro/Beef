@@ -9,6 +9,8 @@ NS_BF_BEGIN;
 typedef void (*BFApp_UpdateFunc)(bool batchStart);
 typedef void (*BFApp_UpdateFFunc)(float updatePct);
 typedef void (*BFApp_DrawFunc)(bool forceDraw);
+// Returns true while the app wants to keep being called between updates
+typedef bool (*BFApp_IdleUpdateFunc)();
 
 class BFApp;
 class BFSoundManager;
@@ -18,6 +20,14 @@ class FileStream;
 class DrawLayer;
 
 typedef std::list<BFWindow*> BFWindowList;
+
+class FramePacer
+{
+public:
+	virtual ~FramePacer() {}
+	// True once the next frame is due, false if timeoutMS passed first.
+	virtual bool WaitForFrame(int timeoutMS) = 0;
+};
 
 enum
 {
@@ -63,26 +73,49 @@ public:
 	double					mClientUpdateCntF;
 
 	bool					mInProcess;
+	// Bumped by every Process that starts, so one can tell another ran while it pumped messages.
+	int						mProcessCount;
 	bool					mRunning;
 	RenderDevice*			mRenderDevice;
 	int						mSysDialogCnt;
 	int						mUpdateCnt;
-	int						mNumPhysUpdates;
+	int						mSlowStartItr;
 	SyncEvent				mVSyncEvent;
 	volatile bool			mVSyncActive;
 	bool                    mVSynched;
 	bool					mVSyncFailed;
+	// When set, frame pacing comes from an external process signaling a named event
+	// (one Draw per signal) instead of our own vsync; own-window Present stops blocking
+	volatile bool			mExternalPacingActive;
+	// When set, paces us instead: one Draw per completed wait, taking precedence over external pacing
+	// and vsync. mFramePacerRefreshRate, when positive, replaces the head window's refresh rate for
+	// update timing.
+	FramePacer*				mFramePacer;
+	float					mFramePacerRefreshRate;
+	// A flip-model window's own pacer: used when neither mFramePacer nor external pacing is, in place of vsync.
+	FramePacer*				mWindowFramePacer;
+	// Frame pacer waits since the last BFApp_TakeFramePacerStats.
+	int						mFramePacerWaits;
+	int						mFramePacerSignaled;
+	int64					mFramePacerWaitMicros;
 	bool					mForceNextDraw;
+	bool					mUnthrottledRendering = false;
+	// Automation: the app keeps its logical window focus even while another application is the
+	// OS foreground window, so popup menus stay open and injected input routes as if we were in front
+	bool					mVirtualFocus;
 
 	int                     mUpdateSampleCount;
 	int                     mUpdateSampleTimes;
 
 	uint32 mLastProcessTick;
+	uint64 mLastWakeMicros;
 	float mPhysFrameTimeAcc;
+	float mPhysFrameTimeErr; // Elapsed time not yet handed to mPhysFrameTimeAcc
 
 	BFApp_UpdateFunc		mUpdateFunc;
 	BFApp_UpdateFFunc		mUpdateFFunc;
 	BFApp_DrawFunc			mDrawFunc;
+	BFApp_IdleUpdateFunc	mIdleUpdateFunc;
 	int						mCursor;
 
 	BFWindowList			mWindowList;
@@ -93,6 +126,8 @@ public:
 	virtual void			UpdateF(float updatePct);
 	virtual void			Draw();
 	virtual void			Process();
+	virtual void			PumpMessages() {}
+	bool					IdleUpdate();
 	virtual void			PhysSetCursor() = 0;
 
 public:
@@ -107,7 +142,7 @@ public:
 	virtual void			GetWorkspaceRect(int& x, int& y, int& width, int& height) = 0;
 	virtual void			GetWorkspaceRectFrom(int fromX, int fromY, int fromWidth, int fromHeight, int& outX, int& outY, int& outWidth, int& outHeight) { GetWorkspaceRect(outX, outY, outWidth, outHeight); }
 
-	virtual BFWindow*		CreateNewWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int windowFlags) = 0;
+	virtual BFWindow*		CreateNewWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int64 windowFlags) = 0;
 	virtual void			RemoveWindow(BFWindow* window);
 	virtual DrawLayer*		CreateDrawLayer(BFWindow* window) = 0;
 
@@ -118,6 +153,9 @@ public:
 
 	virtual String			EnumerateInputDevices() { return ""; }
 	virtual BFInputDevice*	CreateInputDevice(const StringImpl& guid) { return NULL; }
+
+	virtual void			SetExternalPacing(const char* eventName) {}
+	virtual bool			WaitForExternalPacing(int timeoutMS) { return false; }
 
 	virtual BFSysBitmap*	LoadSysBitmap(const wchar_t* fileName) = 0;
 

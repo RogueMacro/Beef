@@ -168,6 +168,26 @@ public class SaveFileDialog : FileDialog
 		}
 	}
 }
+#elif BF_PLATFORM_MACOS
+namespace System.IO;
+
+public class SaveFileDialog : FileDialog
+{
+	public virtual bool OverwritePrompt
+	{
+		get
+		{
+			return GetOption(2);
+		}
+
+		set
+		{
+			SetOption(2, value);
+		}
+	}
+
+	protected override bool IsSaveDialog => true;
+}
 #else
 namespace System.IO
 {

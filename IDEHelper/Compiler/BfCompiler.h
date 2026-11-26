@@ -105,6 +105,8 @@ public:
 		int mCLongSize;
 		BfToolsetType mToolsetType;
 		BfSIMDSetting mSIMDSetting;
+		BfFloatingPointMode mFloatingPointMode;
+		BfFMASetting mFMASetting;
 		String mMallocLinkName;
 		String mFreeLinkName;
 		bool mIncrementalBuild;
@@ -154,6 +156,8 @@ public:
 			mCLongSize = 4;
 			mToolsetType = BfToolsetType_Microsoft;
 			mSIMDSetting = BfSIMDSetting_None;
+			mFloatingPointMode = BfFloatingPointMode_Precise;
+			mFMASetting = BfFMASetting_TargetDefault;
 			mHotProject = NULL;
 			mDebugAlloc = false;
 			mOmitDebugHelpers = false;
@@ -190,6 +194,15 @@ public:
 		{
 #ifdef BF_PLATFORM_WINDOWS
 			return mToolsetType != BfToolsetType_GNU;
+#else
+			return false;
+#endif
+		}
+
+		bool IsWSL()
+		{
+#ifdef BF_PLATFORM_WINDOWS
+			return mPlatformType == BfPlatformType_Linux;
 #else
 			return false;
 #endif
@@ -276,6 +289,7 @@ public:
 		bool mHasNewTypes;
 		bool mHasNewInterfaceTypes;
 		Array<BfCodeGenFileEntry> mQueuedOutFiles; // Queues up when we have failed hot compiles
+		Array<BfCodeGenFileEntry> mUncommittedOutFiles; // Handed to the IDE but not yet hot loaded
 		HashSet<int> mSlotDefineTypeIds;
 		HashSet<int> mNewlySlottedTypeIds;
 		HashSet<int> mPendingDataChanges;
@@ -330,6 +344,9 @@ public:
 	BfContext* mContext;
 	BfCodeGen mCodeGen;
 	String mOutputDirectory;
+	String mCompilerPath;
+	String mCompilerVersion;
+	int64 mCompilerBuildDate; // UTC, in DateTime ticks
 	int mLastMidCompileRefreshRevision;
 	bool mCanceling;
 	bool mHasRequiredTypes;
@@ -405,6 +422,11 @@ public:
 	BfTypeDef* mIOnFieldInitTypeDef;
 	BfTypeDef* mIOnMethodInitTypeDef;
 
+	BfTypeDef* mCompilerOptionsPlatformTypeTypeDef;
+	BfTypeDef* mCompilerOptionsMachineTypeTypeDef;
+	BfTypeDef* mCompilerOptionsToolsetTypeTypeDef;
+	BfTypeDef* mCompilerOptionsOptLevelTypeDef;
+
 	BfTypeDef* mMethodRefTypeDef;
 	BfTypeDef* mNullableTypeDef;
 
@@ -435,6 +457,7 @@ public:
 	BfTypeDef* mCallingConventionAttributeTypeDef;
 	BfTypeDef* mOrderedAttributeTypeDef;
 	BfTypeDef* mInlineAttributeTypeDef;
+	BfTypeDef* mNoInlineAttributeTypeDef;
 	BfTypeDef* mCLinkAttributeTypeDef;
 	BfTypeDef* mImportAttributeTypeDef;
 	BfTypeDef* mExportAttributeTypeDef;
@@ -480,7 +503,7 @@ public:
 	bool IsTypeUsed(BfType* checkType, BfProject* curProject, bool conservativeCheck = false);
 	bool IsModuleAccessible(BfModule* module, BfProject* curProject);
 	void FixVDataHash(BfModule* bfModule);
-	void CheckModuleStringRefs(BfModule* module, BfVDataModule* vdataModule, int lastModuleRevision, HashSet<int>& foundStringIds, HashSet<int>& dllNameSet, Array<BfMethodInstance*>& dllMethods, Array<BfCompiler::StringValueEntry>& stringValueEntries);
+	void CheckModuleStringRefs(BfModule* module, BfVDataModule* vdataModule, int lastModuleRevision, HashSet<int>& foundStringIds, HashSet<int>& vdataStringIds, HashSet<int>& dllNameSet, Array<BfMethodInstance*>& dllMethods, Array<BfCompiler::StringValueEntry>& stringValueEntries);
 	void HashModuleVData(BfModule* module, HashContext& hash);
 	BfIRFunction CreateLoadSharedLibraries(BfVDataModule* bfModule, Array<BfMethodInstance*>& dllMethods);
 	void GetTestMethods(BfVDataModule* bfModule, Array<TestMethod>& testMethods, HashContext& vdataHashCtx);

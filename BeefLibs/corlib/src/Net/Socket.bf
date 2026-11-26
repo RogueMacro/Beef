@@ -4,13 +4,171 @@ using System.Interop;
 
 namespace System.Net
 {
+	public enum SocketType : int
+	{
+		Stream = 1,
+		Datagram = 2
+	}
+
+	public enum Protocol : int
+	{
+		TCP = 6,
+		UDP = 17
+	}
+
+	public enum AddressFamily : int
+	{
+		IPv4 = 2,
+		// NOTE: AF_* constants are OS-level and differ per platform: Windows 23,
+		// Linux/Android 10, macOS/iOS (BSD) 30. Using the Windows value on macOS made
+		// socket(AF_INET6, ...) fail with EAFNOSUPPORT (errno 47).
+#if BF_PLATFORM_WINDOWS
+		IPv6 = 23,
+#elif BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+		IPv6 = 30,
+#else
+		IPv6 = 10,
+#endif
+	}
+
+	public enum MessageFlags : int32
+	{
+		OutOfBounds = 0x1,
+		Peek        = 0x2,
+		DontRoute   = 0x4,
+		WaitAll     = 0x8
+	}
+
 	class Socket
 	{
+
+		public enum SocketError : int32
+		{
+#if BF_PLATFORM_WINDOWS
+			Interrupted              = 10008,
+			InvalidHandle            = 10009,
+			PermissionDenied         = 10013,
+			InvalidArgument          = 10022,
+			TooManyOpenInSystem      = 10023,
+			TooManyOpen              = 10024,
+			WouldBlock               = 10035,
+			InProgress               = 10036,
+			Already                  = 10037,
+			NotASocket               = 10038,
+			DestAddressRequired      = 10039,
+			MessageTooLong           = 10040,
+			WrongProtocolType        = 10041,
+			ProtocolUnavailable      = 10042,
+			ProtocolUnsupported      = 10043,
+			SocketTypeUnsupported    = 10044,
+			OperationUnsupported     = 10045,
+			ProtFamilyUnsupported    = 10046,
+			AddressFamilyUnsupported = 10047,
+			AddressInUse             = 10048,
+			AddressUnavailable       = 10049,
+			NetworkDown              = 10050,
+			NetworkUnreachable       = 10051,
+			NetworkReset             = 10052,
+			ConnectionAborted        = 10053,
+			ConnectionReset          = 10054,
+			NoBufferSpace            = 10055,
+			AlreadyConnected         = 10056,
+			NotConnected             = 10057,
+			SocketShutdown           = 10058,
+			TooManyReferences        = 10059,
+			TimedOut                 = 10060,
+			ConnectionRefused        = 10061,
+			Loop                     = 10062,
+			NameTooLong              = 10063,
+			HostDown                 = 10064,
+			HostUnreachable          = 10065,
+			NotEmpty                 = 10066,
+			TooManyProcesses         = 10067,
+#elif BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+			Interrupted              = 4,
+			InvalidHandle            = 9,
+			PermissionDenied         = 13,
+			InvalidArgument          = 22,
+			TooManyOpenInSystem      = 23,
+			TooManyOpen              = 24,
+			WouldBlock               = 35,
+			InProgress               = 36,
+			Already                  = 37,
+			NotASocket               = 38,
+			DestAddressRequired      = 39,
+			MessageTooLong           = 40,
+			WrongProtocolType        = 41,
+			ProtocolUnavailable      = 42,
+			ProtocolUnsupported      = 43,
+			SocketTypeUnsupported    = 44,
+			OperationUnsupported     = 45,
+			ProtFamilyUnsupported    = 46,
+			AddressFamilyUnsupported = 47,
+			AddressInUse             = 48,
+			AddressUnavailable       = 49,
+			NetworkDown              = 50,
+			NetworkUnreachable       = 51,
+			NetworkReset             = 52,
+			ConnectionAborted        = 53,
+			ConnectionReset          = 54,
+			NoBufferSpace            = 55,
+			AlreadyConnected         = 56,
+			NotConnected             = 57,
+			SocketShutdown           = 58,
+			TooManyReferences        = 59,
+			TimedOut                 = 60,
+			ConnectionRefused        = 61,
+			Loop                     = 62,
+			NameTooLong              = 63,
+			HostDown                 = 64,
+			HostUnreachable          = 65,
+			NotEmpty                 = 66,
+			TooManyProcesses         = 67,
+#else
+			Interrupted              = 4,
+			InvalidHandle            = 9,
+			PermissionDenied         = 13,
+			InvalidArgument          = 22,
+			TooManyOpenInSystem      = 23,
+			TooManyOpen              = 24,
+			WouldBlock               = 11,
+			InProgress               = 115,
+			Already                  = 114,
+			NotASocket               = 88,
+			DestAddressRequired      = 89,
+			MessageTooLong           = 90,
+			WrongProtocolType        = 91,
+			ProtocolUnavailable      = 92,
+			ProtocolUnsupported      = 93,
+			SocketTypeUnsupported    = 94,
+			OperationUnsupported     = 95,
+			ProtFamilyUnsupported    = 96,
+			AddressFamilyUnsupported = 97,
+			AddressInUse             = 98,
+			AddressUnavailable       = 99,
+			NetworkDown              = 100,
+			NetworkUnreachable       = 101,
+			NetworkReset             = 102,
+			ConnectionAborted        = 103,
+			ConnectionReset          = 104,
+			NoBufferSpace            = 105,
+			AlreadyConnected         = 106,
+			NotConnected             = 107,
+			SocketShutdown           = 108,
+			TooManyReferences        = 109,
+			TimedOut                 = 110,
+			ConnectionRefused        = 111,
+			Loop                     = 40,
+			NameTooLong              = 36,
+			HostDown                 = 112,
+			HostUnreachable          = 113,
+			NotEmpty                 = 39,
+			TooManyProcesses         = 127,
+#endif
+			ConnectionClosed = -1
+		}
+
 		const uint16 WINSOCK_VERSION = 0x0202;
-		const int32 WSAENETRESET    = 10052;
-		const int32 WSAECONNABORTED = 10053;
-		const int32 WSAECONNRESET   = 10054;
-		const int32 WSAEWOULDBLOCK  = 10035;
 
 #if BF_PLATFORM_WINDOWS
 		public struct HSocket : uint
@@ -158,13 +316,35 @@ namespace System.Net
 		[CRepr]
 		public struct SockAddr
 		{
-
+			// BSD-derived platforms (macOS/iOS) prefix the family with a length byte:
+			//     struct sockaddr { __uint8_t sa_len; sa_family_t sa_family; };
+			// Writing the family as an int16 at offset 0 put the family value into sa_len and
+			// left sa_family as 0 (AF_UNSPEC), so bind() failed with EAFNOSUPPORT (errno 47).
+#if BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+			public uint8 sa_len;
+			public uint8 sa_family;
+#else
+			public int16 sa_family;
+#endif
 		}
 
 		[CRepr]
 		public struct SockAddr_in : SockAddr
         {
-	        public int16 sin_family;
+#if BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+			// Setting the family also records the struct length, which BSD requires.
+			public int16 sin_family
+			{
+				get => sa_family;
+				set mut
+				{
+					sa_len = (uint8)sizeof(SockAddr_in);
+					sa_family = (uint8)value;
+				}
+			}
+#else
+			public int16 sin_family { get => sa_family; set mut => sa_family = value; }
+#endif
 	        public uint16 sin_port;
 	        public IPv4Address sin_addr;
 	        public char8[8] sin_zero;
@@ -173,7 +353,20 @@ namespace System.Net
 		[CRepr]
 		public struct SockAddr_in6 : SockAddr
 		{
-			public int16 sin6_family;
+#if BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+			// Setting the family also records the struct length, which BSD requires.
+			public int16 sin6_family
+			{
+				get => sa_family;
+				set mut
+				{
+					sa_len = (uint8)sizeof(SockAddr_in6);
+					sa_family = (uint8)value;
+				}
+			}
+#else
+			public int16 sin6_family { get => sa_family; set mut => sa_family = value; }
+#endif
 			public uint16 sin6_port;
 			public uint32 sin6_flowinfo;
 			public IPv6Address sin6_addr;
@@ -198,7 +391,10 @@ namespace System.Net
 			public int32 ai_socktype;
 			public int32 ai_protocol;
 			public c_size ai_addrlen;
-#if BF_PLATFORM_WINDOWS
+#if BF_PLATFORM_WINDOWS || BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+			// BSD-derived platforms also order these as ai_canonname then ai_addr; Linux is the
+			// odd one out. Reading the Linux order on macOS made ai_addr read as null (it was
+			// actually ai_canonname), so ConnectEx(hostname, port) null-dereferenced and crashed.
 			public char8* ai_canonname;
 			public SockAddr* ai_addr;
 #else
@@ -208,10 +404,128 @@ namespace System.Net
 			public SockAddr* ai_next;
 		}
 
+		public struct SockAddrInfo : IDisposable
+		{
+			public AddrInfo* addrInfo;
+
+			public int32 AddressFamily => addrInfo.ai_family;
+			public uint16 Port => ((SockAddr_in*)addrInfo.ai_addr).sin_port;
+			public IPv4Address IPv4
+			{
+				get
+				{
+					Debug.Assert(AddressFamily == AF_INET);
+					return ((SockAddr_in*)addrInfo.ai_addr).sin_addr;
+				}
+				
+			}
+			public IPv6Address IPv6
+			{
+				get
+				{
+					Debug.Assert(AddressFamily == AF_INET6);
+					return ((SockAddr_in6*)addrInfo.ai_addr).sin6_addr;
+				}
+			}
+
+			public void Dispose() mut
+			{
+				if (addrInfo != null)
+					freeaddrinfo(addrInfo);
+				addrInfo = null;
+			}
+		}
+
+		public struct SockOpt : IDisposable
+		{
+			bool ownsMemory = false;
+
+			public int32 Level;
+			public int32 Name;
+			public void* Value;
+			public int32 Size;
+
+			public this(int32 level, int32 name, void* value, int32 size)
+			{
+				Level = level;
+				Name = name;
+				Value = value;
+				Size = size;
+			}
+
+			public this<T>(int32 level, int32 name, T* value) where T : struct : this(level, name, value, sizeof(T)) {}
+
+			public this<T>(int32 level, int32 name, T value) where T : struct
+			{
+				Level = level;
+				Name = name;
+				Size = sizeof(T);
+				ownsMemory = true;
+
+				let ptr = new T[1]*;
+				ptr[0] = value;
+				Value = ptr;
+			}
+
+			public void Dispose()
+			{
+				if(ownsMemory)
+					delete Value;
+			}
+		}
+
+		public enum PollEvents : int16
+		{
+			None     = 0,
+#if BF_PLATFORM_WINDOWS
+			In       = 0x300,
+			Priority = 0x400,
+			Out      = 0x010,
+			Error    = 0x001,
+			Hangup   = 0x002,
+			Invalid  = 0x004
+#else
+			In       = 0x01,
+			Priority = 0x02,
+			Out      = 0x04,
+			Error    = 0x08,
+			Hangup   = 0x10,
+			Invalid  = 0x20
+#endif
+		}
+
+		[CRepr]
+		public struct PollFD
+		{
+			public HSocket fd;
+			public PollEvents events;
+			public PollEvents revents;
+
+			public this(HSocket fd, PollEvents requested)
+			{
+				this.fd = fd;
+				this.events = requested;
+				this.revents = 0;
+			}
+		}
+
+		public enum ShutdownDirection : int32
+		{
+			Recieve = 0,
+			Send    = 1,
+			Both    = 2
+		}
+
 		public const HSocket INVALID_SOCKET = (HSocket)-1;
 		public const int32 SOCKET_ERROR = -1;
 		public const int AF_INET = 2;
+#if BF_PLATFORM_WINDOWS
 		public const int AF_INET6 = 23;
+#elif BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+		public const int AF_INET6 = 30;
+#else
+		public const int AF_INET6 = 10;
+#endif
 		public const int SOCK_STREAM = 1;
 		public const int SOCK_DGRAM = 2;
 		public const int IPPROTO_TCP = 6;
@@ -226,7 +540,15 @@ namespace System.Net
 #if BF_PLATFORM_WINDOWS
 		public const int SOL_SOCKET = 0xffff;
 		public const int SO_REUSEADDR = 0x0004;
- 		public const int SO_BROADCAST = 0x0020;
+		public const int SO_BROADCAST = 0x0020;
+		public const int IPV6_V6ONLY = 27;
+#elif BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+		// BSD-derived platforms (macOS/iOS) use the same values as Windows for these.
+		// The previous #else branch used Linux values, so setsockopt(IPPROTO_IPV6,
+		// IPV6_V6ONLY, ...) returned ENOPROTOOPT (errno 42) and IPv6 listen failed.
+		public const int SOL_SOCKET = 0xffff;
+		public const int SO_REUSEADDR = 0x0004;
+		public const int SO_BROADCAST = 0x0020;
 		public const int IPV6_V6ONLY = 27;
 #else
 		public const int SOL_SOCKET = 1;
@@ -238,7 +560,7 @@ namespace System.Net
 		public const IPv4Address INADDR_ANY = default;
 		public const IPv6Address IN6ADDR_ANY = default;
 
-#if BF_PLATFORM_WINDOWS
+#if BF_PLATFORM_WINDOWS || BF_PLATFORM_MACOS || BF_PLATFORM_IOS
 		const int FIONBIO = (int)0x8004667e;
 #else
 		const int FIONBIO = (int)0x00005421;
@@ -307,8 +629,19 @@ namespace System.Net
 		[CLink, CallingConvention(.Stdcall)]
 		static extern HostEnt* gethostbyname(char8* name);
 
+#if BF_PLATFORM_WINDOWS
+		[Import("Ws2_32.lib"), CLink, CallingConvention(.Stdcall)]
+		static extern int32 getaddrinfo(char8* pNodeName, char8* pServiceName, AddrInfo* pHints, AddrInfo** ppResult);
+
+		[Import("Ws2_32.lib"), CLink, CallingConvention(.Stdcall)]
+		static extern void freeaddrinfo(AddrInfo* pAddrInfo);
+#else
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int32 getaddrinfo(char8* pNodeName, char8* pServiceName, AddrInfo* pHints, AddrInfo** ppResult);
+
+		[CLink, CallingConvention(.Stdcall)]
+		static extern void freeaddrinfo(AddrInfo* pAddrInfo);
+#endif
 
 		[CLink, CallingConvention(.Stdcall)]
 		static extern HSocket socket(int32 af, int32 type, int32 protocol);
@@ -319,9 +652,15 @@ namespace System.Net
 #if BF_PLATFORM_WINDOWS
 		[Import("wsock32.lib"), CLink, CallingConvention(.Stdcall)]
 		static extern int32 closesocket(HSocket s);
+
+		[Import("Ws2_32.lib"), CLink, CallingConvention(.Stdcall)]
+		static extern int32 shutdown(HSocket s, ShutdownDirection how);
 #else
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int32 close(HSocket s);
+
+		[CLink, CallingConvention(.Stdcall)]
+		static extern int32 shutdown(HSocket s, ShutdownDirection how);
 #endif
 
 		[CLink, CallingConvention(.Stdcall)]
@@ -336,6 +675,10 @@ namespace System.Net
 #if BF_PLATFORM_WINDOWS
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int32 ioctlsocket(HSocket s, int cmd, int* argp);
+#elif BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+		// ioctl is variadic, and the Apple arm64 ABI passes variadic arguments on the stack
+		[CLink, CallingConvention(.Stdcall)]
+		static extern int32 ioctl(HSocket s, int cmd, ...);
 #else
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int32 ioctl(HSocket s, int cmd, int* argp);
@@ -358,6 +701,14 @@ namespace System.Net
 
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int32 sendto(HSocket s, void* ptr, int32 len, int32 flags, SockAddr* to, int32 toLen);
+
+#if BF_PLATFORM_WINDOWS
+		[Import("Ws2_32.lib"), CLink, CallingConvention(.Stdcall)]
+		static extern int32 WSAPoll(PollFD* fdArray, uint32 fds, int32 timeout);
+#else
+		[CLink, CallingConvention(.Stdcall)]
+		static extern int32 poll(PollFD* fds, uint64 nfds, int32 timeout);
+#endif
 
 		public ~this()
 		{
@@ -388,12 +739,12 @@ namespace System.Net
 #endif
 		}
 
-		int32 GetLastError()
+		static SocketError GetLastError()
 		{
 #if BF_PLATFORM_WINDOWS
-			return WSAGetLastError();
+			return (.)WSAGetLastError();
 #else
-			return *_errno();
+			return (.)*_errno();
 #endif
 		}
 
@@ -407,6 +758,33 @@ namespace System.Net
 		{
 			return (int16)(((val & 0x00FF) << 8) |
 				((val & 0xFF00) >> 8));
+		}
+
+		public static Result<void, SocketError> GetAddrInfo(StringView addr, AddrInfo hints, AddrInfo** res) => GetAddrInfo(addr, (StringView)default, hints, res);
+		public static Result<void, SocketError> GetAddrInfo(StringView addr, uint16 port, AddrInfo hints, AddrInfo** res) => GetAddrInfo(addr, port.ToString(.. scope .()), hints, res);
+		public static Result<void, SocketError> GetAddrInfo(StringView addr, StringView service, AddrInfo hints, AddrInfo** res)
+		{
+			var hints;
+			return (getaddrinfo(addr.Ptr, service.Ptr, &hints, res) != 0) ? .Err(GetLastError()) : .Ok;
+		}
+
+		public static Result<SockAddrInfo, SocketError> GetAddrInfo(StringView addr, AddrInfo hints = default) => GetAddrInfo(addr, (StringView)default, hints);
+		public static Result<SockAddrInfo, SocketError> GetAddrInfo(StringView addr, uint16 port, AddrInfo hints = default) => GetAddrInfo(addr, port.ToString(.. scope .()), hints);
+		public static Result<SockAddrInfo, SocketError> GetAddrInfo(StringView addr, StringView service, AddrInfo hints = default)
+		{
+			AddrInfo* addrInfo = null;
+			defer
+			{
+				if (addrInfo != null)
+					freeaddrinfo(addrInfo);
+			}
+
+			Try!(GetAddrInfo(addr, service, hints, &addrInfo));
+
+			let sockAddrInfo = SockAddrInfo{ addrInfo = addrInfo };
+			addrInfo = null;
+
+			return sockAddrInfo;
 		}
 
 		void SetBlocking(bool blocking)
@@ -425,151 +803,79 @@ namespace System.Net
 			SetBlocking(mIsBlocking);
 		}
 
-        public Result<void> Listen(int32 port, int32 backlog = 5)
-        {
-            return Listen(.(127, 0, 0, 1), port, backlog);
-        }
+		public Result<void, SocketError> Listen(int32 port, int32 backlog = 5) => Listen((IPv6Address)default, port, backlog, false);
+		public Result<void, SocketError> ListenLocal(int32 port, int32 backlog = 5) => Listen(.(127, 0, 0, 1), port, backlog);
+		public Result<void, SocketError> Listen(IPv4Address address, int32 port, int32 backlog = 5) => OpenEx(address, port, .Stream, .TCP, backlog);
+		public Result<void, SocketError> Listen(IPv6Address address, int32 port, int32 backlog = 5, bool v6Only = false)
+			=> OpenEx(
+				address,
+				port,
+				.Stream,
+				.TCP,
+				backlog,
+				.(IPPROTO_IPV6, IPV6_V6ONLY, (int32)(v6Only ? 1 : 0))
+			);
 
-		public Result<void> Listen(IPv4Address address, int32 port, int32 backlog = 5)
-		{
-			Debug.Assert(mHandle == INVALID_SOCKET);
-
-			mHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-			
-			if (mHandle == INVALID_SOCKET)
-			{
-#unwarn
-				int32 err = GetLastError();
-				return .Err;
-			}
-
-			RehupSettings();
-
-			SockAddr_in service;
-			service.sin_family = AF_INET;
-			service.sin_addr = address;
-			service.sin_port = (uint16)htons((int16)port);
-
-			int32 size = sizeof(SockAddr_in);
-			if (bind(mHandle, &service, size) == SOCKET_ERROR)
-			{
-				Close();
-				return .Err;
-			}
-
-			if (listen(mHandle, backlog) == SOCKET_ERROR)
-			{
-#unwarn
-				int err = GetLastError();
-				Close();
-				return .Err;
-			}
-
-			return .Ok;
-		}
-
-		public Result<void> Listen(IPv6Address address, int32 port, int32 backlog = 5, bool v6Only = false)
-		{
-			Debug.Assert(mHandle == INVALID_SOCKET);
-
-			mHandle = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
-			
-			if (mHandle == INVALID_SOCKET)
-			{
-#unwarn
-				int32 err = GetLastError();
-				return .Err;
-			}
-
-			int32 ipv6Opt = v6Only ? 1 : 0;
-			setsockopt(mHandle, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6Opt, 4);
-
-			RehupSettings();
-
-			SockAddr_in6 service;
-			service.sin6_family = AF_INET6;
-			service.sin6_addr = address;
-			service.sin6_port = (uint16)htons((int16)port);
-
-			int32 size = sizeof(SockAddr_in6);
-			if (bind(mHandle, &service, size) == SOCKET_ERROR)
-			{
-#unwarn
-				int err = GetLastError();
-				Close();
-				return .Err;
-			}
-
-			if (listen(mHandle, backlog) == SOCKET_ERROR)
-			{
-#unwarn
-				int err = GetLastError();
-				Close();
-				return .Err;
-			}
-
-			return .Ok;
-		}
-
-		public Result<void> Connect(StringView addr, int32 port, out SockAddr_in sockAddr)
+		public Result<void, SocketError> Connect(StringView addr, int32 port) => Connect(addr, port, ?);
+		public Result<void, SocketError> Connect(StringView addr, int32 port, out SockAddr_in sockAddr)
 		{
 			sockAddr = default;
-			mHandle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-			if (mHandle == INVALID_SOCKET)
-				return .Err;
 
 			var hostEnt = gethostbyname(scope String(addr));
 			if (hostEnt == null)
-				return .Err;
+				return .Err(GetLastError());
 
 			sockAddr.sin_family = AF_INET;
 			Internal.MemCpy(&sockAddr.sin_addr, hostEnt.h_addr_list[0], sizeof(IPv4Address));
 			sockAddr.sin_port = (uint16)htons((int16)port);
 
-			if (connect(mHandle, &sockAddr, sizeof(SockAddr_in)) == SOCKET_ERROR)
-				return .Err;
-
-			if (mHandle == INVALID_SOCKET)
-			{
-#unwarn
-				int32 err = GetLastError();
-				return .Err;
-			}
-
-			mIsConnected = true;
-			RehupSettings();
-
-			return .Ok;
+			return ConnectEx(&sockAddr, sizeof(SockAddr_in), .Stream, .TCP);
 		}
 
-		public Result<void> Connect(StringView addr, int32 port, out SockAddr* sockAddr, out int addrFamily)
+		public Result<void, SocketError> ConnectEx(StringView addr, int32 port, out SockAddrInfo sockAddrInfo)
 		{
-			sockAddr = null;
-			addrFamily = default;
-
-			AddrInfo hints = default;
-			hints.ai_socktype = SOCK_STREAM;
-			hints.ai_protocol = IPPROTO_TCP;
+			sockAddrInfo = default;
 
 			AddrInfo* addrInfo = null;
-			if (getaddrinfo(addr.Ptr, null, &hints, &addrInfo) < 0)
-				return .Err;
+			defer
+			{
+				if (addrInfo != null)
+					freeaddrinfo(addrInfo);
+			}
 
-			sockAddr = addrInfo.ai_addr;
-			addrFamily = addrInfo.ai_family;
+			Try!(GetAddrInfo(addr, (.)port, .(){ ai_socktype = SOCK_STREAM, ai_protocol = IPPROTO_TCP }, &addrInfo));
+			Try!(ConnectEx(addrInfo.ai_addr, (.)addrInfo.ai_addrlen, .Stream, .TCP));
 
-			mHandle = socket(addrInfo.ai_family, SOCK_STREAM, IPPROTO_TCP);
+			sockAddrInfo.addrInfo = addrInfo;
+			addrInfo = null;
+
+			return .Ok;
+		}
+
+		public Result<void, SocketError> ConnectEx(SockAddr* addr, int32 addrLen, SocketType type, Protocol protocol, params SockOpt[] opts)
+		{
+			int32 addrFamily = addr.sa_family;
+			mHandle = socket(addrFamily, (.)type, (.)protocol);
 			if (mHandle == INVALID_SOCKET)
-				return .Err;
+				return .Err(GetLastError());
 
-			if (connect(mHandle, sockAddr, (.)addrInfo.ai_addrlen) == SOCKET_ERROR)
-				return .Err;
+			for (let opt in opts)
+			{
+				if (setsockopt(mHandle, opt.Level, opt.Name, opt.Value, opt.Size) == SOCKET_ERROR)
+				{
+					let err = GetLastError();
+					Close();
+					return .Err(err);
+				}
+				opt.Dispose();
+			}
 
-			if (mHandle == INVALID_SOCKET)
+			if (connect(mHandle, addr, addrLen) == SOCKET_ERROR)
 			{
 #unwarn
-				int32 err = GetLastError();
-				return .Err;
+				let err = GetLastError();
+				Close();
+				return .Err(err);
 			}
 
 			mIsConnected = true;
@@ -578,16 +884,14 @@ namespace System.Net
 			return .Ok;
 		}
 
-		public Result<void> Connect(StringView addr, int32 port) => Connect(addr, port, ?);
-
-		public Result<void> AcceptFrom(Socket listenSocket, SockAddr* from, int32* fromLen)
+		public Result<void, SocketError> AcceptFrom(Socket listenSocket, SockAddr* from, int32* fromLen)
 		{
 			mHandle = accept(listenSocket.mHandle, from, fromLen);
 			if (mHandle == INVALID_SOCKET)
 			{
 #unwarn
-				int lastErr = GetLastError();
-				return .Err;
+				let lastErr = GetLastError();
+				return .Err(lastErr);
 			}
 
 			RehupSettings();
@@ -595,14 +899,14 @@ namespace System.Net
 			return .Ok;
 		}
 
-		public Result<void> AcceptFrom(Socket listenSocket, out SockAddr_in clientAddr)
+		public Result<void, SocketError> AcceptFrom(Socket listenSocket, out SockAddr_in clientAddr)
 		{
 			clientAddr = default;
 			int32 clientAddrLen = sizeof(SockAddr_in);
 			return AcceptFrom(listenSocket, &clientAddr, &clientAddrLen);
 		}
 
-		public Result<void> AcceptFrom(Socket listenSocket) => AcceptFrom(listenSocket, null, null);
+		public Result<void, SocketError> AcceptFrom(Socket listenSocket) => AcceptFrom(listenSocket, null, null);
 
 		public static int32 Select(FDSet* readFDS, FDSet* writeFDS, FDSet* exceptFDS, int waitTimeMS)
 		{
@@ -639,6 +943,15 @@ namespace System.Net
 			return select(nfds, readFDS, writeFDS, exceptFDS, timeVal);
 		}
 
+		public static int32 Poll(PollFD* fds, uint nfds, int timeout)
+		{
+#if BF_PLATFORM_WINDOWS
+			return WSAPoll(fds, (.)nfds, (.)timeout);
+#else
+			return poll(fds, (.)nfds, (.)timeout);
+#endif
+		}
+
 		public int32 DbgRecv(void* ptr, int32 size)
 		{
 			int32 result = recv(mHandle, ptr, size, 0);
@@ -656,89 +969,85 @@ namespace System.Net
 
 		void CheckDisconnected()
 		{
-			int32 lastErr = GetLastError();
+			let lastErr = GetLastError();
 			switch (lastErr)
 			{
-			case WSAENETRESET,
-				 WSAECONNABORTED,
-				 WSAECONNRESET:
+			case .NetworkReset,
+				 .ConnectionAborted,
+				 .ConnectionReset:
 				mIsConnected = false;
-			case WSAEWOULDBLOCK:
+			case .WouldBlock:
 			default:
 				NOP!();
 			}
 		}
 
-		public Result<int> Recv(void* ptr, int size)
+		public Result<int, SocketError> Recv(void* ptr, int size, MessageFlags flags = 0)
 		{
-			int32 result = recv(mHandle, ptr, (int32)size, 0);
+			int32 result = recv(mHandle, ptr, (int32)size, (.)flags);
 			if (result == 0)
 			{
 				mIsConnected = false;
-				return .Err;
+				return .Err(.ConnectionClosed);
 			}
 			if (result == -1)
 			{
 				CheckDisconnected();
-				if (!mIsConnected)
-					return .Err;
+				return .Err(GetLastError());
 			}
 			return result;
 		}
 
-		public Result<int> RecvFrom(void* ptr, int size, SockAddr* from, ref int32 fromLen)
-		{
-			int32 result = recvfrom(mHandle, ptr, (int32)size, 0, from, &fromLen);
-			if (result == 0)
-			{
-				mIsConnected = false;
-				return .Err;
-			}
-			if (result == -1)
-			{
-				CheckDisconnected();
-				if (!mIsConnected)
-					return .Err;
-			}
-			return result;
-		}
-
-		public Result<int> RecvFrom(void* ptr, int size, out SockAddr_in from)
+		public Result<int, SocketError> RecvFrom(void* ptr, int size, out SockAddr_in from, MessageFlags flags = 0)
 		{
 			from = default;
 			//from.sin_family = AF_INET;
 			int32 fromLen = sizeof(SockAddr_in);
-			return RecvFrom(ptr, size, &from, ref fromLen);
+			return RecvFrom(ptr, size, &from, ref fromLen, (.)flags);
 		}
 
-		public Result<int> Send(void* ptr, int size)
+		public Result<int, SocketError> RecvFrom(void* ptr, int size, SockAddr* from, ref int32 fromLen, MessageFlags flags = 0)
 		{
-			int32 result = send(mHandle, ptr, (int32)size, 0);
-			if (result < 0)
+			int32 result = recvfrom(mHandle, ptr, (int32)size, (.)flags, from, &fromLen);
+			if (result == 0)
+			{
+				mIsConnected = false;
+				return .Err(.ConnectionClosed);
+			}
+			if (result == -1)
 			{
 				CheckDisconnected();
-				if (!mIsConnected)
-					return .Err;
+				return .Err(GetLastError());
 			}
 			return result;
 		}
 
-		public Result<int> SendTo(void* ptr, int size, SockAddr* to, int toLen)
+		public Result<int, SocketError> Send(void* ptr, int size, MessageFlags flags = 0)
 		{
-			int32 result = sendto(mHandle, ptr, (int32)size, 0, to, (.)toLen);
+			int32 result = send(mHandle, ptr, (int32)size, (.)flags);
 			if (result < 0)
 			{
 				CheckDisconnected();
-				if (!mIsConnected)
-					return .Err;
+				return .Err(GetLastError());
+			}
+			return result;
+		}
+
+		public Result<int, SocketError> SendTo(void* ptr, int size, SockAddr* to, int toLen, MessageFlags flags = 0)
+		{
+			int32 result = sendto(mHandle, ptr, (int32)size, (.)flags, to, (.)toLen);
+			if (result < 0)
+			{
+				CheckDisconnected();
+				return .Err(GetLastError());
 			}
 			return result;
 		}
 
 #unwarn
-		public Result<int> SendTo(void* ptr, int size, SockAddr_in to) => SendTo(ptr, size, &to, sizeof(SockAddr_in));
+		public Result<int, SocketError> SendTo(void* ptr, int size, SockAddr_in to, MessageFlags flags = 0) => SendTo(ptr, size, &to, sizeof(SockAddr_in), flags);
 #unwarn
-		public Result<int> SendTo(void* ptr, int size, SockAddr_in6 to) => SendTo(ptr, size, &to, sizeof(SockAddr_in6));
+		public Result<int, SocketError> SendTo(void* ptr, int size, SockAddr_in6 to, MessageFlags flags = 0) => SendTo(ptr, size, &to, sizeof(SockAddr_in6), flags);
 		
 		public void Close()
 		{
@@ -751,55 +1060,121 @@ namespace System.Net
 			mHandle = INVALID_SOCKET;
 		}
 
-		public Result<void> OpenUDP(int32 port = -1)
+		public Result<void, SocketError> Shutdown(ShutdownDirection how = .Both)
 		{
-			SockAddr_in bindAddr = default;
-
-			mHandle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-			if (mHandle == INVALID_SOCKET)
+			if (shutdown(mHandle, how) == SOCKET_ERROR)
 			{
-				return .Err;
+				let err = GetLastError();
+				return .Err(err);
 			}
 
-			RehupSettings();
-
-			int32 yes = 1;
-			//setsockopt(mHandle, SOL_SOCKET, SO_REUSEADDR, &yes, 4);
-			int32 status = setsockopt(mHandle, SOL_SOCKET, SO_BROADCAST, &yes, 4);
-
-			bindAddr.sin_addr = INADDR_ANY;
-			bindAddr.sin_port = (.)htons((int16)port);
-			bindAddr.sin_family = AF_INET;
-
-			status = bind(mHandle, &bindAddr, sizeof(SockAddr_in));
+			mIsConnected = false;
 			return .Ok;
 		}
 
-		public Result<void> OpenUDPIPv6(int32 port = -1, bool v6Only = false)
+		
+		public Result<void, SocketError> OpenUDP(int32 port = -1) => OpenUDP(INADDR_ANY, port);
+		public Result<void, SocketError> OpenUDP(IPv4Address addr, int32 port = -1)
+			=> OpenEx(
+				addr,
+				port,
+				.Datagram,
+				.UDP,
+				-1,
+				.(SOL_SOCKET, SO_BROADCAST, (int32)1)
+			);
+
+		public Result<void, SocketError> OpenUDPIPv6(int32 port = -1, bool v6Only = false) => OpenUDPIPv6(IN6ADDR_ANY, port, v6Only);
+		public Result<void, SocketError> OpenUDPIPv6(IPv6Address addr, int32 port = -1, bool v6Only = false)
+			=> OpenEx(
+				addr,
+				port,
+				.Datagram,
+				.UDP,
+				-1,
+				.(SOL_SOCKET, SO_BROADCAST, (int32)1),
+				.(IPPROTO_IPV6, IPV6_V6ONLY, (int32)(v6Only ? 1 : 0))
+			);
+		
+		public Result<void, SocketError> OpenEx(IPv4Address addr, int32 port, SocketType type, Protocol protocol, int32 backlog, params SockOpt[] opts)
+		{
+			SockAddr_in bindAddr = default;
+			bindAddr.sin_addr = addr;
+			bindAddr.sin_port = (.)htons((int16)port);
+			bindAddr.sin_family = AF_INET;
+
+			return OpenEx(&bindAddr, sizeof(SockAddr_in), type, protocol, backlog, params opts);
+		}
+
+		public Result<void, SocketError> OpenEx(IPv6Address addr, int32 port, SocketType type, Protocol protocol, int32 backlog, params SockOpt[] opts)
 		{
 			SockAddr_in6 bindAddr = default;
+			bindAddr.sin6_addr = addr;
+			bindAddr.sin6_port = (.)htons((int16)port);
+			bindAddr.sin6_family = AF_INET6;
 
-			mHandle = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+			return OpenEx(&bindAddr, sizeof(SockAddr_in6), type, protocol, backlog, params opts);
+		}
+
+		public Result<void, SocketError> OpenEx(SockAddr* addr, int32 addrLength, SocketType type, Protocol protocol, int32 backlog, params SockOpt[] opts)
+		{
+			Debug.Assert(mHandle == INVALID_SOCKET);
+
+			int32 addrFamily = addr.sa_family;
+			mHandle = socket(addrFamily, (.)type, (.)protocol);
 			if (mHandle == INVALID_SOCKET)
 			{
-				return .Err;
+				return .Err(GetLastError());
 			}
 
 			RehupSettings();
 
-			int32 yes = 1;
-			//setsockopt(mHandle, SOL_SOCKET, SO_REUSEADDR, &yes, 4);
-			int32 status = setsockopt(mHandle, SOL_SOCKET, SO_BROADCAST, &yes, 4);
+			for (let opt in opts)
+			{
+				if (setsockopt(mHandle, opt.Level, opt.Name, opt.Value, opt.Size) == SOCKET_ERROR)
+				{
+					let err = GetLastError();
+					Close();
+					return .Err(err);
+				}
+				opt.Dispose();
+			}
 
-			int32 ipv6Opt = v6Only ? 1 : 0;
-			setsockopt(mHandle, IPPROTO_IPV6, IPV6_V6ONLY, &ipv6Opt, 4);
+			if (bind(mHandle, addr, addrLength) == SOCKET_ERROR)
+			{
+				let err = GetLastError();
+				Close();
+				return .Err(err);
+			}
 
-			bindAddr.sin6_addr = IN6ADDR_ANY;
-			bindAddr.sin6_port = (.)htons((int16)port);
-			bindAddr.sin6_family = AF_INET6;
+			if(type == .Stream)
+			{
+				if (listen(mHandle, backlog) == SOCKET_ERROR)
+				{
+					let err = GetLastError();
+					Close();
+					return .Err(err);
+				}
+			}
 
-			status = bind(mHandle, &bindAddr, sizeof(SockAddr_in6));
 			return .Ok;
+		}
+	}
+}
+
+namespace System
+{
+	extension Result<T, TErr> where TErr : System.Net.Socket.SocketError
+	{
+		public static implicit operator Result<T>(Self res)
+		{
+			switch(res)
+			{
+			case .Ok(let val):
+				return .Ok(val);
+			case .Err:
+				return .Err;
+			}
 		}
 	}
 }

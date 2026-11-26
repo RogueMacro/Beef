@@ -83,7 +83,7 @@ BfGenericExtensionEntry* BfModule::BuildGenericExtensionInfo(BfTypeInstance* gen
 		auto& genericConstraint = partialTypeDef->mExternalConstraints[externConstraintIdx];
 
 		auto genericParamInstance = new BfGenericTypeParamInstance(partialTypeDef, externConstraintIdx + (int)partialTypeDef->mGenericParamDefs.size());
-		genericParamInstance->mExternType = ResolveTypeRef(genericConstraint.mTypeRef, BfPopulateType_Identity);
+		genericParamInstance->mExternType = ResolveTypeRef(genericConstraint.mTypeRef, BfPopulateType_Identity, BfResolveTypeRefFlag_NoReify);
 
 		auto autoComplete = mCompiler->GetAutoComplete();
 		if (autoComplete != NULL)
@@ -221,7 +221,7 @@ bool BfModule::FinishGenericParams(BfType* resolvedTypeRef)
 					else
 					{
 						auto externConstraintDef = genericParamInstance->GetExternConstraintDef();
-						genericParamInstance->mExternType = ResolveTypeRef(externConstraintDef->mTypeRef);
+						genericParamInstance->mExternType = ResolveTypeRef(externConstraintDef->mTypeRef, BfPopulateType_Data, BfResolveTypeRefFlag_NoReify);
 						if (genericParamInstance->mExternType == NULL)
 							genericParamInstance->mExternType = GetPrimitiveType(BfTypeCode_Var);
 					}
@@ -303,7 +303,7 @@ bool BfModule::FinishGenericParams(BfType* resolvedTypeRef)
 			else
 			{
 				auto externConstraintDef = genericParamInstance->GetExternConstraintDef();
-				genericParamInstance->mExternType = ResolveTypeRef(externConstraintDef->mTypeRef);
+				genericParamInstance->mExternType = ResolveTypeRef(externConstraintDef->mTypeRef, BfPopulateType_Data, BfResolveTypeRefFlag_NoReify);
 
 				auto autoComplete = mCompiler->GetAutoComplete();
 				if (autoComplete != NULL)
@@ -426,6 +426,13 @@ bool BfModule::ValidateGenericConstraints(BfAstNode* typeRef, BfTypeInstance* ge
 	// We don't validate constraints for things like Tuples/Delegates
 	if (genericTypeInst->IsOnDemand())
 		return true;
+
+	// Validating an instance can populate it, which can validate the instances it references, which can lead back
+	//  here. In an inheritance loop between generic types that cycle never ends, so if this instance's validation
+	//  is already in progress further up the stack, leave it to that call - it reports any errors
+	if (genericTypeInst->mGenericTypeInfo->mValidatingGenericConstraints)
+		return true;
+	SetAndRestoreValue<bool> prevValidating(genericTypeInst->mGenericTypeInfo->mValidatingGenericConstraints, true);
 
 	SetAndRestoreValue<bool> prevIgnoreErrors(mIgnoreErrors, mIgnoreErrors || ignoreErrors);
 	genericTypeInst->mGenericTypeInfo->mValidatedGenericConstraints = true;
@@ -735,7 +742,7 @@ void BfModule::InitType(BfType* resolvedTypeRef, BfPopulateType populateType)
 			typeInst->mTypeDef->mDefState = BfTypeDef::DefState_Defined;
 		}
 
-		typeInst->mIsReified = mIsReified;
+		typeInst->mIsReified = (mIsReified) && (!mNoReify);
 
 		//BF_ASSERT(typeInst->mTypeDef->mTypeCode != BfTypeCode_Extension);
 
@@ -769,7 +776,7 @@ void BfModule::InitType(BfType* resolvedTypeRef, BfPopulateType populateType)
 				return;
 			}
 
-			if (mIsReified)
+			if ((mIsReified) && (!mNoReify))
 			{
 				// Try to reify any generic args
 				for (auto genericArg : typeInst->mGenericTypeInfo->mTypeGenericArguments)
@@ -1233,7 +1240,7 @@ void BfModule::PopulateType(BfType* resolvedTypeRef, BfPopulateType populateType
 	}
 
 	// Are we "demanding" to reify a type that is currently resolve-only?
-	if ((mIsReified) && (populateType >= BfPopulateType_Declaration))
+	if ((mIsReified) && (!mNoReify) && (populateType >= BfPopulateType_Declaration))
 	{
 		if (resolvedTypeRef->IsTypeInstance())
 		{
@@ -1371,6 +1378,8 @@ void BfModule::PopulateType(BfType* resolvedTypeRef, BfPopulateType populateType
 
  	if (populateType <= BfPopulateType_TypeDef)
  		return;
+
+	resolvedTypeRef->mActiveRevision = mCompiler->mRevision;
 
 	auto typeInstance = resolvedTypeRef->ToTypeInstance();
 	CheckInjectNewRevision(typeInstance);
@@ -1966,6 +1975,8 @@ BfTypeOptions* BfModule::GetTypeOptions(BfTypeDef* typeDef)
 			auto& first = mContext->mSystem->mTypeOptions[matchedIndices[0]];
 			BfTypeOptions mergedTypeOptions;
 			mergedTypeOptions.mSIMDSetting = first.mSIMDSetting;
+			mergedTypeOptions.mFloatingPointMode = first.mFloatingPointMode;
+			mergedTypeOptions.mFMASetting = first.mFMASetting;
 			mergedTypeOptions.mOptimizationLevel = first.mOptimizationLevel;
 			mergedTypeOptions.mEmitDebugInfo = first.mEmitDebugInfo;
 			mergedTypeOptions.mAndFlags = first.mAndFlags;
@@ -1980,6 +1991,10 @@ BfTypeOptions* BfModule::GetTypeOptions(BfTypeDef* typeDef)
 				auto& typeOptions = mContext->mSystem->mTypeOptions[matchedIndices[idx]];
 				if (typeOptions.mSIMDSetting != -1)
 					mergedTypeOptions.mSIMDSetting = typeOptions.mSIMDSetting;
+				if (typeOptions.mFloatingPointMode != BfFloatingPointMode_NotSet)
+					mergedTypeOptions.mFloatingPointMode = typeOptions.mFloatingPointMode;
+				if (typeOptions.mFMASetting != BfFMASetting_NotSet)
+					mergedTypeOptions.mFMASetting = typeOptions.mFMASetting;
 				if (typeOptions.mOptimizationLevel != -1)
 					mergedTypeOptions.mOptimizationLevel = typeOptions.mOptimizationLevel;
 				if (typeOptions.mEmitDebugInfo != -1)
@@ -2199,6 +2214,8 @@ int BfModule::GenerateTypeOptions(BfCustomAttributes* customAttributes, BfTypeIn
 			auto& first = mContext->mSystem->mTypeOptions[matchedIndices[0]];
 			BfTypeOptions mergedTypeOptions;
 			mergedTypeOptions.mSIMDSetting = first.mSIMDSetting;
+			mergedTypeOptions.mFloatingPointMode = first.mFloatingPointMode;
+			mergedTypeOptions.mFMASetting = first.mFMASetting;
 			mergedTypeOptions.mOptimizationLevel = first.mOptimizationLevel;
 			mergedTypeOptions.mEmitDebugInfo = first.mEmitDebugInfo;
 			mergedTypeOptions.mAndFlags = first.mAndFlags;
@@ -2213,6 +2230,10 @@ int BfModule::GenerateTypeOptions(BfCustomAttributes* customAttributes, BfTypeIn
 				auto& typeOptions = mContext->mSystem->mTypeOptions[matchedIndices[idx]];
 				if (typeOptions.mSIMDSetting != -1)
 					mergedTypeOptions.mSIMDSetting = typeOptions.mSIMDSetting;
+				if (typeOptions.mFloatingPointMode != BfFloatingPointMode_NotSet)
+					mergedTypeOptions.mFloatingPointMode = typeOptions.mFloatingPointMode;
+				if (typeOptions.mFMASetting != BfFMASetting_NotSet)
+					mergedTypeOptions.mFMASetting = typeOptions.mFMASetting;
 				if (typeOptions.mOptimizationLevel != -1)
 					mergedTypeOptions.mOptimizationLevel = typeOptions.mOptimizationLevel;
 				if (typeOptions.mEmitDebugInfo != -1)
@@ -2696,7 +2717,11 @@ void BfModule::HandleCEAttributes(CeEmitContext* ceEmitContext, BfTypeInstance* 
 			{
 				auto owner = methodInstance->GetOwner();
 				int typeId = owner->mTypeId;
-				if ((!result) && (mCompiler->mFastFinish))
+				// Sample this once - a fast-finish request can arrive from another thread at any point, and a call that
+				//  completed before it arrived produced a full emission that we must still apply. Only a call that was
+				//  actually cut short (which also defers a rebuild of this type) gets the fast-finish treatment.
+				bool fastFinished = (!result) && (mCompiler->mFastFinish);
+				if (fastFinished)
 				{
 					if ((typeInstance->mCeTypeInfo != NULL) && (typeInstance->mCeTypeInfo->mNext == NULL))
 						typeInstance->mCeTypeInfo->mNext = new BfCeTypeInfo();
@@ -2730,7 +2755,7 @@ void BfModule::HandleCEAttributes(CeEmitContext* ceEmitContext, BfTypeInstance* 
 						typeInstance->mCeTypeInfo->mFailed = true;
 				}
 
-				if ((ceEmitContext->HasEmissions()) && (!mCompiler->mFastFinish))
+				if ((ceEmitContext->HasEmissions()) && (!fastFinished))
 				{
 					String ctxStr = "comptime ";
 					ctxStr += methodInstance->mMethodDef->mName;
@@ -2750,6 +2775,11 @@ void BfModule::HandleCEAttributes(CeEmitContext* ceEmitContext, BfTypeInstance* 
 
 void BfModule::CEMixin(BfAstNode* refNode, const StringImpl& code)
 {
+	if ((mCurMethodState != NULL) && (mCurMethodState->mMixinState != NULL))
+	{
+		refNode = mCurMethodState->mMixinState->mSource;
+	}
+
 	if (code.IsEmpty())
 		return;
 
@@ -2965,7 +2995,18 @@ void BfModule::ExecuteCEOnCompile(CeEmitContext* ceEmitContext, BfTypeInstance* 
 		}
 		else if (typeInstance->mDefineState != BfTypeDefineState_CETypeInit)
 		{
-			// We populated before we could finish
+			// The type finished populating while this handler was running, so whatever it
+			//  emitted can no longer be applied. A detected data cycle now bails out of the
+			//  populate rather than completing it, so this should be unreachable - but if it
+			//  is reached, mark the type for a rebuild instead of silently caching a
+			//  half-emitted type as valid
+			if (typeInstance->mCeTypeInfo != NULL)
+				typeInstance->mCeTypeInfo->mFailed = true;
+			if ((ceEmitContext != NULL) && (!ceEmitContext->mEmitData.IsEmpty()))
+			{
+				Fail(StrFormat("Code emitted by '%s' was discarded because type '%s' finished populating while it was executing",
+					MethodToString(methodInstance).c_str(), TypeToString(typeInstance).c_str()), methodDef->GetRefNode());
+			}
 			AssertErrorState();
 		}
 		else
@@ -3545,6 +3586,43 @@ void BfModule::DoPopulateType_TypeAlias(BfTypeAliasType* typeAlias)
  	if ((typeAlias->mAliasToType != NULL) && (typeAlias->mAliasToType != aliasToType) && (!typeAlias->mDependencyMap.IsEmpty()))
  		mContext->QueueMidCompileRebuildDependentTypes(typeAlias, "type alias remapped");
 
+	if (aliasToType != NULL)
+	{
+		int aliasDepth = 0;
+		HashSet<BfType*> seenAliases;
+		bool isRecursive = false;
+
+		BfType* resolvedTypeRef = aliasToType;
+		while ((resolvedTypeRef != NULL) && (resolvedTypeRef->IsTypeAlias()))
+		{
+			if (resolvedTypeRef == typeAlias)
+			{
+				isRecursive = true;
+				break;
+			}
+			aliasDepth++;
+			if (aliasDepth > 8)
+			{
+				if (!seenAliases.Add(resolvedTypeRef))
+				{
+					isRecursive = true;
+					break;
+				}
+			}
+
+			resolvedTypeRef = resolvedTypeRef->GetUnderlyingType();
+		}
+		
+		if (isRecursive)
+		{
+			BfAstNode* refNode = typeAliasDecl;
+			if (typeAliasDecl->mAliasToType)
+				refNode = typeAliasDecl->mAliasToType;
+			Fail(StrFormat("Type alias '%s' has a recursive definition", TypeToString(aliasToType).c_str()), refNode);
+			aliasToType = NULL;
+		}
+	}
+	
 	typeAlias->mAliasToType = aliasToType;
 
 	if (aliasToType != NULL)
@@ -3842,6 +3920,9 @@ void BfModule::DoPopulateType_CeCheckEnum(BfTypeInstance* typeInstance, bool und
 
 void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateType)
 {
+	// Populate this type's dependencies under its owning module's normal reification policy.
+	SetAndRestoreValue<bool> prevNoReify(mNoReify, false);
+
 	if (populateType == BfPopulateType_Identity)
 		return;
 
@@ -4100,6 +4181,14 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 				{
 					AssertErrorState();
 					TypeFailed(typeInstance);
+				}
+
+				// Resolving the base type can re-enter and finish populating us (ie: through a data cycle in a sized
+				//  array's size expression), so don't restore our earlier define state over that
+				if (_CheckTypeDone())
+				{
+					prevDefineState.CancelRestore();
+					return;
 				}
 			}
 
@@ -4378,8 +4467,19 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 
 				if ((checkTypeInst != NULL) && (checkTypeInst->mTypeFailed))
 				{
-					// To keep circular references from breaking type invariants (ie: base type loops)
-					continue;
+					// To keep circular references from breaking type invariants (ie: base type loops) we skip a failed base
+					//  when taking it could close a loop - either its own base is still unresolved, or its base chain already
+					//  leads back to us. A base that failed for any other reason (a type-init hook failing, say) is still our
+					//  base, and dropping it would silently re-parent us onto Object
+					bool closesLoop = checkTypeInst->mDefineState <= BfTypeDefineState_ResolvingBaseType;
+					int checkDepth = 0;
+					for (auto checkBase = checkTypeInst; (checkBase != NULL) && (!closesLoop); checkBase = checkBase->mBaseType)
+					{
+						if ((checkBase == typeInstance) || (++checkDepth > 1024))
+							closesLoop = true;
+					}
+					if (closesLoop)
+						continue;
 				}
 
 				if (!canDeriveFrom)
@@ -4568,8 +4668,48 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 			}
 		}
 
+		// Our ResolvingBaseType state has been restored by now and mBaseType is not assigned until after the
+		//  populate below, so an inheritance loop (A : B, B : A) would otherwise recurse through here until the
+		//  stack runs out and leave mBaseType circular. Walk our base's chain - using the base each type is
+		//  populating further up the stack where mBaseType is not set yet - and fail if it leads back to us
+		{
+			bool isLoop = false;
+			int checkDepth = 0;
+			for (auto checkType = baseTypeInst; checkType != NULL; )
+			{
+				if ((checkType == typeInstance) || (++checkDepth > 1024))
+				{
+					isLoop = true;
+					break;
+				}
+				BfTypeInstance* nextType = checkType->mBaseType;
+				if (nextType == NULL)
+				{
+					for (auto checkState = mContext->mCurTypeState; checkState != NULL; checkState = checkState->mPrevState)
+					{
+						if ((checkState->mType == checkType) && (checkState->mCurBaseType != NULL))
+						{
+							nextType = checkState->mCurBaseType;
+							break;
+						}
+					}
+				}
+				checkType = nextType;
+			}
+
+			if (isLoop)
+			{
+				Fail(StrFormat("Base type '%s' causes a circular inheritance chain", TypeToString(baseTypeInst).c_str()), baseTypeRef, true);
+				TypeFailed(typeInstance);
+				baseTypeInst = defaultBaseTypeInst;
+			}
+		}
+
 		if (populateType > BfPopulateType_CustomAttributes)
+		{
+			SetAndRestoreValue<BfTypeInstance*> prevBaseType(typeState.mCurBaseType, baseTypeInst);
 			PopulateType(baseTypeInst, BfPopulateType_Data);
+		}
 
 		typeInstance->mBaseTypeMayBeIncomplete = false;
 
@@ -4783,6 +4923,11 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 		}
 	}
 
+	// Resolving our base type can populate us all the way through in a nested call, such as when a type-init
+	//  hook's data cycle is broken by populating a type without its hook. The check in the interfaces block
+	//  above only covers types that have interfaces
+	if (_CheckTypeDone())
+		return;
 	BF_ASSERT(!typeInstance->mNeedsMethodProcessing);
 	if (typeInstance->mDefineState < BfTypeDefineState_HasInterfaces_Direct)
 		typeInstance->mDefineState = BfTypeDefineState_HasInterfaces_Direct;
@@ -5000,6 +5145,10 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 
 		for (auto field : typeDef->mFields)
 		{
+			// A re-entrant population pass can resize mFieldInstances, and a comptime emit can leave it shorter than
+			//  the field list we are walking, so every lookup through 'mIdx' is range-checked
+			if (field->mIdx >= typeInstance->mFieldInstances.mSize)
+				continue;
 			auto fieldInstance = &typeInstance->mFieldInstances[field->mIdx];
 			if (fieldInstance->mResolvedType != NULL)
 				continue;
@@ -5025,6 +5174,8 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 				if (field->mIsConst != (pass == 0))
 					continue;
 
+				if (field->mIdx >= typeInstance->mFieldInstances.mSize)
+					continue;
 				auto fieldInstance = &typeInstance->mFieldInstances[field->mIdx];
 				if ((fieldInstance->mResolvedType != NULL) || (!fieldInstance->mFieldIncluded))
 					continue;
@@ -5061,7 +5212,12 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 							AddDependency(payloadType, typeInstance, BfDependencyMap::DependencyFlag_ValueTypeMemberData);
 							BF_ASSERT(payloadType->IsTuple());
 							resolvedFieldType = payloadType;
-							fieldInstance->mIsEnumPayloadCase = true;
+							// The payload resolve can re-enter and resize mFieldInstances
+							if (field->mIdx < typeInstance->mFieldInstances.mSize)
+							{
+								fieldInstance = &typeInstance->mFieldInstances[field->mIdx];
+								fieldInstance->mIsEnumPayloadCase = true;
+							}
 						}
 					}
 					else
@@ -5095,6 +5251,12 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 						resolvedFieldType = GetPrimitiveType(BfTypeCode_Var);
 					}
 				}
+
+				// Resolving the field's type can re-enter this type's population (through a generic constraint on it, say) and a pass that
+				//  takes in new emitted members resizes mFieldInstances, so the field instance is looked up again rather than held across it
+				if (field->mIdx >= typeInstance->mFieldInstances.mSize)
+					continue;
+				fieldInstance = &typeInstance->mFieldInstances[field->mIdx];
 
 				if (resolvedFieldType->IsUndefSizedArray())
 				{
@@ -5143,6 +5305,8 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 		int enumCaseEntryIdx = 0;
 		for (auto field : typeDef->mFields)
 		{
+			if (field->mIdx >= typeInstance->mFieldInstances.mSize)
+				continue;
 			auto fieldInstance = &typeInstance->mFieldInstances[field->mIdx];
 			if (!fieldInstance->mFieldIncluded)
 				continue;
@@ -5164,6 +5328,8 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 
 		for (auto& resolveEntry : deferredVarResolves)
 		{
+			if (resolveEntry.mFieldDef->mIdx >= typeInstance->mFieldInstances.mSize)
+				continue;
 			hadDeferredVars = true;
 			auto fieldType = ResolveVarFieldType(typeInstance, &typeInstance->mFieldInstances[resolveEntry.mFieldDef->mIdx], resolveEntry.mFieldDef);
 			if (fieldType == NULL)
@@ -5173,6 +5339,9 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 				mHadBuildError = true;
 				//typeInstance->mTypeFailed = true;
 			}
+			// ResolveVarFieldType evaluates the initializer, which can re-enter and resize mFieldInstances
+			if (resolveEntry.mFieldDef->mIdx >= typeInstance->mFieldInstances.mSize)
+				continue;
 			auto fieldInstance = &typeInstance->mFieldInstances[resolveEntry.mFieldDef->mIdx];
 			fieldInstance->SetResolvedType(fieldType);
 		}
@@ -5388,6 +5557,16 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 						typeState = typeState->mPrevState;
 					}
 				}
+
+				// We have detected an unrecoverable data cycle. Returning here leaves the type at
+				//  BfTypeDefineState_CETypeInit so the TypeInit handler that is still executing
+				//  further up the stack can apply its emission when it finishes - completing the
+				//  populate from here would advance us to 'Defined' and strand that emission,
+				//  leaving the type permanently missing the members it was about to emit
+				typeInstance->mTypeFailed = true;
+				mHadBuildError = true;
+				AssertErrorState();
+				return;
 			}
  		}
 
@@ -5428,7 +5607,10 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 					hashCtx.Mixin(ceInfo->mEmitSourceMap.mCount);
 					for (auto& kv : ceInfo->mEmitSourceMap)
 					{
-						hashCtx.Mixin(kv.mKey);
+						// The low part of the key is the emitter's position in its source file, which shifts with any edit earlier
+						//  in that file. Only mix in the partial index so that doesn't look like changed emissions and needlessly
+						//  rebuild our dependents mid-compile - the emitters are still distinguished by their order here.
+						hashCtx.Mixin((int32)(kv.mKey >> 32));
 						hashCtx.Mixin(kv.mValue.mKind);
 						hashCtx.Mixin(kv.mValue.mSrcStart);
 						hashCtx.Mixin(kv.mValue.mSrcEnd);
@@ -5450,19 +5632,23 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 
 					if (!typeInstance->mCeTypeInfo->mNext->mFastFinished)
 					{
-						if ((typeInstance->mCeTypeInfo->mHash != typeInstance->mCeTypeInfo->mNext->mHash) && (!typeInstance->mCeTypeInfo->mHash.IsZero()))
-							mContext->QueueMidCompileRebuildDependentTypes(typeInstance, "comptime hash changed");
+						// Dependents may have been slotted against incomplete emissions during a canceled pass.
+						if (((typeInstance->mCeTypeInfo->mHash != typeInstance->mCeTypeInfo->mNext->mHash) ||
+							(typeInstance->mCeTypeInfo->mFastFinished)) &&
+							((!typeInstance->mCeTypeInfo->mHash.IsZero()) || (typeInstance->mHadPopulate)))
+							mContext->QueueMidCompileRebuildDependentTypes(typeInstance,
+								typeInstance->mCeTypeInfo->mFastFinished ? "comptime retry completed" : "comptime hash changed");
 						typeInstance->mCeTypeInfo->mEmitSourceMap = typeInstance->mCeTypeInfo->mNext->mEmitSourceMap;
 						typeInstance->mCeTypeInfo->mOnCompileMap = typeInstance->mCeTypeInfo->mNext->mOnCompileMap;
 						typeInstance->mCeTypeInfo->mTypeIFaceMap = typeInstance->mCeTypeInfo->mNext->mTypeIFaceMap;
 						typeInstance->mCeTypeInfo->mHash = typeInstance->mCeTypeInfo->mNext->mHash;
 						typeInstance->mCeTypeInfo->mAlign = typeInstance->mCeTypeInfo->mNext->mAlign;
+						typeInstance->mCeTypeInfo->mFastFinished = false;
 					}
 					else
 					{
-						// This greatly increases dependent type rebuilds, which triggers other issues
-						/*if ((typeInstance->mCeTypeInfo->mHash != typeInstance->mCeTypeInfo->mNext->mHash) && (!typeInstance->mCeTypeInfo->mHash.IsZero()))
-							mContext->QueueMidCompileRebuildDependentTypes(typeInstance, "canceled comptime hash changed");*/
+						// Keep the cached emissions, but invalidate dependents when the retry completes.
+						typeInstance->mCeTypeInfo->mFastFinished = true;
 					}
 
 					delete typeInstance->mCeTypeInfo->mNext;
@@ -5471,12 +5657,13 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 				else
 				{
 					// Removed emissions
-					if (!typeInstance->mCeTypeInfo->mHash.IsZero())
+					if ((!typeInstance->mCeTypeInfo->mHash.IsZero()) || (typeInstance->mCeTypeInfo->mFastFinished))
 						mContext->QueueMidCompileRebuildDependentTypes(typeInstance, "removed comptime hash changed");
 					typeInstance->mCeTypeInfo->mEmitSourceMap.Clear();
 					typeInstance->mCeTypeInfo->mOnCompileMap.Clear();
 					typeInstance->mCeTypeInfo->mTypeIFaceMap.Clear();
 					typeInstance->mCeTypeInfo->mHash = Val128();
+					typeInstance->mCeTypeInfo->mFastFinished = false;
 				}
 
 				if (((typeInstance->mCeTypeInfo->mFailed) || (typeInstance->mTypeDef->HasParsingFailed())) &&
@@ -5487,6 +5674,9 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 				}
 				typeInstance->mCeTypeInfo->mFailed = false;
 			}
+
+			// Must be tracked on the type rather than on mCeTypeInfo, which does not exist yet when a populate emits nothing
+			typeInstance->mHadPopulate = true;
 
 			if (typeInstance->mCeTypeInfo != NULL)
 			{
@@ -5655,7 +5845,12 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 						BfAstNode* refNode = fieldDecl->mConstSpecifier;
 						if (refNode == NULL)
 							refNode = fieldDef->GetRefNode();
-						if ((!resolvedFieldType->IsGenericParam()) && (!resolvedFieldType->IsObject()) && (!resolvedFieldType->IsStruct()))
+						// A typed primitive (which includes a payload-less enum) is not IsStruct(), but it
+						//  can still declare members whether or not it currently does. A function pointer
+						//  is a typed primitive too, and it has nothing to expose
+						bool canUsing = (resolvedFieldType->IsGenericParam()) || (resolvedFieldType->IsObject()) || (resolvedFieldType->IsStruct()) ||
+							((resolvedFieldType->IsTypedPrimitive()) && (!resolvedFieldType->IsFunction()));
+						if (!canUsing)
 						{														
 							Warn(0, StrFormat("Field type '%s' is not applicable for 'using'", TypeToString(resolvedFieldType).c_str()), refNode);
 						}
@@ -5808,7 +6003,7 @@ void BfModule::DoPopulateType(BfType* resolvedTypeRef, BfPopulateType populateTy
 								failStr = StrFormat("Circular data reference detected between '%s' and '%s'", TypeToString(mCurTypeInstance).c_str(), TypeToString(fieldTypeInst).c_str());
 								if (!mContext->mFieldResolveReentrys.IsEmpty())
 								{
-									failStr += StrFormat(" with the following fields:", TypeToString(mCurTypeInstance).c_str());
+									failStr += " with the following fields:";
 									for (int i = 0; i < (int)mContext->mFieldResolveReentrys.size(); i++)
 									{
 										auto checkField = mContext->mFieldResolveReentrys[i];
@@ -6400,6 +6595,19 @@ void BfModule::DoTypeInstanceMethodProcessing(BfTypeInstance* typeInstance)
 		return;
 	}
 
+	// If anything in our base chain is partway through slotting its own virtual methods further up the stack,
+	//  our virtual table would be built from a short copy of it. That happens while a data cycle is being broken,
+	//  for instance by a type-init hook that reflects over a base type's methods. Stay pending instead - the
+	//  frames that own our base chain process us once it is complete
+	for (auto checkBaseType = typeInstance->GetImplBaseType(); checkBaseType != NULL; checkBaseType = checkBaseType->GetImplBaseType())
+	{
+		if (checkBaseType->mDefineState == BfTypeDefineState_DefinedAndMethodsSlotting)
+		{
+			BfLogSysM("DoTypeInstanceMethodProcessing %p deferred, base %p is still slotting\n", typeInstance, checkBaseType);
+			return;
+		}
+	}
+
 	//
 	{
 		BP_ZONE("DoTypeInstanceMethodProcessing:CheckStack");
@@ -6507,6 +6715,16 @@ void BfModule::DoTypeInstanceMethodProcessing(BfTypeInstance* typeInstance)
 		if (implBaseType->IsIncomplete())
 			PopulateType(implBaseType, BfPopulateType_Full_Force);
 
+		// A base further up can be incomplete while the direct base is not: reifying a type rebuilds it, and the
+		//  types between it and us can still be the complete ones from before. Our interfaces are slotted after the
+		//  end of every base's, so a walk up the bases that stops at the incomplete one slots ours over Object's
+		//  IHashable. Complete the whole chain first
+		for (auto checkBaseType = implBaseType->GetImplBaseType(); checkBaseType != NULL; checkBaseType = checkBaseType->GetImplBaseType())
+		{
+			if (checkBaseType->IsIncomplete())
+				PopulateType(checkBaseType, BfPopulateType_Full_Force);
+		}
+
 		typeInstance->mInterfaceMethodTable = baseTypeInst->mInterfaceMethodTable;
 		typeInstance->mVirtualMethodTable = implBaseType->mVirtualMethodTable;
 		typeInstance->mVirtualMethodTableSize = implBaseType->mVirtualMethodTableSize;
@@ -6526,7 +6744,14 @@ void BfModule::DoTypeInstanceMethodProcessing(BfTypeInstance* typeInstance)
 		BfTypeInterfaceEntry& typeInterfaceInst = typeInstance->mInterfaces[iFaceIdx];
 
 		auto checkInterface = typeInterfaceInst.mInterfaceType;
-		if (checkInterface->IsIncomplete())
+		if (checkInterface->IsDeleting())
+		{
+			// We were populated before a mid-compile rebuild deleted this interface. We still reserve its entries below,
+			//  and slotting skips it - this compile gets redone with us rebuilt.
+			mCompiler->RequestExtraCompile();
+			InternalError("DoTypeInstanceMethodProcessing using deleted interface", typeInstance->mTypeDef->GetRefNode());
+		}
+		else if (checkInterface->IsIncomplete())
 			PopulateType(checkInterface, BfPopulateType_Full_Force);
 
 		typeInterfaceInst.mStartInterfaceTableIdx = (int)typeInstance->mInterfaceMethodTable.size();
@@ -6726,6 +6951,13 @@ void BfModule::DoTypeInstanceMethodProcessing(BfTypeInstance* typeInstance)
 	// Generate all methods. Pass 1
 	for (auto methodDef : typeDef->mMethods)
 	{
+		if (methodDef->mIdx >= typeInstance->mMethodInstanceGroups.size())
+		{
+			mCompiler->RequestExtraCompile();
+			InternalError("DoTypeInstanceMethodProcessing methodDef->mIdx oob");
+			return;
+		}
+
 		auto methodInstanceGroup = &typeInstance->mMethodInstanceGroups[methodDef->mIdx];
 
 		if (typeOptions != NULL)
@@ -6981,8 +7213,9 @@ void BfModule::DoTypeInstanceMethodProcessing(BfTypeInstance* typeInstance)
 
 				methodInstance = moduleMethodInstance.mMethodInstance;
 				if (methodInstance == NULL)
-				{
-					BF_ASSERT(typeInstance->IsGenericTypeInstance() && (typeInstance->mTypeDef->mIsCombinedPartial));
+				{					
+					BF_ASSERT(typeInstance->IsBoxed() ||
+						(typeInstance->IsGenericTypeInstance() && (typeInstance->mTypeDef->mIsCombinedPartial)));
 					continue;
 				}
 
@@ -7567,6 +7800,9 @@ void BfModule::DoTypeInstanceMethodProcessing(BfTypeInstance* typeInstance)
 	CheckAddFailType();
 
 	typeInstance->mDefineState = BfTypeDefineState_DefinedAndMethodsSlotted;
+
+	CheckExtensionOverrideConflicts(typeInstance);
+
 	mCompiler->mStats.mTypesPopulated++;
 	mCompiler->UpdateCompletion();
 
@@ -7586,6 +7822,7 @@ void BfModule::RebuildMethods(BfTypeInstance* typeInstance)
 	typeInstance->mNeedsMethodProcessing = true;
 	typeInstance->mDefineState = BfTypeDefineState_Defined;
 	typeInstance->mTypeIncomplete = true;
+	typeInstance->RemoveMethodsFromCEMachine();
 
 	for (auto& methodInstanceGroup : typeInstance->mMethodInstanceGroups)
 	{
@@ -7621,7 +7858,11 @@ void BfModule::AddMethodToWorkList(BfMethodInstance* methodInstance)
 	BF_ASSERT(mCompiler->mCompileState != BfCompiler::CompileState_VData);
 	if ((methodInstance->mIsReified) && (!methodInstance->mIsUnspecialized))
 	{
-		BF_ASSERT(mCompiler->mCompileState != BfCompiler::CompileState_Unreified);
+		if (mCompiler->mCompileState == BfCompiler::CompileState_Unreified)
+		{
+			InternalError("AddMethodToWorkList on reified method while in CompileState_Unreified");
+			return;
+		}
 	}
 
 	if (methodInstance->IsOrInUnspecializedVariation())
@@ -7663,7 +7904,7 @@ void BfModule::AddMethodToWorkList(BfMethodInstance* methodInstance)
 		auto module = GetOrCreateMethodModule(methodInstance);
 		methodInstance->mDeclModule = module;
 
-		BfIRValue func = CreateFunctionFrom(methodInstance, false, methodInstance->mAlwaysInline);
+		BfIRValue func = CreateFunctionFrom(methodInstance, false, (methodInstance->mInlineKind == BfInlineKind_Always));
 		methodInstance->mIRFunction = func;
 
 		module->mFuncReferences[methodInstance] = func;
@@ -7680,7 +7921,7 @@ void BfModule::AddMethodToWorkList(BfMethodInstance* methodInstance)
 
 		SetAndRestoreValue<bool> prevIgnoreWrites(mBfIRBuilder->mIgnoreWrites, mWantsIRIgnoreWrites);
 
-		BfIRValue func = CreateFunctionFrom(methodInstance, false, methodInstance->mAlwaysInline);
+		BfIRValue func = CreateFunctionFrom(methodInstance, false, (methodInstance->mInlineKind == BfInlineKind_Always));
 		if (func)
 		{
 			methodInstance->mIRFunction = func;
@@ -7761,9 +8002,12 @@ void BfModule::AddMethodToWorkList(BfMethodInstance* methodInstance)
 		}
 
 		BF_ASSERT(mIsModuleMutable || mReifyQueued);
-	}
+	}	
 
-	BF_ASSERT((mBfIRBuilder != NULL) || (!methodInstance->mIsReified));
+	if ((mBfIRBuilder == NULL) && (methodInstance->mIsReified))
+	{
+		InternalError("AddMethodToWorkList no mBfIRBuilder for reified method");
+	}
 
 	BfLogSysM("Adding to mMethodWorkList Module: %p IncompleteMethodCount: %d Type %p MethodInstance: %p Name:%s TypeRevision: %d ModuleRevision: %d ReqId:%d\n", this, mIncompleteMethodCount, typeInstance, methodInstance, methodInstance->mMethodDef->mName.c_str(), methodProcessRequest->mRevision, methodProcessRequest->mFromModuleRevision, methodProcessRequest->mReqId);
 
@@ -8525,6 +8769,8 @@ BfTypeInstance* BfModule::SantizeTupleType(BfTypeInstance* tupleType)
 
 BfRefType* BfModule::CreateRefType(BfType* resolvedTypeRef, BfRefType::RefKind refKind)
 {
+	BF_ASSERT(!resolvedTypeRef->IsDeleting());
+
 	auto refType = mContext->mRefTypePool.Get();
 	refType->mContext = mContext;
 	refType->mElementType = resolvedTypeRef;
@@ -8577,9 +8823,9 @@ BfType* BfModule::ResolveTypeDef(BfTypeDef* typeDef, BfPopulateType populateType
 
 	//BF_ASSERT(typeDef->mTypeCode != BfTypeCode_Extension);
 	BF_ASSERT(!typeDef->mIsPartial || typeDef->mIsCombinedPartial);
-
-	BF_ASSERT(typeDef->mDefState != BfTypeDef::DefState_Deleted);
-	BF_ASSERT((typeDef->mOuterType == NULL) || (typeDef->mOuterType->mDefState != BfTypeDef::DefState_Deleted));
+	
+	BF_ASSERT((typeDef->mDefState != BfTypeDef::DefState_Deleted) || ((resolveFlags & BfResolveTypeRefFlag_AllowDeletedTypeDef) != 0));
+	BF_ASSERT((typeDef->mOuterType == NULL) || (typeDef->mOuterType->mDefState != BfTypeDef::DefState_Deleted) || ((resolveFlags & BfResolveTypeRefFlag_AllowDeletedTypeDef) != 0));
 
 	if (typeDef->mGenericParamDefs.size() != 0)
 		return ResolveTypeDef(typeDef, BfTypeVector(), populateType, resolveFlags);
@@ -8874,7 +9120,7 @@ BfTypeInstance* BfModule::GetOuterType(BfType* type)
 	typeGenericArguments.resize(outerTypeDef->mGenericParamDefs.size());
 
 	//auto outerType = ResolveTypeDef(outerTypeDef, typeGenericArguments, BfPopulateType_Declaration);
-	auto outerType = ResolveTypeDef(outerTypeDef, typeGenericArguments, BfPopulateType_Identity);
+	auto outerType = ResolveTypeDef(outerTypeDef, typeGenericArguments, BfPopulateType_Identity, BfResolveTypeRefFlag_AllowDeletedTypeDef);
 	if (outerType == NULL)
 		return NULL;
 	return outerType->ToTypeInstance();
@@ -10264,6 +10510,7 @@ BfType* BfModule::ResolveTypeResult(BfTypeReference* typeRef, BfType* resolvedTy
 	if ((populateType != BfPopulateType_TypeDef) && (populateType != BfPopulateType_IdentityNoRemapAlias))
 	{
 		int aliasDepth = 0;
+		bool derefedAlias = false;
 		HashSet<BfType*> seenAliases;
 
 		while ((resolvedTypeRef != NULL) && (resolvedTypeRef->IsTypeAlias()))
@@ -10282,7 +10529,7 @@ BfType* BfModule::ResolveTypeResult(BfTypeReference* typeRef, BfType* resolvedTy
 			if (mCurTypeInstance != NULL)
 				AddDependency(resolvedTypeRef, mCurTypeInstance, BfDependencyMap::DependencyFlag_NameReference);
 			if (resolvedTypeRef->mDefineState == BfTypeDefineState_Undefined)
-				PopulateType(resolvedTypeRef);
+				populateModule->PopulateType(resolvedTypeRef);
 			if ((typeInstance->mCustomAttributes != NULL) && (!typeRef->IsTemporary()))
 				CheckErrorAttributes(typeInstance, NULL, NULL, typeInstance->mCustomAttributes, typeRef);
 			resolvedTypeRef = resolvedTypeRef->GetUnderlyingType();
@@ -10290,7 +10537,16 @@ BfType* BfModule::ResolveTypeResult(BfTypeReference* typeRef, BfType* resolvedTy
 				typeInstance = resolvedTypeRef->ToTypeInstance();
 			else
 				typeInstance = NULL;
+			derefedAlias = true;
 		}
+
+		// The loop populates each alias and then steps to what that alias refers to, so
+		// the type we end up returning has only been populated incidentally. Apply the
+		// level the caller asked for. Without this, sizeof/alignof/strideof through an
+		// alias read an unpopulated type and fold to 0/1/0 with no error, unless
+		// something else in the program happened to populate that type first.
+		if ((derefedAlias) && (resolvedTypeRef != NULL) && (populateType > BfPopulateType_Identity))
+			populateModule->PopulateType(resolvedTypeRef, populateType);
 	}
 
 	if (typeInstance != NULL)
@@ -10885,7 +11141,12 @@ void BfModule::TypeRefNotFound(BfTypeReference* typeRef, const char* appendName)
 				BfTypeInstance* typeInstance = mCurTypeInstance;
 				BfTypeLookupEntry typeLookupEntry;
 				typeLookupEntry.mNumGenericParams = 0;
-				typeLookupEntry.mAtomUpdateIdx = mSystem->mAtomUpdateIdx;
+				typeLookupEntry.mFlags = BfTypeLookupEntry::Flags_None;
+				typeLookupEntry.mUseTypeDef = NULL;
+				// The name has a part that is not an atom, so this lookup can only start succeeding after a new atom is created.
+				//  We record the atom creation count rather than mAtomUpdateIdx, which also changes whenever a type is removed -
+				//  including our own emitted typedef each time we are rebuilt, which had us fail this lookup, rebuild, and dirty it again
+				typeLookupEntry.mAtomUpdateIdx = (uint32)mSystem->mAtomCreateIdx;
 				typeInstance->mLookupResults.TryAdd(typeLookupEntry, BfTypeLookupResult());
 			}
 		}
@@ -11200,6 +11461,12 @@ BfType* BfModule::ResolveTypeRef(BfTypeReference* typeRef, BfPopulateType popula
 BfType* BfModule::ResolveTypeRef_Ref(BfTypeReference* typeRef, BfPopulateType populateType, BfResolveTypeRefFlags& resolveFlags, int numGenericArgs)
 {
 	//BP_ZONE("BfModule::ResolveTypeRef");
+
+	// Nested references and aliases may populate types without forwarding resolveFlags.
+	// Keep their resolution unreified too, without changing types already reified.
+	SetAndRestoreValue<bool> prevNoReify(mNoReify,
+		mNoReify || (((resolveFlags & BfResolveTypeRefFlag_NoReify) != 0) &&
+			(mCompiler->mOptions.mCompileOnDemandKind != BfCompileOnDemandKind_AlwaysInclude)));
 
 	if (typeRef == NULL)
 	{
@@ -13404,6 +13671,14 @@ BfIRValue BfModule::CastToFunction(BfAstNode* srcNode, const BfTypedValue& targe
 {
 	auto invokeMethodInstance = GetDelegateInvokeMethod(toType->ToTypeInstance());
 
+	auto _ThisTypeAccepts = [&](BfType* methodThisType, BfType* invokeThisType)
+	{
+		// Value types keep their own layout and an interface method has no body to bind, so both need an exact match
+		if ((methodThisType->IsValueType()) || (invokeThisType->IsValueType()) || (methodThisType->IsInterface()))
+			return methodThisType == invokeThisType;
+		return TypeIsSubTypeOf(invokeThisType->ToTypeInstance(), methodThisType->ToTypeInstance());
+	};
+
 	bool methodsThisMatch = true;
 	if (invokeMethodInstance->mMethodDef->mIsStatic != methodInstance->mMethodDef->mIsStatic)
 		methodsThisMatch = false;
@@ -13417,7 +13692,7 @@ BfIRValue BfModule::CastToFunction(BfAstNode* srcNode, const BfTypedValue& targe
 			BfType* invokeThisType = invokeMethodInstance->GetThisType();
 			if (invokeThisType->IsPointer())
 				invokeThisType = invokeThisType->GetUnderlyingType();
-			if (!TypeIsSubTypeOf(thisType->ToTypeInstance(), invokeThisType->ToTypeInstance()))
+			if (!_ThisTypeAccepts(thisType, invokeThisType))
 				methodsThisMatch = false;
 		}
 	}
@@ -13488,7 +13763,7 @@ BfIRValue BfModule::CastToFunction(BfAstNode* srcNode, const BfTypedValue& targe
 						invokeThisWasPtr = true;
 					}
 
-					if (TypeIsSubTypeOf(thisType->ToTypeInstance(), invokeThisType->ToTypeInstance()))
+					if (_ThisTypeAccepts(thisType, invokeThisType))
 					{
 						if (invokeThisWasPtr != thisWasPtr)
 						{
@@ -13498,6 +13773,16 @@ BfIRValue BfModule::CastToFunction(BfAstNode* srcNode, const BfTypedValue& targe
 								Fail(StrFormat("Non-static method '%s' cannot match '%s', consider adding 'mut' specifier to '%s this' in the function parameters", MethodToString(methodInstance).c_str(), TypeToString(toType).c_str(), TypeToString(thisType).c_str()), srcNode);
 							handled = true;
 						}
+					}
+					else if ((thisType->IsValueType()) || (invokeThisType->IsValueType()))
+					{
+						Fail(StrFormat("Non-static method '%s' cannot match '%s', a value type 'this' must be exactly '%s'", MethodToString(methodInstance).c_str(), TypeToString(toType).c_str(), TypeToString(thisType).c_str()), srcNode);
+						handled = true;
+					}
+					else if (TypeIsSubTypeOf(thisType->ToTypeInstance(), invokeThisType->ToTypeInstance()))
+					{
+						Fail(StrFormat("Non-static method '%s' cannot match '%s' because a '%s' passed as 'this' is not necessarily a '%s'", MethodToString(methodInstance).c_str(), TypeToString(toType).c_str(), TypeToString(invokeThisType).c_str(), TypeToString(thisType).c_str()), srcNode);
+						handled = true;
 					}
 				}
 			}
@@ -14367,7 +14652,7 @@ BfIRValue BfModule::CastToValue(BfAstNode* srcNode, BfTypedValue typedVal, BfTyp
 						return BfIRValue();
 
 					auto fakeVal = GetFakeTypedValue(bfType);
-					auto val = CastToValue(srcNode, fakeVal, toType, castFlags);
+					auto val = mContext->mUnreifiedModule->CastToValue(srcNode, fakeVal, toType, castFlags);
 					if (val)
 						return mBfIRBuilder->GetUndefConstValue(mBfIRBuilder->MapType(toType));
 				}
@@ -14589,6 +14874,12 @@ BfIRValue BfModule::CastToValue(BfAstNode* srcNode, BfTypedValue typedVal, BfTyp
 				BfStringPoolEntry* entry = NULL;
 				if ((isNull) || (mContext->mStringObjectIdMap.TryGetValue(stringId, &entry)))
 				{
+					// 'entry' points straight into mStringObjectIdMap's entry storage. The PopulateType
+					//  calls below can intern new string literals, and that insert can reallocate the
+					//  entry array (or hand this slot to another string off the free list), so read the
+					//  length we need out now, while the pointer is still valid
+					if (entry != NULL)
+						strLen = (int)entry->mString.mLength;
 					auto svTypeInst = toType->ToTypeInstance();
 					
 					PopulateType(svTypeInst);
@@ -14610,7 +14901,7 @@ BfIRValue BfModule::CastToValue(BfAstNode* srcNode, BfTypedValue typedVal, BfTyp
 						{
 							auto stringCharPtr = GetStringCharPtr(stringId);
 							spanFieldVals.Add(stringCharPtr);
-							spanFieldVals.Add(mBfIRBuilder->CreateConst(BfTypeCode_IntPtr, entry->mString.mLength));
+							spanFieldVals.Add(mBfIRBuilder->CreateConst(BfTypeCode_IntPtr, strLen));
 						}
 
 						SizedArray<BfIRValue, 2> svFieldVals;
@@ -14656,8 +14947,16 @@ BfIRValue BfModule::CastToValue(BfAstNode* srcNode, BfTypedValue typedVal, BfTyp
 		}
 	}
 
+	bool wantUserConversion = (((castFlags & BfCastFlags_NoConversionOperator) == 0) && (toType != mContext->mBfObjectType));
+
+	if ((wantUserConversion) && (typedVal.mType->IsPrimitiveType()) && (toType->IsPrimitiveType()))
+	{
+		// Disallow primitive-to-primitive casts
+		wantUserConversion = false;
+	}
+
 	// Check user-defined operators
-	if (((castFlags & BfCastFlags_NoConversionOperator) == 0) && (toType != mContext->mBfObjectType))
+	if (wantUserConversion)
 	{
 		BfType* walkFromType = typedVal.mType;
 		if (walkFromType->IsWrappableType())
@@ -15360,8 +15659,20 @@ BfTypedValue BfModule::Cast(BfAstNode* srcNode, const BfTypedValue& typedVal, Bf
 							nameMatches = fromParamName == toParamName;
 					}
 
+					bool typeMatches = fromMethodInst->GetParamType(paramIdx) == toMethodInst->GetParamType(paramIdx);
+					if ((!typeMatches) && (paramIdx == 0) && (fromMethodInst->HasExplicitThis()))
+					{
+						// Calling through the new type passes a 'this' of its type, which the function accepts when that derives from
+						//  its own 'this' type. This matches what CastToFunction allows when binding a method. Value types keep exact
+						//  matches, as their layouts differ
+						auto fromThisType = fromMethodInst->GetParamType(paramIdx);
+						auto toThisType = toMethodInst->GetParamType(paramIdx);
+						if ((fromThisType->IsObjectOrInterface()) && (toThisType->IsObjectOrInterface()))
+							typeMatches = TypeIsSubTypeOf(toThisType->ToTypeInstance(), fromThisType->ToTypeInstance());
+					}
+
 					if ((fromMethodInst->GetParamKind(paramIdx) == toMethodInst->GetParamKind(paramIdx)) &&
-						(fromMethodInst->GetParamType(paramIdx) == toMethodInst->GetParamType(paramIdx)) &&
+						(typeMatches) &&
 						(nameMatches))
 					{
 						// Matched, required for implicit/explicit
@@ -15601,7 +15912,7 @@ bool BfModule::TypeIsSubTypeOf(BfTypeInstance* srcType, BfTypeInstance* wantType
 
 	if (wantType->IsInterface())
 	{
-		if (wantType->mDefineState < BfTypeDefineState_HasInterfaces_All)
+		if (srcType->mDefineState < BfTypeDefineState_HasInterfaces_All)
 			PopulateType(srcType, BfPopulateType_Interfaces_All);
 
 		BfTypeDef* checkActiveTypeDef = NULL;

@@ -35,6 +35,23 @@ namespace Beefy.widgets
     {
         public Scrollbar mHorzScrollbar;
         public Scrollbar mVertScrollbar;
+
+        public override void Describe(Beefy.utils.StructuredData data)
+        {
+            base.Describe(data);
+            if (mVertScrollbar != null)
+            {
+                data.Add("scrollY", (int)mVertScrollbar.mContentPos);
+                data.Add("scrollHeight", (int)mVertScrollbar.mContentSize);
+                data.Add("pageHeight", (int)mVertScrollbar.mPageSize);
+            }
+            if (mHorzScrollbar != null)
+            {
+                data.Add("scrollX", (int)mHorzScrollbar.mContentPos);
+                data.Add("scrollWidth", (int)mHorzScrollbar.mContentSize);
+                data.Add("pageWidth", (int)mHorzScrollbar.mPageSize);
+            }
+        }
         public Insets mScrollbarInsets = new Insets() ~ delete _;
         public ScrollContentContainer mScrollContentContainer;
         public Widget mScrollContent;
@@ -270,12 +287,16 @@ namespace Beefy.widgets
         {
             base.MouseWheel(x, y, deltaX, deltaY);
 
+			// Shift is the conventional 'treat the wheel as horizontal' modifier, but only for devices with
+			//  no horizontal axis of their own - an explicit deltaX already means horizontal
+			bool wantHorz = (deltaX == 0) && (mWidgetWindow != null) && (mWidgetWindow.IsKeyDown(.Shift));
+
 			if (deltaY != 0)
 			{
-	            if (mVertScrollbar != null)
+	            if ((mVertScrollbar != null) && (!wantHorz))
 	                mVertScrollbar.MouseWheel(x, y, 0, deltaY);
 	            else if (mHorzScrollbar != null)
-	                mHorzScrollbar.MouseWheel(x, y, deltaY, 0);
+	                mHorzScrollbar.MouseWheel(x, y, -deltaY, 0);
 			}
 			if (deltaX != 0)
 			{

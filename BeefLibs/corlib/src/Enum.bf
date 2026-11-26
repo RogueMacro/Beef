@@ -19,7 +19,7 @@ namespace System
 
 		[NoShow(true)]
 		[Comptime(ConstEval=true)]
-		public static int GetCount<T>() where T : Enum
+		public static int GetCount<T>() where T : enum
 		{
 			return GetCount(typeof(T));
 		}
@@ -40,7 +40,7 @@ namespace System
 
 		[NoShow(true)]
 		[Comptime(ConstEval=true)]
-		public static var GetMinValue<T>() where T : Enum
+		public static var GetMinValue<T>() where T : enum
 		{
 			Compiler.SetReturnType(typeof(T));
 			return GetMinValue(typeof(T));
@@ -62,7 +62,7 @@ namespace System
 
 		[NoShow(true)]
 		[Comptime(ConstEval=true)]
-		public static var GetMaxValue<T>() where T : Enum
+		public static var GetMaxValue<T>() where T : enum
 		{
 			Compiler.SetReturnType(typeof(T));
 			return GetMaxValue(typeof(T));
@@ -120,8 +120,7 @@ namespace System
 		}
 
 		[NoShow(true)]
-		public static bool IsDefined<T>(T value) where T : Enum
-			where T : enum
+		public static bool IsDefined<T>(T value) where T : enum
 		{
 			for (var data in GetValues<T>())
 			{
@@ -169,6 +168,23 @@ namespace System
 			where TEnum : enum
 		{
 		    return .();
+		}
+
+		[NoShow(true)]
+		[Comptime(ConstEval=true)]
+		public static bool HasPayload<T>() where T : enum
+		{
+			for (var fieldInfo in typeof(T).GetFields())
+			{
+				if (!fieldInfo.IsEnumCase)
+					continue;
+				if (var fieldTypeInst = fieldInfo.FieldType as TypeInstance)
+				{
+					if ((fieldTypeInst.IsTuple) && (fieldTypeInst.FieldCount > 0))
+						return true;
+				}
+			}
+			return false;
 		}
 
 		[NoShow(true)]

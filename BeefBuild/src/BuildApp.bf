@@ -26,6 +26,7 @@ namespace BeefBuild
 		public bool mHandledVerb;
 		public String mRunArgs ~ delete _;
 		public String mStartingDirectory = new .() ~ delete _;
+		public String mTargetProject ~ delete _;
 		MainVerbState mMainVerbState;
 
 		/*void Test()
@@ -83,6 +84,7 @@ namespace BeefBuild
 				Fail("Platform not specified");
 
 			base.Init();
+			InitUserDataDir();
 
 			mSettings.Load();
 			mSettings.Apply();
@@ -281,6 +283,9 @@ namespace BeefBuild
 				case "-config":
 					mConfigName.Set(value);
 					return true;
+				case "-project":
+					String.NewOrSet!(mTargetProject, value);
+					return true;
 				case "-platform":
 					mPlatformName.Set(value);
 					return true;
@@ -328,6 +333,9 @@ namespace BeefBuild
 
 						return true;
 					}
+				case "-define":
+					mExtraWorkspacePreprocessorMacros.Add(new .(value));
+					return true;
 				}
 			}
 
@@ -403,6 +411,11 @@ namespace BeefBuild
 				mFailed = true;
 		}
 
+		protected virtual bool HandleWorkspaceCommand(Project targetProject)
+		{
+			return false;
+		}
+
 		public override void Update(bool batchStart)
 		{
 			base.Update(batchStart);
@@ -415,17 +428,41 @@ namespace BeefBuild
 			{
 				if ((!mFailed) && (!mHandledVerb))
 				{
+					Project targetProject = null;
+					if (mTargetProject != null)
+					{
+						targetProject = mWorkspace.FindProject(mTargetProject);
+						if (targetProject == null)
+						{
+							Fail(scope $"Failed to locate target project '{mTargetProject}'");
+							return;
+						}
+					}
+
 					mHandledVerb = true;
+					if (HandleWorkspaceCommand(targetProject))
+					{
+						Stop();
+						return;
+					}
 					if (mIsTest)
 					{
-						RunTests(mTestIncludeIgnored, false);
+						DoRunTests(mTestIncludeIgnored, false, targetProject);
 					}
 					else if (mVerb == .Update)
 					{
 						// No-op here
 					}
 					else if (mVerb != .New)
-						Compile(.Normal, null);
+					{
+						bool compileStarted;
+						if (targetProject != null)
+							compileStarted = Compile(.NormalTargeted(new .(targetProject.mProjectName)), null);
+						else
+							compileStarted = Compile(.Normal, null);
+						if (!compileStarted)
+							mFailed = true;
+					}
 				}
 
 				if (mCompilingBeef)

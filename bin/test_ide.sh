@@ -1,0 +1,232 @@
+#!/bin/bash
+# Runs under a headless weston by default (needs weston and a GPU render node); --display xvfb uses xvfb-run.
+# Without a GPU render node (CI runners, Xvfb) Mesa renders with llvmpipe, which loads the system LLVM into the
+# IDE process and can crash when that differs from the IDE's LLVM. GALLIUM_DRIVER=softpipe avoids the crash.
+# LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=softpipe reproduces those software GL conditions on a machine with a GPU.
+echo Starting test_ide.sh
+
+SCRIPTPATH=$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+ROOTPATH="$(dirname "$SCRIPTPATH")"
+TEST_TIMEOUT=${TEST_TIMEOUT:-180s}
+DISPLAY_MODE=weston
+BINARIES=(BeefIDE_d BeefIDE)
+
+set -e
+
+while [[ $# -gt 0 ]]
+do
+	case $1 in
+		fast)
+			echo "Performing fast test (Debug only)"
+			BINARIES=(BeefIDE_d)
+			;;
+		--display)
+			DISPLAY_MODE=$2
+			shift
+			;;
+		*)
+			echo "Usage: $0 [fast] [--display xvfb|weston]" >&2
+			exit 1
+			;;
+	esac
+	shift
+done
+
+fail() {
+	if [[ $1 == 124 || $1 == 137 ]]; then
+		echo "Timed out after $TEST_TIMEOUT"
+	fi
+	echo "#### FAILED ####"
+	exit "$1"
+}
+
+if [[ $DISPLAY_MODE == "xvfb" ]]; then
+	if ! command -v xvfb-run >/dev/null; then
+		echo "ERROR: xvfb-run not found, install xvfb or use --display weston" >&2
+		exit 1
+	fi
+	LAUNCHER=(timeout --kill-after=10s "$TEST_TIMEOUT" xvfb-run -a)
+	# SDL3 prefers Wayland, so an inherited WAYLAND_DISPLAY would bypass Xvfb and open windows on the desktop.
+	unset WAYLAND_DISPLAY
+	export SDL_VIDEO_DRIVER=x11
+elif [[ $DISPLAY_MODE == "weston" ]]; then
+	LAUNCHER=(timeout --kill-after=10s "$TEST_TIMEOUT")
+	if ! command -v weston >/dev/null; then
+		echo "ERROR: weston not found, install weston or use --display xvfb" >&2
+		exit 1
+	fi
+	if [ -z "$XDG_RUNTIME_DIR" ]; then
+		echo "ERROR: XDG_RUNTIME_DIR must be set to run weston" >&2
+		exit 1
+	fi
+	RENDERER=--renderer=gl
+	if ! weston --help 2>&1 | grep -q -- --renderer; then
+		RENDERER=--use-gl
+	fi
+	WESTON_SOCKET=beef-test-ide-$$
+	WESTON_LOG=${TMPDIR:-/tmp}/$WESTON_SOCKET.log
+	echo "Starting weston on $WESTON_SOCKET, logging to $WESTON_LOG"
+	weston --backend=headless $RENDERER --socket=$WESTON_SOCKET --width=1920 --height=1080 --idle-time=0 >"$WESTON_LOG" 2>&1 &
+	WESTON_PID=$!
+	trap 'kill $WESTON_PID 2>/dev/null; wait $WESTON_PID 2>/dev/null' EXIT
+	trap 'exit 1' INT TERM
+	for i in {1..100}
+	do
+		[ -S "$XDG_RUNTIME_DIR/$WESTON_SOCKET" ] && break
+		if [[ $i == 100 ]] || ! kill -0 $WESTON_PID 2>/dev/null; then
+			echo "ERROR: weston failed to create $XDG_RUNTIME_DIR/$WESTON_SOCKET within 10s, see $WESTON_LOG" >&2
+			exit 1
+		fi
+		sleep 0.1
+	done
+	# Keep the IDE and the programs it debugs off the caller's X server.
+	unset DISPLAY
+	export WAYLAND_DISPLAY=$WESTON_SOCKET
+	export SDL_VIDEO_DRIVER=wayland
+else
+	echo "Unknown display '$DISPLAY_MODE', expected xvfb or weston" >&2
+	exit 1
+fi
+
+cd "$ROOTPATH/IDE/dist"
+
+# One run gives the whole baseline, so a run that fails or disagrees does not stop the others
+if [ -n "$BEEF_DBG_SHADOW_ALL" ]
+then
+	SHADOW_ALL_DIR=${BEEF_DBG_SHADOW_ALL_DIR:-${TMPDIR:-/tmp}/beef-dbg-shadow-all}
+	rm -rf "$SHADOW_ALL_DIR/reports" "$SHADOW_ALL_DIR/exits.txt"
+	mkdir -p "$SHADOW_ALL_DIR/reports"
+	for script in "$ROOTPATH"/IDE/Tests/Test1/scripts/*.txt
+	do
+		name=$(basename "$script" .txt)
+		for ide in "${BINARIES[@]}"
+		do
+			echo "Testing IDE/Tests/Test1/scripts/$name.txt in $ide with BEEF_DBG_SHADOW"
+			report="$SHADOW_ALL_DIR/reports/$name@$ide.txt"
+			exitCode=0
+			BEEF_DBG_SHADOW=1 BEEF_DBG_SHADOW_REPORT="$report" "${LAUNCHER[@]}" "./$ide" -proddir="$ROOTPATH/IDE/Tests/Test1" -test="$script" || exitCode=$?
+			touch "$report"
+			echo "$name@$ide $exitCode" >> "$SHADOW_ALL_DIR/exits.txt"
+		done
+	done
+	awk '
+		FNR == 1 { run = FILENAME; sub(/.*\//, "", run); sub(/\.txt$/, "", run) }
+		/^DBGSHADOW query / {
+			split($4, q, "="); split($5, m, "="); split($6, src, "=")
+			queries[$3] += q[2]; mismatches[$3] += m[2]; source[$3] = src[2]
+			if (m[2] > 0) runs[$3] = runs[$3] " " run
+			next
+		}
+		/^DBGSHADOW breakpoint-extra:/ { extra["breakpoint"]++; next }
+		/^DBGSHADOW unsupported / {
+			split($4, c, "="); unsupported[$3] += c[2]; unsupportedRuns[$3] = unsupportedRuns[$3] " " run
+			next
+		}
+		/^DBGSHADOW [a-z_]+: / {
+			key = $2; sub(/:$/, "", key)
+			if (!(key in first)) first[key] = run ": " $0
+			next
+		}
+		END {
+			for (key in queries) {
+				printf "query %s source=%s queries=%d mismatches=%d extra=%d runs=%s\n", key, source[key], queries[key], mismatches[key], extra[key] + 0, runs[key]
+				totalMismatches += mismatches[key]
+			}
+			for (key in unsupported) {
+				printf "unsupported %s count=%d runs=%s\n", key, unsupported[key], unsupportedRuns[key]
+				totalUnsupported += unsupported[key]
+			}
+			for (key in first)
+				printf "first %s %s\n", key, first[key]
+			printf "total mismatches=%d unsupported=%d\n", totalMismatches, totalUnsupported
+		}' "$SHADOW_ALL_DIR"/reports/*.txt | sort > "$SHADOW_ALL_DIR/shadow-all.txt"
+	awk '$2 != 0 { print "exit " $1 " " $2 }' "$SHADOW_ALL_DIR/exits.txt" >> "$SHADOW_ALL_DIR/shadow-all.txt"
+	cat "$SHADOW_ALL_DIR/shadow-all.txt"
+	if grep -q "^total mismatches=0 unsupported=0$" "$SHADOW_ALL_DIR/shadow-all.txt" && ! grep -q "^exit " "$SHADOW_ALL_DIR/shadow-all.txt"
+	then
+		echo "SUCCESS!"
+		exit 0
+	fi
+	echo "#### FAILED ####"
+	exit 1
+fi
+
+test_workspace() {
+	for script in "$ROOTPATH/$1"/scripts/*.txt
+	do
+		for ide in "${BINARIES[@]}"
+		do
+			echo "Testing $1/scripts/$(basename "$script") in $ide"
+			"${LAUNCHER[@]}" "./$ide" -proddir="$ROOTPATH/$1" -test="$script" || fail $?
+		done
+	done
+}
+
+# Left out: BugW002 (Windows registry API), DebuggerTests (not in the repo), BugW005 (StepOver across a call between hot-loaded methods loses the frame on Linux).
+for testpath in CompileFail001 Test1 SlotTest MemoryBreakTest BugW001 BugW003 BugW004 BugW006 BugW007 BugW008 BugW009 BugW010 IndentTest TestDynCrt1
+do
+	test_workspace IDE/Tests/$testpath
+done
+
+for script in NewProject01 NewProject02
+do
+	for ide in "${BINARIES[@]}"
+	do
+		echo "Testing IDE/Tests/EmptyTest/scripts/$script.txt in $ide"
+		"${LAUNCHER[@]}" "./$ide" -test="$ROOTPATH/IDE/Tests/EmptyTest/scripts/$script.txt" || fail $?
+	done
+done
+
+for ide in "${BINARIES[@]}"
+do
+	echo "Testing IDE/Tests/Test1/faults/HotSwap_WriteFailure.txt in $ide"
+	BEEF_LLDB_HOT_FAIL_WRITE=1 "${LAUNCHER[@]}" "./$ide" -proddir="$ROOTPATH/IDE/Tests/Test1" -test="$ROOTPATH/IDE/Tests/Test1/faults/HotSwap_WriteFailure.txt" || fail $?
+	echo "Testing IDE/Tests/Test1/faults/HotSwap_RepatchFailure.txt in $ide"
+	BEEF_LLDB_HOT_FAIL_WRITE=13 BEEF_LLDB_HOT_FAIL_LOAD=2 "${LAUNCHER[@]}" "./$ide" -proddir="$ROOTPATH/IDE/Tests/Test1" -test="$ROOTPATH/IDE/Tests/Test1/faults/HotSwap_RepatchFailure.txt" || fail $?
+	echo "Testing IDE/Tests/Test1/faults/HotSwap_UndoFailure.txt in $ide"
+	BEEF_LLDB_HOT_FAIL_WRITE=1 BEEF_LLDB_HOT_FAIL_UNDO=1 "${LAUNCHER[@]}" "./$ide" -proddir="$ROOTPATH/IDE/Tests/Test1" -test="$ROOTPATH/IDE/Tests/Test1/faults/HotSwap_UndoFailure.txt" || fail $?
+done
+
+# Attach: the program is started here and the IDE attaches to it by pid; it must survive the detach.
+./BeefBuild_d -proddir="$ROOTPATH/IDE/Tests/AttachTest" -config=Debug >/dev/null || fail $?
+for ide in "${BINARIES[@]}"
+do
+	echo "Testing IDE/Tests/AttachTest/scripts/Attach.txt in $ide"
+	"$ROOTPATH/IDE/Tests/AttachTest/build/Debug_Linux64/AttachTest/AttachTest" >/dev/null &
+	ATTACH_PID=$!
+	"${LAUNCHER[@]}" "./$ide" -proddir="$ROOTPATH/IDE/Tests/AttachTest" -attachId=$ATTACH_PID -test="$ROOTPATH/IDE/Tests/AttachTest/scripts/Attach.txt"
+	IDE_EXIT=$?
+	if kill -0 $ATTACH_PID 2>/dev/null; then
+		kill $ATTACH_PID
+	else
+		echo "ERROR: AttachTest did not survive the detach"
+		IDE_EXIT=1
+	fi
+	wait $ATTACH_PID 2>/dev/null || true
+	[ $IDE_EXIT -eq 0 ] || fail $IDE_EXIT
+done
+
+# Fails on any disagreement with LLDB or unsupported host call
+SHADOW_REPORT=${TMPDIR:-/tmp}/beef-dbg-shadow-$$.txt
+for script in Inline Mixins Stepping_Scope Breakpoints Splats Splats02 Splats03 Multithread02 Data01 Globals
+do
+	for ide in "${BINARIES[@]}"
+	do
+		echo "Testing IDE/Tests/Test1/scripts/$script.txt in $ide with BEEF_DBG_SHADOW"
+		rm -f "$SHADOW_REPORT"
+		BEEF_DBG_SHADOW=1 BEEF_DBG_SHADOW_REPORT="$SHADOW_REPORT" "${LAUNCHER[@]}" "./$ide" -proddir="$ROOTPATH/IDE/Tests/Test1" -test="$ROOTPATH/IDE/Tests/Test1/scripts/$script.txt" || fail $?
+		touch "$SHADOW_REPORT"
+		grep "^DBGSHADOW breakpoint-extra:" "$SHADOW_REPORT" || true
+		if ! awk '/^DBGSHADOW queries=/ { for (i = 2; i <= NF; i++) { split($i, kv, "="); total[kv[1]] += kv[2] } }
+			END { printf "DBGSHADOW queries=%d mismatches=%d extra=%d unsupported=%d\n", total["queries"], total["mismatches"], total["extra"], total["unsupported"]
+				exit !((total["queries"] > 0) && (total["mismatches"] == 0) && (total["unsupported"] == 0)) }' "$SHADOW_REPORT"
+		then
+			grep -v "^DBGSHADOW query " "$SHADOW_REPORT" || true
+			rm -f "$SHADOW_REPORT"
+			fail 1
+		fi
+	done
+done
+rm -f "$SHADOW_REPORT"
+
+echo "SUCCESS!"

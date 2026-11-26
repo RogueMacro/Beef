@@ -26,6 +26,7 @@ namespace Beefy.widgets
         public Event<MouseLeftWindowHandler> mOnMouseLeftWindow ~ _.Dispose();
         public Event<WindowGotFocusHandler> mOnWindowGotFocus ~ _.Dispose();
 		public Event<WindowLostFocusHandler> mOnWindowLostFocus ~ _.Dispose();
+		public Event<delegate void(BFWindow window)> mOnRelativeMouseModeAborted ~ _.Dispose();
         public Event<MouseEventHandler> mOnMouseDown ~ _.Dispose();
 		public Event<MouseEventHandler> mOnMouseUp ~ _.Dispose();
         public Event<WindowCloseQueryHandler> mOnWindowCloseQuery ~ _.Dispose();
@@ -68,6 +69,8 @@ namespace Beefy.widgets
         public bool mIsKeyDownHandled;
 		public bool mWantsUpdateF;
 		public bool mTempWantsUpdateF;
+		public bool mDrawWhenHidden;
+		public bool mForceDraw = true;
 
 		public Image mContentRenderTarget ~ delete _;
         public int32 mContentClientWidth;
@@ -121,6 +124,7 @@ namespace Beefy.widgets
 	            mRootWidget.mWidgetWindow = this;
 	            mRootWidget.InitChildren();
 	            mRootWidget.AddedToParent();
+				mRootWidget.AddedToWindow();
 				RehupSize();
 			}
         }
@@ -163,8 +167,13 @@ namespace Beefy.widgets
          	if (mRootWidget == null)
 				 return;
 			
-            base.Draw(g);			
-            mRootWidget.DrawAll(g);            
+            base.Draw(g);
+
+			if ((mDrawWhenHidden) || (mForceDraw) || (mShowKind.IsVisible))
+			{
+				mForceDraw = false;
+            	mRootWidget.DrawAll(g);
+			}
         }
 
         public override void Update()
@@ -184,7 +193,7 @@ namespace Beefy.widgets
 		{
 			if (mRootWidget == null)
 				return;
-			base.Update();
+			base.UpdateF(updatePct);
 			if (mWantsUpdateF || mTempWantsUpdateF)
 				mRootWidget.UpdateFAll(updatePct);
 		}
@@ -305,6 +314,7 @@ namespace Beefy.widgets
 
             mOnWindowMoved(this);
             sOnWindowMoved(this);
+			mForceDraw = true;
         }
 
         public void SetFocus(Widget widget)
@@ -334,9 +344,8 @@ namespace Beefy.widgets
         
         public override void GotFocus()
         {
-			if (mHasFocus)
+			if (mPhysHasFocus)
 				return;
-			mIsDirty = true;
 
 			//Debug.WriteLine("GotFocus {0}", mIsMainWindow);
 
@@ -344,7 +353,7 @@ namespace Beefy.widgets
 			{
 			    // Don't let more than one window think it has the focus
 			    var widgetWindow = window as WidgetWindow;
-			    if ((widgetWindow != null) && (widgetWindow != this) && (widgetWindow.mHasFocus))
+			    if ((widgetWindow != null) && (widgetWindow != this) && (widgetWindow.mPhysHasFocus))
 				{
 			        widgetWindow.LostFocus(this);
 					break;
@@ -352,8 +361,13 @@ namespace Beefy.widgets
 			}
 
             //Debug.WriteLine("GotFocus {0} {1}", mTitle, mIsMainWindow);
-            base.GotFocus();                        
-            
+            base.GotFocus();
+        }
+
+		protected override void FocusGained()
+		{
+			mIsDirty = true;
+
             if (mFocusWidget != null)
 			{
 				//Debug.Assert(!mFocusWidget.mHasFocus);
@@ -364,14 +378,8 @@ namespace Beefy.widgets
 			mOnWindowGotFocus(this);
         }
 
-        public override void LostFocus(BFWindow newFocus)
-        {
-			//Debug.WriteLine("LostFocus {0}", mIsMainWindow);
-
-			if (!mHasFocus)
-				return;
-
-
+		protected override void FocusLost(BFWindow newFocus)
+		{
 			mIsDirty = true;
             for (int32 i = 0; i < (int32)mIsKeyDown.Count; i++)
                 if (mIsKeyDown[i])
@@ -386,8 +394,6 @@ namespace Beefy.widgets
                     MouseUp(mClientMouseX, mClientMouseY, btnIdx);
                 }
             }*/
-
-            base.LostFocus(newFocus);            
 
             if (mCaptureWidget != null)
                 mCaptureWidget = null;
@@ -428,14 +434,16 @@ namespace Beefy.widgets
 
 		BFWindow GetFakeFocusWindow()
 		{
-			/*for (int windowIdx = BFApp.sApp.mWindows.Count - 1; windowIdx >= 0; windowIdx--)
+#if !BF_PLATFORM_WINDOWS
+			for (int windowIdx = BFApp.sApp.mWindows.Count - 1; windowIdx >= 0; windowIdx--)
 			{
 				var checkWindow = BFApp.sApp.mWindows[windowIdx];
 				if (checkWindow == this)
 					return null;
 				if ((checkWindow.mWindowFlags.HasFlag(.FakeFocus)) && (checkWindow.mHasFocus))
 					return checkWindow;
-			}*/
+			}
+#endif
 			return null;
 		}
 
@@ -470,7 +478,7 @@ namespace Beefy.widgets
 				e.mSender = mFocusWidget;
 				mFocusWidget.KeyDown(e);
 			}
-			if (e.mHandled)
+			if ((e.mHandled) && (!e.mKeepChar))
 				mIsKeyDownHandled = true;
 
             return e.mHandled;
@@ -686,8 +694,58 @@ namespace Beefy.widgets
             outY = pt.y;
         }
 
+        // Relative mode has no meaningful screen/client position (the cursor is hidden and clipped in
+        // place, not actually at inX/inY) -- everything routes to mFocusWidget with 0,0 instead of the
+        // normal mCaptureWidget/mOverWidget hit-test routing, and MouseMove/RehupMouse are skipped
+        // entirely rather than being fed a position that would just be wrong.
+        public override void MouseDelta(int32 dx, int32 dy)
+        {
+            mFocusWidget?.MouseDelta(dx, dy);
+        }
+
+		// The pinned cursor is over nothing, so what it rested on drops its hover and tooltip. The next MouseMove
+		// after relative mode ends puts the mouse back inside.
+		public override void StartRelativeMouseMode()
+		{
+			base.StartRelativeMouseMode();
+			if ((mHasMouseInside) && (IsInRelativeMouseMode()))
+				MouseLeave();
+		}
+
+        public override void RelativeMouseModeAborted()
+        {
+            mOnRelativeMouseModeAborted(this);
+        }
+
         public override void MouseDown(int32 inX, int32 inY, int32 btn, int32 btnCount)
         {
+            if (IsInRelativeMouseMode())
+            {
+                if (mMouseFlags == 0)
+                    mMouseDownKeyFlags = GetKeyFlags(true);
+                mMouseFlags |= (MouseFlag)(1 << btn);
+                if ((!mHasFocus) && (mParent == null))
+                    GotFocus();
+
+                if ((mOnMouseDown.HasListeners) || (sOnMouseDown.HasListeners))
+                {
+                    MouseEvent anEvent = scope MouseEvent();
+                    anEvent.mSender = this;
+                    anEvent.mBtn = btn;
+                    anEvent.mBtnCount = btnCount;
+                    mOnMouseDown(anEvent);
+                    sOnMouseDown(anEvent);
+                    if (anEvent.mHandled)
+                        return;
+                }
+
+                if (btn >= 3) // X button - don't pass on to widgets
+                    return;
+
+                mFocusWidget?.MouseDown(0, 0, btn, btnCount);
+                return;
+            }
+
 			let oldFlags = mMouseFlags;
 
 			if (mMouseFlags == 0)
@@ -747,6 +805,28 @@ namespace Beefy.widgets
 
             if (((int32)mMouseFlags & (1 << btn)) == 0)
                 return;
+
+            if (IsInRelativeMouseMode())
+            {
+                mMouseFlags &= (MouseFlag)(~(1 << btn));
+
+                if (mOnMouseUp.HasListeners)
+                {
+                    MouseEvent anEvent = scope MouseEvent();
+                    anEvent.mSender = this;
+                    anEvent.mBtn = btn;
+                    mOnMouseUp(anEvent);
+                    if (anEvent.mHandled)
+                        return;
+                }
+
+                if (btn < 3) // X button - don't pass on to widgets
+                    mFocusWidget?.MouseUp(0, 0, btn);
+
+                if (mMouseFlags == 0)
+                    mMouseDownKeyFlags = 0;
+                return;
+            }
 
 			MouseMove(inX, inY);
             mMouseFlags &= (MouseFlag)(~(1 << btn));

@@ -1,4 +1,5 @@
 using System;
+using System.Interop;
 using System.Collections;
 using System.Text;
 using System.IO;
@@ -45,23 +46,17 @@ namespace Beefy.gfx
 			case Outline(float thickness, uint32 color);
 		}
 
-		public class EffectCharData
-		{
-			public Font.CharData mSrcCharData;
-			public Font.CharData mEffectCharData ~ delete _;
-		}
-
+		// One font's effect glyphs, keyed by the source glyph. Dropped when the font frees its glyphs (Forget): a glyph
+		// allocated later at a freed glyph's address would otherwise find another character's effect image.
 		public class FontEntry
 		{
-			public Font mFont;
 			public ImageAtlas mAtlas = new ImageAtlas() ~ delete _;
-			public List<EffectCharData> mCharData = new .() ~ delete _;
+			public Dictionary<Font.CharData, Font.CharData> mCharData = new .() ~ DeleteDictionaryAndValues!(_);
 		}
 
 		public Kind mKind;
 		public String mEffectOptions = new .() ~ delete _;
 		public Dictionary<Font, FontEntry> mFontEntries = new .() ~ DeleteDictionaryAndValues!(_);
-		public Dictionary<Font.CharData, EffectCharData> mCharData = new .() ~ DeleteDictionaryAndValues!(_);
 
 		public this(Kind kind)
 		{
@@ -81,33 +76,28 @@ namespace Beefy.gfx
 
 		public ~this()
 		{
-
+			for (var font in mFontEntries.Keys)
+				font.[Friend]mEffectUsers.Remove(this);
 		}
 
 		public Font.CharData Apply(Font font, Font.CharData charData)
 		{
-			EffectCharData effectCharData = null;
-			if (mCharData.TryAdd(charData, ?, var effectCharDataPtr))
-			{
-				effectCharData = new EffectCharData();
-				*effectCharDataPtr = effectCharData;
-
-				effectCharData.mSrcCharData = charData;
-				effectCharData.mEffectCharData = new .(charData);
-			}
-			else
-			{
-				return (*effectCharDataPtr).mEffectCharData;
-			}
-
 			FontEntry fontEntry = null;
 			if (mFontEntries.TryAdd(font, ?, var fontEntryPtr))
 			{
 				fontEntry = new .();
 				*fontEntryPtr = fontEntry;
+				if (font.[Friend]mEffectUsers == null)
+					font.[Friend]mEffectUsers = new .();
+				font.[Friend]mEffectUsers.Add(this);
 			}
 			else
 				fontEntry = *fontEntryPtr;
+
+			if (!fontEntry.mCharData.TryAdd(charData, ?, var effectCharDataPtr))
+				return *effectCharDataPtr;
+			let effectCharData = new Font.CharData(charData);
+			*effectCharDataPtr = effectCharData;
 
 			int32 ofsX = 0;
 			int32 ofsY = 0;
@@ -117,16 +107,20 @@ namespace Beefy.gfx
 				ofsY += (.)Math.Ceiling(thickness) + 2;
 			}
 
-			effectCharData.mEffectCharData.mXOffset -= ofsX;
-			effectCharData.mEffectCharData.mYOffset -= ofsY;
-			var effectImage = fontEntry.mAtlas.Alloc(charData.mImageSegment.mSrcWidth + ofsX * 2, charData.mImageSegment.mSrcHeight + ofsY * 2);
-			effectCharData.mEffectCharData.mImageSegment = effectImage;
-			effectCharData.mSrcCharData.mImageSegment.ApplyEffect(effectImage, mEffectOptions);
+			effectCharData.mXOffset -= ofsX;
+			effectCharData.mYOffset -= ofsY;
+			// Drawn wherever the glyph is, so it needs the glyph's guard (copied into effectCharData above).
+			var effectImage = fontEntry.mAtlas.Alloc(charData.mImageSegment.mSrcWidth + ofsX * 2, charData.mImageSegment.mSrcHeight + ofsY * 2, charData.mGuard);
+			effectCharData.mImageSegment = effectImage;
+			charData.mImageSegment.ApplyEffect(effectImage, mEffectOptions);
+			return effectCharData;
+		}
 
-			/*uint32 color = 0xFFFFFFFF;
-			effectImage.SetBits(0, 0, 1, 1, 1, &color);*/
-
-			return effectCharData.mEffectCharData;
+		// The font is freeing its glyphs (see Font.Dispose).
+		public void Forget(Font font)
+		{
+			if (mFontEntries.GetAndRemove(font) case .Ok(let entry))
+				delete entry.value;
 		}
 
 		public void Prepare(Font font, StringView str)
@@ -148,6 +142,9 @@ namespace Beefy.gfx
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern FTGlyph* FTFont_AllocGlyph(FTFont* ftFont, int32 char8Code, bool allowDefault);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern FTGlyph* FTFont_AllocGlyphGuarded(FTFont* ftFont, int32 char8Code, bool allowDefault, int32 guard);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern int32 FTFont_GetKerning(FTFont* font, int32 char8CodeA, int32 char8CodeB);
@@ -188,6 +185,9 @@ namespace Beefy.gfx
             public int32 mYOffset;
             public int32 mXAdvance;
 			public bool mIsCombiningMark;
+			// The guard requested for mImageSegment and anything made from it (Font.mGlyphGuard). Kept even for an
+			// empty glyph: its effect image still has texels to guard.
+			public int32 mGuard;
 
 			public this()
 			{
@@ -205,6 +205,7 @@ namespace Beefy.gfx
 				mYOffset = copyFrom.mYOffset;
 				mXAdvance = copyFrom.mXAdvance;
 				mIsCombiningMark = copyFrom.mIsCombiningMark;
+				mGuard = copyFrom.mGuard;
 			}
         }
 
@@ -255,9 +256,136 @@ namespace Beefy.gfx
 		float[] mLoKerningTable;
 		//BitmapFont mBMFont ~ delete _; 
 		public StringView mEllipsis = "...";
+		// Empty texels kept around each glyph in its page, so a filtered (scaled or rotated) draw never samples a
+		// neighbour. 1 covers bilinear filtering, except minified draws into a multisampled target, whose edge
+		// pixels sample up to half a pixel outside the quad. Set by Load, before any glyph exists.
+		int32 mGlyphGuard;
 
 		List<FontEffect> mFontEffectStack ~ delete _;
 		DisposeProxy mFontEffectDisposeProxy = new .(new () => { PopFontEffect(); }) ~ delete _;
+		// Effects holding glyphs made from this font's, told when the glyphs go (see FontEffect.Forget).
+		List<FontEffect> mEffectUsers ~ delete _;
+
+#if BF_PLATFORM_MACOS
+
+		// CoreText enumeration in BeefySysLib (platform/darwin/DarwinFonts.cpp)
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BFFont_EnumSystemFonts(function void(char8* family, char8* style, char8* path, int32 isRegular, void* userData) callback, void* userData);
+
+		// Same naming scheme as the fontconfig path: "FAMILY STYLE" for every face, plus "FAMILY" for the regular one
+		static void AddSystemFont(char8* family, char8* style, char8* path, int32 isRegular, void* userData)
+		{
+			let filepath = StringView(path);
+
+			String fontName = scope .(48);
+			fontName.Append(StringView(family));
+			if (style != null)
+			{
+				if (isRegular != 0)
+				{
+					fontName.ToUpper();
+
+					if (sFontNameMap.TryAdd(fontName, let pKey, let pVal))
+					{
+						(*pKey) = new String(fontName);
+						(*pVal) = new String(filepath);
+					}
+				}
+
+				fontName..Append(' ').Append(StringView(style));
+			}
+
+			fontName.ToUpper();
+
+			if (sFontNameMap.TryAdd(fontName, let pKey, let pVal))
+			{
+				(*pKey) = new String(fontName);
+				(*pVal) = new String(filepath);
+			}
+		}
+
+#endif
+
+#if BF_PLATFORM_LINUX
+
+		const String FONTCONFIG_LIB = "libfontconfig.so";
+		static bool IsFontconfigAvailable { get; private set; }
+
+		[AlwaysInclude, StaticInitPriority(100)]
+		private static class FontconfigAllowFail
+		{
+			static this()
+			{
+				SelfOuter.IsFontconfigAvailable = true;
+				Runtime.AddErrorHandler(new (stage, error) => {
+					if (stage == .PreFail)
+					{
+						if (let err = error as Runtime.LoadSharedLibraryError && err.mPath == FONTCONFIG_LIB)
+						{
+							SelfOuter.IsFontconfigAvailable = false;
+							return .Ignore;
+						}
+					}
+					
+					return .ContinueFailure;
+				});
+			}
+		}
+
+		struct FcConfig;
+		struct FcPattern;
+		struct FcObjectSet;
+
+		[CRepr]
+		struct FcFontSet
+		{
+			public c_int nfont;
+			public c_int sfont;
+			public FcPattern** fonts; 
+		}
+
+		enum FcResult : c_int
+		{
+			Match,
+			NoMatch,
+			TypeMismatch,
+			NoId,
+			OutOfMemory
+		}
+
+		const String FC_FAMILY = "family";
+		const String FC_STYLE = "style";
+		const String FC_WEIGHT = "weight";
+		const String FC_SLANT = "slant";
+		const String FC_FILE = "file";
+
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern c_int FcInit();
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern void FcFini();
+
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern FcPattern* FcPatternCreate();
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern void FcPatternDestroy(FcPattern* p);
+
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern FcObjectSet* FcObjectSetBuild(c_char* first, ...);
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern void FcObjectSetDestroy(FcObjectSet* os);
+
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern FcFontSet* FcFontList(FcConfig* config, FcPattern* p, FcObjectSet* os);
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern void FcFontSetDestroy(FcFontSet* fs);
+
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern FcResult FcPatternGetString(FcPattern* p, c_char* object, c_int n, char8** s);
+
+		[CLink, Import(FONTCONFIG_LIB)]
+		static extern FcResult FcPatternGetInteger(FcPattern* p, c_char* object, c_int n, c_int *i);
+
+#endif
 
         public this()
         {
@@ -288,84 +416,158 @@ namespace Beefy.gfx
 
 		static void BuildFontNameCache()
 		{
-#if BF_PLATFORM_WINDOWS
 			using (sMonitor.Enter())
 			{
 				sFontNameMap = new .();
 
-				for (int pass < 2)
-				{
-					Windows.HKey hkey;
+#if BF_PLATFORM_WINDOWS
 
-					if (pass == 0)
+			for (int pass < 2)
+			{
+				Windows.HKey hkey;
+
+				if (pass == 0)
+				{
+					if (Windows.RegOpenKeyExA(Windows.HKEY_LOCAL_MACHINE, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts", 0,
+						Windows.KEY_QUERY_VALUE | Windows.KEY_WOW64_32KEY | Windows.KEY_ENUMERATE_SUB_KEYS, out hkey) != Windows.S_OK)
+						continue;
+				}
+				else
+				{
+					if (Windows.RegOpenKeyExA(Windows.HKEY_CURRENT_USER, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts", 0,
+						Windows.KEY_QUERY_VALUE | Windows.KEY_WOW64_32KEY | Windows.KEY_ENUMERATE_SUB_KEYS, out hkey) != Windows.S_OK)
+						continue;
+				}
+
+				defer Windows.RegCloseKey(hkey);
+
+				for (int32 i = 0; true; i++)
+				{
+					char16[256] fontNameArr;
+					uint32 nameLen = 255;
+					uint32 valType = 0;
+
+					char16[256] data;
+					uint32 dataLen = 256 * 2;
+					int32 result = Windows.RegEnumValueW(hkey, i, &fontNameArr, &nameLen, null, &valType, &data, &dataLen);
+					if (result == 0)
 					{
-						if (Windows.RegOpenKeyExA(Windows.HKEY_LOCAL_MACHINE, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts", 0,
-							Windows.KEY_QUERY_VALUE | Windows.KEY_WOW64_32KEY | Windows.KEY_ENUMERATE_SUB_KEYS, out hkey) != Windows.S_OK)
-							continue;
+						if (valType == 1)
+						{
+							String fontName = scope String(&fontNameArr);
+							int parenPos = fontName.IndexOf(" (");
+							if (parenPos != -1)
+								fontName.RemoveToEnd(parenPos);
+							fontName.ToUpper();
+							String fontPath = scope String(&data);
+							if ((!fontPath.EndsWith(".TTF", .OrdinalIgnoreCase)) && (!fontPath.EndsWith(".TTC", .OrdinalIgnoreCase)))
+								continue;
+
+							if (fontName.Contains('&'))
+							{
+								int collectionIdx = 0;
+								for (var namePart in fontName.Split('&', .RemoveEmptyEntries))
+								{
+									namePart.Trim();
+									if (sFontNameMap.TryAddAlt(namePart, var keyPtr, var valuePtr))
+									{
+										*keyPtr = new String(namePart);
+										*valuePtr = new $"{fontPath}@{collectionIdx}";
+										collectionIdx++;
+									}
+								}
+							}
+							else if (sFontNameMap.TryAdd(fontName, var keyPtr, var valuePtr))
+							{
+								*keyPtr = new String(fontName);
+								*valuePtr = new String(fontPath);
+							}
+						}
 					}
 					else
 					{
-						if (Windows.RegOpenKeyExA(Windows.HKEY_CURRENT_USER, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts", 0,
-							Windows.KEY_QUERY_VALUE | Windows.KEY_WOW64_32KEY | Windows.KEY_ENUMERATE_SUB_KEYS, out hkey) != Windows.S_OK)
+						if (result == Windows.ERROR_MORE_DATA)
 							continue;
-					}
 
-					defer Windows.RegCloseKey(hkey);
-
-					for (int32 i = 0; true; i++)
-					{
-						char16[256] fontNameArr;
-						uint32 nameLen = 255;
-						uint32 valType = 0;
-
-						char16[256] data;
-						uint32 dataLen = 256 * 2;
-						int32 result = Windows.RegEnumValueW(hkey, i, &fontNameArr, &nameLen, null, &valType, &data, &dataLen);
-						if (result == 0)
-						{
-							if (valType == 1)
-							{
-								String fontName = scope String(&fontNameArr);
-								int parenPos = fontName.IndexOf(" (");
-								if (parenPos != -1)
-									fontName.RemoveToEnd(parenPos);
-								fontName.ToUpper();
-								String fontPath = scope String(&data);
-								if ((!fontPath.EndsWith(".TTF", .OrdinalIgnoreCase)) && (!fontPath.EndsWith(".TTC", .OrdinalIgnoreCase)))
-									continue;
-
-								if (fontName.Contains('&'))
-								{
-									int collectionIdx = 0;
-									for (var namePart in fontName.Split('&', .RemoveEmptyEntries))
-									{
-										namePart.Trim();
-										if (sFontNameMap.TryAddAlt(namePart, var keyPtr, var valuePtr))
-										{
-											*keyPtr = new String(namePart);
-											*valuePtr = new $"{fontPath}@{collectionIdx}";
-											collectionIdx++;
-										}
-									}
-								}
-								else if (sFontNameMap.TryAdd(fontName, var keyPtr, var valuePtr))
-								{
-									*keyPtr = new String(fontName);
-									*valuePtr = new String(fontPath);
-								}
-							}
-						}
-						else
-						{
-							if (result == Windows.ERROR_MORE_DATA)
-								continue;
-
-							break;
-						}
+						break;
 					}
 				}
 			}
+#elif BF_PLATFORM_LINUX
+				if (!IsFontconfigAvailable)
+					return;
+
+				if (FcInit() == 0)
+					return;
+
+				defer FcFini();
+
+				let pattern = FcPatternCreate();
+				defer FcPatternDestroy(pattern);
+				let objectset = FcObjectSetBuild(FC_FAMILY, FC_STYLE, FC_WEIGHT, FC_SLANT, FC_FILE, null);
+				defer FcObjectSetDestroy(objectset);
+
+				let fontSet = FcFontList(null, pattern, objectset);
+				if (fontSet == null)
+					return;
+				defer FcFontSetDestroy(fontSet);
+
+				for (let i < fontSet.nfont)
+				{
+					let font = fontSet.fonts[i];
+
+					char8* pFile = null;
+					if (FcPatternGetString(font, FC_FILE, 0, &pFile) != .Match)
+					{
+						continue;
+					}
+
+					char8* pFamily = null;
+					if (FcPatternGetString(font, FC_FAMILY, 0, &pFamily) != .Match)
+					{
+						continue;
+					}
+
+					char8* pStyle = null;
+					FcPatternGetString(font, FC_STYLE, 0, &pStyle);
+					c_int weight = 0;
+					let isRegular = (FcPatternGetInteger(font, FC_WEIGHT, 0, &weight) == .Match) && (weight == 80);
+					c_int slant = 0;
+					let isRoman = (FcPatternGetInteger(font, FC_SLANT, 0, &slant) == .Match) && (slant == 0);
+
+					let filepath = StringView(pFile);
+					let familyName = StringView(pFamily);
+					
+					String fontName = scope .(48);
+					fontName.Append(familyName);
+					if (pStyle != null)
+					{
+						if (isRegular && isRoman)
+						{
+							fontName.ToUpper();
+
+							if (sFontNameMap.TryAdd(fontName, let pKey, let pVal))
+							{
+								(*pKey) = new String(fontName);
+								(*pVal) = new String(filepath);
+							}
+						}
+
+						fontName..Append(' ').Append(pStyle);
+					}	
+
+					fontName.ToUpper();
+
+					if (sFontNameMap.TryAdd(fontName, let pKey, let pVal))
+					{
+						(*pKey) = new String(fontName);
+						(*pVal) = new String(filepath);
+					}
+				}	 
+#elif BF_PLATFORM_MACOS
+				BFFont_EnumSystemFonts(=> AddSystemFont, null);
 #endif
+			}
 		}
 
 		public static void ClearFontNameCache()
@@ -402,6 +604,13 @@ namespace Beefy.gfx
 
 		public void Dispose(bool cacheRetain)
 		{
+			if (mEffectUsers != null)
+			{
+				for (var effect in mEffectUsers)
+					effect.Forget(this);
+				mEffectUsers.Clear();
+			}
+
 			if (mFTFont != null)
 			{
 				FTFont_Delete(mFTFont, cacheRetain);
@@ -454,7 +663,7 @@ namespace Beefy.gfx
 
 		public Result<void> AddAlternate(String path, float pointSize = -1)
 		{
-			Font altFont = Try!(LoadFromFile(path, pointSize));
+			Font altFont = Try!(LoadFromFile(path, pointSize, mGlyphGuard));
 			AltFont altFontEntry;
 			altFontEntry.mFont = altFont;
 			altFontEntry.mOwned = true;
@@ -536,9 +745,9 @@ namespace Beefy.gfx
 						BuildFontNameCache();
 					String pathStr;
 					let lookupStr = scope String(fontName)..ToUpper();
-#if BF_PLATFORM_WINDOWS
 					if (sFontNameMap.TryGetValue(lookupStr, out pathStr))
 					{
+#if BF_PLATFORM_WINDOWS
 						if (!pathStr.Contains(':'))
 						{
 							char8[256] windowsDir;
@@ -546,23 +755,36 @@ namespace Beefy.gfx
 							path.Append(&windowsDir);
 							path.Append(@"\Fonts\");
 						}
+#endif
 
 						path.Append(pathStr);
 						return;
 					}
-#endif
 					if ((sFontFailMap != null) && (sFontFailMap.TryGetValue(lookupStr, out pathStr)))
 					{
-						path.Append(pathStr);
+						StringView lastPath = pathStr;
+						for (let fontFailName in pathStr.Split('\0', .RemoveEmptyEntries))
+						{
+							let failName  = scope String(fontFailName)..ToUpper();
+							if (sFontNameMap.TryGetValue(failName, out pathStr))
+							{
+								GetFontPath(fontFailName, path);
+								return;
+							}
+							lastPath = fontFailName;
+						}
+
+						path.Append(lastPath);
 						return;
 					}
 				}
 			}
 		}
 
-        public bool Load(StringView fontName, float pointSize = -1)
+        public bool Load(StringView fontName, float pointSize = -1, int32 glyphGuard = 0)
         {
 			Dispose();
+			mGlyphGuard = glyphGuard;
 
 			mCharData = new Dictionary<char32, CharData>();
 			mLowCharData = new CharData[LOW_CHAR_COUNT];
@@ -677,12 +899,12 @@ namespace Beefy.gfx
             return true;
         }
 
-        public static Result<Font> LoadFromFile(String path, float pointSize = -1)
+        public static Result<Font> LoadFromFile(String path, float pointSize = -1, int32 glyphGuard = 0)
         {
 			scope AutoBeefPerf("Font.LoadFromFile");
 
             Font font = new Font();
-            if (!font.Load(path, pointSize))
+            if (!font.Load(path, pointSize, glyphGuard))
 			{
 				delete font;
                 return .Err; //TODO: Make proper error
@@ -780,11 +1002,12 @@ namespace Beefy.gfx
 					if (ftFont == null)
 						continue;
 
-					var ftGlyph = FTFont_AllocGlyph(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1);
+					var ftGlyph = FTFont_AllocGlyphGuarded(ftFont, (int32)checkChar, fontIdx == mAlternates.Count - 1, mGlyphGuard);
 					if (ftGlyph == null)
 						continue;
 
 					charData = new CharData();
+					charData.mGuard = mGlyphGuard;
 					charData.mX = ftGlyph.mX;
 					charData.mY = ftGlyph.mY;
 					charData.mWidth = ftGlyph.mWidth;

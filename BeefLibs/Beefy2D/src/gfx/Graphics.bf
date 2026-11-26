@@ -415,6 +415,16 @@ namespace Beefy.gfx
 			PopRenderState();
 		}
 
+		// Scoped override of just the sampler (eg nearest-filtering for a zoomed-in image view),
+		// independent of the TexWrap/clip state tracked above.
+		public DisposeProxy PushSamplerKind(SamplerKind samplerKind)
+		{
+			var renderState = AllocRenderState(mDefaultShader, mClipRect, mTexWrap);
+			renderState.SamplerKind = samplerKind;
+			PushRenderState(renderState);
+			return mRenderStateDisposeProxy;
+		}
+
 		public void PushTextRenderState()
 		{
 			var textRenderState = AllocRenderState(mTextShader, mClipRect, mTexWrap);
@@ -452,7 +462,13 @@ namespace Beefy.gfx
         static extern void Gfx_DrawIndexedVertices(int32 vertexSize, void* vtxData, int32 vtxCount, uint16* idxData, int32 idxCount);
 
 		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_DrawIndexedVerticesInst(int32 vertexSize, void* vtxData, int32 vtxCount, uint16* idxData, int32 idxCount, float instValue, int32 instOfs);
+
+		[CallingConvention(.Stdcall), CLink]
 		static extern void Gfx_DrawIndexedVertices2D(int32 vertexSize, void* vtxData, int32 vtxCount, uint16* idxData, int32 idxCount, float a, float b, float c, float d, float tx, float ty, float z);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_DrawStaticMeshInstanced(void* mesh, int32 instBase, int32 instCount);
 
         [CallingConvention(.Stdcall), CLink]
         static extern void Gfx_SetShaderConstantData(int32 usageIdx, int32 slotIdx, void* data, int32 size);
@@ -467,6 +483,9 @@ namespace Beefy.gfx
         extern static void* Gfx_QueueRenderCmd(void* nativeRenderCmd);
 
         [CallingConvention(.Stdcall), CLink]
+        extern static void* Gfx_QueueRenderable(void* nativeRenderable);
+
+        [CallingConvention(.Stdcall), CLink]
         extern static void Gfx_SetTexture_TextureSegment(int32 textureIdx, void* textureSegment);
         
         public this()
@@ -479,6 +498,46 @@ namespace Beefy.gfx
             Debug.Assert(image.mSrcTexture == null);
             Gfx_SetTexture_TextureSegment(textureIdx, image.mNativeTextureSegment);
         }
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static void Gfx_SetComputeTexture(int32 slot, void* textureSegment);
+		[CallingConvention(.Stdcall), CLink]
+		extern static void Gfx_SetComputeUAV(int32 slot, void* textureSegment, int32 mipLevel);
+		[CallingConvention(.Stdcall), CLink]
+		extern static void Gfx_Dispatch(void* computeShader, int32 groupsX, int32 groupsY, int32 groupsZ);
+		[CallingConvention(.Stdcall), CLink]
+		extern static void Gfx_SetPixelUAV(int32 slot, void* textureSegment);
+
+		// Binds a GPU-writable buffer as pixel-stage unordered access (RWStructuredBuffer at
+		// register(u<slot>)); null unbinds. Queued in order with the draws. D3D shares the UAV and
+		// render-target slots, so slot must be at or above the pass's render-target count, and the
+		// buffer must not be bound as a texture at the same time.
+		public void SetPixelUnorderedAccess(int32 slot, GpuBuffer buffer)
+		{
+			Gfx_SetPixelUAV(slot, (buffer != null) ? buffer.mNativeTextureSegment : null);
+		}
+
+		// Compute bindings queue in order with the draws and are consumed by the next Dispatch,
+		// which unbinds them again (see DrawLayer::Dispatch). null unbinds a slot.
+		public void SetComputeTexture(int32 slot, Image image)
+		{
+			Gfx_SetComputeTexture(slot, (image != null) ? image.mNativeTextureSegment : null);
+		}
+
+		public void SetComputeUAV(int32 slot, Image image, int32 mipLevel = 0)
+		{
+			Gfx_SetComputeUAV(slot, (image != null) ? image.mNativeTextureSegment : null, mipLevel);
+		}
+
+		public void SetComputeConstantData(int slotIdx, void* data, int size)
+		{
+			Gfx_SetShaderConstantData(2, (int32)slotIdx, data, (int32)size);
+		}
+
+		public void Dispatch(ComputeShader shader, int32 groupsX, int32 groupsY, int32 groupsZ = 1)
+		{
+			Gfx_Dispatch(shader.mNativeShader, groupsX, groupsY, groupsZ);
+		}
 
         /*public void StartDraw()
         {
@@ -532,7 +591,14 @@ namespace Beefy.gfx
         {
             Gfx_QueueRenderCmd(renderCmd.mNativeRenderCmd);
         }
-        
+
+        // eg ModelInstance -- unlike Draw(RenderCmd), the same Renderable can be queued this way
+        // more than once (into different DrawLayers, or twice into the same one) in a single frame.
+        public void Draw(Renderable renderable)
+        {
+            Gfx_QueueRenderable(renderable.mNativeRenderable);
+        }
+
         public void Draw(IDrawable drawable, float x = 0, float y = 0)
         {
             Matrix newMatrix = Matrix();
@@ -844,6 +910,20 @@ namespace Beefy.gfx
 			}
         }
 
+		// 3D only: like DrawIndexedVertices, but every copied vertex gets `instValue` written into the
+		// float at byte offset `instOfs` (the source vertices are untouched).
+		public void DrawIndexedVerticesInst(VertexDefinition vertexDef, void* vertices, int vtxCount, uint16* indices, int idxCount, float instValue, int instOfs)
+		{
+			Gfx_DrawIndexedVerticesInst(vertexDef.mVertexSize, vertices, (int32)vtxCount, indices, (int32)idxCount, instValue, (int32)instOfs);
+		}
+
+		// Queued like any draw. Instance i's per-instance vertex element (see VertexMemberAttribute.
+		// mPerInstance) reads the float instBase + i + 1 -- the same encoding DrawIndexedVerticesInst stamps.
+		public void DrawStaticMeshInstanced(StaticMesh mesh, int instBase, int instCount)
+		{
+			Gfx_DrawStaticMeshInstanced(mesh.mNativeMesh, (int32)instBase, (int32)instCount);
+		}
+
         public void SetVertexShaderConstantData(int slotIdx, void* data, int size)
         {
             Gfx_SetShaderConstantData(0, (int32)slotIdx, data, (int32)size);
@@ -1055,6 +1135,156 @@ namespace Beefy.gfx
 		public void OutlineCircle(float x, float y, float radius)
 		{
 			OutlineOval(x, y, radius, radius);
+		}
+
+		// Antialiased: the edge fades out across one pixel, centered on the true outline. Built in
+		// pixels so the fade stays one pixel wide under a scaled or rotated mMatrix.
+		public void FillOval(float x, float y, float radiusX, float radiusY)
+		{
+			Matrix m = mMatrix;
+			float cx = m.tx + m.a * x + m.c * y;
+			float cy = m.ty + m.b * x + m.d * y;
+			float axX = m.a * radiusX;
+			float axY = m.b * radiusX;
+			float ayX = m.c * radiusY;
+			float ayY = m.d * radiusY;
+			float winding = Math.Sign(axX * ayY - axY * ayX);
+			if (winding == 0)
+				return;
+
+			Color edgeColor = mColor;
+			edgeColor.A = 0;
+
+			float pixelRadius = Math.Sqrt(axX * axX + axY * axY) + Math.Sqrt(ayX * ayX + ayY * ayY);
+			int numSections = 12 + (.)(pixelRadius * 0.15f);
+			// Per section: a solid triangle out to the inner edge, then a quad fading across the edge.
+			Gfx_AllocTris(mWhiteDot.mNativeTextureSegment, (.)(numSections * 9));
+
+			float prevInnerX = 0;
+			float prevInnerY = 0;
+			float prevOuterX = 0;
+			float prevOuterY = 0;
+			for (int section <= numSections)
+			{
+				// The last section reuses angle 0 exactly, so the ring closes without a seam.
+				float ang = ((section % numSections) * Math.PI_f * 2) / numSections;
+				float cos = Math.Cos(ang);
+				float sin = Math.Sin(ang);
+				float rimX = axX * cos + ayX * sin;
+				float rimY = axY * cos + ayY * sin;
+				float tanX = ayX * cos - axX * sin;
+				float tanY = ayY * cos - axY * sin;
+				float tanLen = Math.Sqrt(tanX * tanX + tanY * tanY);
+				float normX = winding * tanY / tanLen;
+				float normY = -winding * tanX / tanLen;
+				// Sub-pixel ovals can't inset a full half pixel without crossing the center.
+				float inset = Math.Min(0.5f, Math.Sqrt(rimX * rimX + rimY * rimY));
+				float innerX = cx + rimX - normX * inset;
+				float innerY = cy + rimY - normY * inset;
+				float outerX = cx + rimX + normX * 0.5f;
+				float outerY = cy + rimY + normY * 0.5f;
+
+				if (section > 0)
+				{
+					int32 v = (.)((section - 1) * 9);
+					Gfx_SetDrawVertex(v + 0, cx, cy, 0, 0.5f, 0.5f, mColor);
+					Gfx_SetDrawVertex(v + 1, prevInnerX, prevInnerY, 0, 0.5f, 0.5f, mColor);
+					Gfx_SetDrawVertex(v + 2, innerX, innerY, 0, 0.5f, 0.5f, mColor);
+
+					Gfx_CopyDrawVertex(v + 3, v + 1);
+					Gfx_SetDrawVertex(v + 4, prevOuterX, prevOuterY, 0, 0.5f, 0.5f, edgeColor);
+					Gfx_CopyDrawVertex(v + 5, v + 2);
+
+					Gfx_CopyDrawVertex(v + 6, v + 2);
+					Gfx_CopyDrawVertex(v + 7, v + 4);
+					Gfx_SetDrawVertex(v + 8, outerX, outerY, 0, 0.5f, 0.5f, edgeColor);
+				}
+
+				prevInnerX = innerX;
+				prevInnerY = innerY;
+				prevOuterX = outerX;
+				prevOuterY = outerY;
+			}
+		}
+
+		public void FillCircle(float x, float y, float radius)
+		{
+			FillOval(x, y, radius, radius);
+		}
+
+		// FillRect with FillOval's one-pixel edge fade -- for rects that a rotated or sheared mMatrix
+		// leaves with stepped edges. Pixel-aligned rects want plain FillRect, which stays crisp.
+		public void FillRectAntialiased(float x, float y, float width, float height)
+		{
+			Matrix m = mMatrix;
+			float[4] cornerX = .(x, x + width, x + width, x);
+			float[4] cornerY = .(y, y, y + height, y + height);
+			float[4] px = ?;
+			float[4] py = ?;
+			for (int i < 4)
+			{
+				px[i] = m.tx + m.a * cornerX[i] + m.c * cornerY[i];
+				py[i] = m.ty + m.b * cornerX[i] + m.d * cornerY[i];
+			}
+			float area = (px[1] - px[0]) * (py[3] - py[0]) - (py[1] - py[0]) * (px[3] - px[0]);
+			if (area == 0)
+				return;
+			float winding = Math.Sign(area);
+
+			// Outward pixel-space normal of edge i (corner i to i + 1).
+			float[4] nx = ?;
+			float[4] ny = ?;
+			float[4] edgeLength = ?;
+			for (int i < 4)
+			{
+				float ex = px[(i + 1) % 4] - px[i];
+				float ey = py[(i + 1) % 4] - py[i];
+				edgeLength[i] = Math.Sqrt(ex * ex + ey * ey);
+				nx[i] = winding * ey / edgeLength[i];
+				ny[i] = -winding * ex / edgeLength[i];
+			}
+			// A rect under a pixel thick can't inset a full half pixel without its sides crossing.
+			float thickness = Math.Abs(area) / Math.Max(edgeLength[0], edgeLength[1]);
+			float inset = Math.Min(0.5f, thickness * 0.5f);
+
+			// Corner i joins edges i - 1 and i; its miter offset puts both sides `amount` away.
+			float[4] innerX = ?;
+			float[4] innerY = ?;
+			float[4] outerX = ?;
+			float[4] outerY = ?;
+			for (int i < 4)
+			{
+				int prev = (i + 3) % 4;
+				float sumX = nx[prev] + nx[i];
+				float sumY = ny[prev] + ny[i];
+				float miter = 1.0f / (1.0f + nx[prev] * nx[i] + ny[prev] * ny[i]);
+				innerX[i] = px[i] - sumX * miter * inset;
+				innerY[i] = py[i] - sumY * miter * inset;
+				outerX[i] = px[i] + sumX * miter * 0.5f;
+				outerY[i] = py[i] + sumY * miter * 0.5f;
+			}
+
+			Color edgeColor = mColor;
+			edgeColor.A = 0;
+			// The solid inner quad, then a quad per side fading across its edge.
+			Gfx_AllocTris(mWhiteDot.mNativeTextureSegment, 6 + 4 * 6);
+			Gfx_SetDrawVertex(0, innerX[0], innerY[0], 0, 0.5f, 0.5f, mColor);
+			Gfx_SetDrawVertex(1, innerX[1], innerY[1], 0, 0.5f, 0.5f, mColor);
+			Gfx_SetDrawVertex(2, innerX[2], innerY[2], 0, 0.5f, 0.5f, mColor);
+			Gfx_CopyDrawVertex(3, 0);
+			Gfx_CopyDrawVertex(4, 2);
+			Gfx_SetDrawVertex(5, innerX[3], innerY[3], 0, 0.5f, 0.5f, mColor);
+			for (int i < 4)
+			{
+				int next = (i + 1) % 4;
+				int32 v = (.)(6 + i * 6);
+				Gfx_SetDrawVertex(v + 0, innerX[i], innerY[i], 0, 0.5f, 0.5f, mColor);
+				Gfx_SetDrawVertex(v + 1, outerX[i], outerY[i], 0, 0.5f, 0.5f, edgeColor);
+				Gfx_SetDrawVertex(v + 2, innerX[next], innerY[next], 0, 0.5f, 0.5f, mColor);
+				Gfx_CopyDrawVertex(v + 3, v + 2);
+				Gfx_CopyDrawVertex(v + 4, v + 1);
+				Gfx_SetDrawVertex(v + 5, outerX[next], outerY[next], 0, 0.5f, 0.5f, edgeColor);
+			}
 		}
     }
 #else

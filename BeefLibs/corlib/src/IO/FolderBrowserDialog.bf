@@ -246,7 +246,14 @@ public class FolderBrowserDialog : CommonDialog
 		}
 		set
 		{
-			mInitialDir.Set(value);
+			if(mInitialDir == null)
+			{
+				mInitialDir = new .(value);
+			}
+			else
+			{
+				mInitialDir.Set(value);
+			}
 		}
 	}
 
@@ -256,6 +263,42 @@ public class FolderBrowserDialog : CommonDialog
 		Linux.SdBusMessageOpenContainer(m, .DictEntry, "sv");
 		Linux.SdBusMessageAppend(m, "sv", "directory", "b", 1);
 		Linux.SdBusMessageCloseContainer(m);
+	}
+}
+#elif BF_PLATFORM_MACOS
+namespace System.IO;
+
+public class FolderBrowserDialog : CommonDialog
+{
+	public enum FolderKind
+	{
+		Open,
+		Save
+	}
+
+	protected FolderKind mFolderKind;
+
+	public this(FolderKind kind = .Open)
+	{
+		mFolderKind = kind;
+		Reset();
+	}
+
+	public StringView SelectedPath
+	{
+		get
+		{
+			return mDone ? ((mFileNames == null) ? "" : mFileNames[0]) : mInitialDir;
+		}
+		set
+		{
+			String.NewOrSet!(mInitialDir, value);
+		}
+	}
+
+	protected override Result<DialogResult> RunDialog(INativeWindow owner)
+	{
+		return RunNativeDialog(.Folder, false, (mInitialDir != null) ? mInitialDir : "", "", "");
 	}
 }
 #endif

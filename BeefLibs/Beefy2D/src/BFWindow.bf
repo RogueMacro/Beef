@@ -52,6 +52,10 @@ namespace Beefy
 			AcceptFiles = 0x1000'0000,
 			NoShow = 0x2000'0000,
 			NoMouse = 0x4000'0000,
+            Tooltip = 0x8000'0000,
+            LogicalCoords = 0x1'0000'0000,
+			// Skips the layered window style. Not for windows that use SetAlpha, SetMouseVisible or Menu
+			NoLayered = 0x2'0000'0000,
         };
 
 		[AllowDuplicates]
@@ -84,7 +88,7 @@ namespace Beefy
             TopRight = 14,
             Transparent = -1,
             VScroll = 7,
-            Zoom = 9            
+            Zoom = 9
         }
 
 		public enum ShowKind
@@ -105,7 +109,7 @@ namespace Beefy
 
         public virtual void Draw(Graphics g)
         {
-            
+
         }
 
         public virtual void PreDraw(Graphics g)
@@ -123,14 +127,30 @@ namespace Beefy
     {
 		public enum ShowKind
 		{
-			Hide,
-			Normal,
-			Minimized,
-			Maximized,
-			Show,
-			ShowNormal,
-			ShowMinimized,
-			ShowMaximized
+			case Hide;
+			case Normal;
+			case Minimized;
+			case Maximized;
+			case Show;
+			case ShowNormal;
+			case ShowMinimized;
+			case ShowMaximized;
+
+			public bool IsVisible
+			{
+				get
+				{
+					switch (this)
+					{
+					case .Hide,
+						 .Minimized,
+						 .ShowMinimized:
+						return false;
+					default:
+						return true;
+					}
+				}
+			}	
 		}
 
         delegate void NativeMovedDelegate(void* window);
@@ -148,6 +168,8 @@ namespace Beefy
         delegate void NativeMouseUpDelegate(void* window, int32 x, int32 y, int32 btn);
         delegate void NativeMouseWheelDelegate(void* window, int32 x, int32 y, float deltaX, float deltaY);
         delegate void NativeMouseLeaveDelegate(void* window);
+        delegate void NativeMouseDeltaDelegate(void* window, int32 dx, int32 dy);
+        delegate void NativeRelativeMouseModeAbortedDelegate(void* window);
         delegate void NativeMenuItemSelectedDelegate(void* window, void* menu);
 		delegate void NativeDragDropFileDelegate(void* window, char8* filePath);
 
@@ -155,12 +177,13 @@ namespace Beefy
 		public bool mNativeWindowClosed;
 
 		static int32 sId;
-		protected int32 mId = ++sId;
+		public int32 mId = ++sId;
 
 		public String mName ~ delete _;
         public String mTitle ~ delete _;
         public int32 mX;
         public int32 mY;
+		public bool mPositionKnown;
         public int32 mWindowWidth;
         public int32 mWindowHeight;
 		public int32 mNormX;
@@ -176,7 +199,11 @@ namespace Beefy
         public float mAlpha = 1.0f;
         public Flags mWindowFlags;
         private bool mMouseVisible;
-        public bool mHasFocus = false;        
+        // The focus GotFocus/LostFocus report, ie. the OS's.
+        public bool mPhysHasFocus;
+        bool mForceHasFocus;
+        // Focus as widgets see it: physical or forced (see ForceHasFocus).
+        public bool mHasFocus;
         public bool mHasClosed;
 		public bool mIsDirty = true;
         public BFWindow mParent;
@@ -199,21 +226,23 @@ namespace Beefy
         static NativeMouseUpDelegate sNativeMouseUpDelegate ~ delete _;
         static NativeMouseWheelDelegate sNativeMouseWheelDelegate ~ delete _;
         static NativeMouseLeaveDelegate sNativeMouseLeaveDelegate ~ delete _;
+        static NativeMouseDeltaDelegate sNativeMouseDeltaDelegate ~ delete _;
+        static NativeRelativeMouseModeAbortedDelegate sNativeRelativeMouseModeAbortedDelegate ~ delete _;
         static NativeMenuItemSelectedDelegate sNativeMenuItemSelectedDelegate ~ delete _;
         static NativeDragDropFileDelegate sNativeDragDropFileDelegate ~ delete _;
 
         [CallingConvention(.Stdcall), CLink]
-        static extern void* BFApp_CreateWindow(void* parent, char8* title, int32 x, int32 y, int32 width, int32 height, int32 windowFlags);
+        static extern void* BFApp_CreateWindow(void* parent, char8* title, int32 x, int32 y, int32 width, int32 height, int64 windowFlags);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void* BFWindow_GetNativeUnderlying(void* window);
 
         [CallingConvention(.Stdcall), CLink]
-        static extern void BFWindow_SetCallbacks(void* window, void* movedDelegate, void* closeQueryDelegate, void* closedDelegate, 
+        static extern void BFWindow_SetCallbacks(void* window, void* movedDelegate, void* closeQueryDelegate, void* closedDelegate,
             void* gotFocusDelegate, void* lostFocusDelegate,
 			void* keyCharDelegate, void* keyDownDelegate, void* keyUpDelegate, void* hitTestDelegate,
             void* mouseMoveDelegate, void* mouseProxyMoveDelegate, void* mouseDownDelegate, void* mouseUpDelegate, void* mouseWheelDelegate, void* mouseLeaveDelegate,
-            void* menuItemSelectedDelegate, void* dragDropFileDelegate);
+            void* menuItemSelectedDelegate, void* dragDropFileDelegate, void* mouseDeltaDelegate, void* relativeMouseModeAbortedDelegate);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void BFWindow_SetTitle(void* window, char8* title);
@@ -232,6 +261,18 @@ namespace Beefy
 
         [CallingConvention(.Stdcall), CLink]
         static extern void BFWindow_Close(void* window, int32 force);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern bool BFWindow_CaptureClientBits(void* window, uint32* outBits, int32 width, int32 height);
+
+        // What DWM actually composited for this window's client area -- distinct from a same-frame
+        // GPU readback of our own render target, which cannot see anything that goes wrong during
+        // Present's copy to the front buffer or DWM's own compositing. false on mismatch/failure
+        // (e.g. outBits sized for a client rect that just changed).
+        public bool CaptureClientBits(uint32* outBits, int32 width, int32 height)
+        {
+            return BFWindow_CaptureClientBits(mNativeWindow, outBits, width, height);
+        }
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void BFWindow_Show(void* window, ShowKind showKind);
@@ -260,6 +301,21 @@ namespace Beefy
 		[CallingConvention(.Stdcall), CLink]
 		static extern bool BFWindow_IsMouseCaptured(void* window);
 
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BFWindow_StartRelativeMouseMode(void* window);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BFWindow_EndRelativeMouseMode(void* window);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern bool BFWindow_IsInRelativeMouseMode(void* window);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BFWindow_SetBorderlessFullscreen(void* window, bool fullscreen);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern bool BFWindow_IsBorderlessFullscreen(void* window);
+
         [CallingConvention(.Stdcall), CLink]
         static extern void* BFWindow_AddMenuItem(void* window, void* parent, int32 insertIdx, char8* text, char8* hotKey, void* bitmap, int32 enabled, int32 checkState, int32 radioCheck);
 
@@ -272,65 +328,73 @@ namespace Beefy
 		[CallingConvention(.Stdcall), CLink]
 		static extern int BFWindow_GetDPI(void* window);
 
+		[CallingConvention(.Stdcall), CLink]
+		static extern float BFWindow_GetMonitorRefreshRate(void* window);
+
+        // Null once this side has deleted the window. A queued native message for its handle can still
+        // arrive -- eg a Moved dispatched while another window is being resized -- and every callback
+        // below drops it rather than failing the lookup, which used to kill the process.
         public static BFWindow GetBFWindow(void* window)
         {
-            return sWindowDictionary[(int)window];
+            return sWindowDictionary.GetValueOrDefault((int)window);
         }
 
 		#if MONOTOUCH
 		[MonoPInvokeCallback(typeof(NativeMovedDelegate))]
-		static void Static_NativeMovedDelegate(void* window) { GetBFWindow(window).Moved(); }
+		static void Static_NativeMovedDelegate(void* window) { GetBFWindow(window)?.Moved(); }
 		[MonoPInvokeCallback(typeof(NativeClosedDelegate))]
-		static void Static_NativeClosedDelegate(void* window) { GetBFWindow(window).Closed(); }
+		static void Static_NativeClosedDelegate(void* window) { GetBFWindow(window)?.Closed(); }
 		[MonoPInvokeCallback(typeof(NativeCloseQueryDelegate))]
-		static int Static_NativeCloseQueryDelegate(void* window) { return GetBFWindow(window).CloseQuery(); }
+		static int Static_NativeCloseQueryDelegate(void* window) { let bfWindow = GetBFWindow(window); return (bfWindow != null) ? bfWindow.CloseQuery() : 1; }
 		[MonoPInvokeCallback(typeof(NativeGotFocusDelegate))]
-		static void Static_NativeGotFocusDelegate(void* window) { GetBFWindow(window).GotFocus(); }
+		static void Static_NativeGotFocusDelegate(void* window) { GetBFWindow(window)?.GotFocus(); }
 		[MonoPInvokeCallback(typeof(NativeLostFocusDelegate))]
-		static void Static_NativeLostFocusDelegate(void* window) { GetBFWindow(window).LostFocus(); }
+		static void Static_NativeLostFocusDelegate(void* window) { GetBFWindow(window)?.LostFocus(); }
 		[MonoPInvokeCallback(typeof(NativeKeyCharDelegate))]
-		static void Static_NativeKeyCharDelegate(void* window, char8 c) { GetBFWindow(window).KeyChar(c); }
+		static void Static_NativeKeyCharDelegate(void* window, char8 c) { GetBFWindow(window)?.KeyChar(c); }
 		[MonoPInvokeCallback(typeof(NativeKeyDownDelegate))]
-		static bool Static_NativeKeyDownDelegate(void* window, int key, int isRepeat) { return GetBFWindow(window).KeyDown(key, isRepeat); }
+		static bool Static_NativeKeyDownDelegate(void* window, int key, int isRepeat) { let bfWindow = GetBFWindow(window); return (bfWindow != null) ? bfWindow.KeyDown(key, isRepeat) : false; }
 		[MonoPInvokeCallback(typeof(NativeKeyUpDelegate))]
-		static void Static_NativeKeyUpDelegate(void* window, int key) { GetBFWindow(window).KeyUp(key); }
+		static void Static_NativeKeyUpDelegate(void* window, int key) { GetBFWindow(window)?.KeyUp(key); }
 		[MonoPInvokeCallback(typeof(NativeMouseMoveDelegate))]
-		static void Static_NativeMouseMoveDelegate(void* window, int mouseX, int mouseY) { GetBFWindow(window).MouseMove(mouseX, mouseY); }
+		static void Static_NativeMouseMoveDelegate(void* window, int mouseX, int mouseY) { GetBFWindow(window)?.MouseMove(mouseX, mouseY); }
 		[MonoPInvokeCallback(typeof(NativeMouseProxyMoveDelegate))]
-		static void Static_NativeMouseProxyMoveDelegate(void* window, int mouseX, int mouseY) { GetBFWindow(window).MouseProxyMove(mouseX, mouseY); }
+		static void Static_NativeMouseProxyMoveDelegate(void* window, int mouseX, int mouseY) { GetBFWindow(window)?.MouseProxyMove(mouseX, mouseY); }
 		[MonoPInvokeCallback(typeof(NativeMouseDownDelegate))]
-		static void Static_NativeMouseDownDelegate(void* window, int mouseX, int mouseY, int btnNum, int btnCount) { GetBFWindow(window).MouseDown(mouseX, mouseY, btnNum, btnCount); }
+		static void Static_NativeMouseDownDelegate(void* window, int mouseX, int mouseY, int btnNum, int btnCount) { GetBFWindow(window)?.MouseDown(mouseX, mouseY, btnNum, btnCount); }
 		[MonoPInvokeCallback(typeof(NativeMouseUpDelegate))]
-		static void Static_NativeMouseUpDelegate(void* window, int mouseX, int mouseY, int btnNum) { GetBFWindow(window).MouseUp(mouseX, mouseY, btnNum); }
+		static void Static_NativeMouseUpDelegate(void* window, int mouseX, int mouseY, int btnNum) { GetBFWindow(window)?.MouseUp(mouseX, mouseY, btnNum); }
 		[MonoPInvokeCallback(typeof(NativeMouseWheelDelegate))]
-		static void Static_NativeMouseWheelDelegate(void* window, int mouseX, int mouseY, int delta) { GetBFWindow(window).MouseWheel(mouseX, mouseY, delta); }
+		static void Static_NativeMouseWheelDelegate(void* window, int mouseX, int mouseY, int delta) { GetBFWindow(window)?.MouseWheel(mouseX, mouseY, delta); }
 		[MonoPInvokeCallback(typeof(NativeMouseLeaveDelegate))]
-		static void Static_NativeMouseLeaveDelegate(void* window) { GetBFWindow(window).MouseLeave(); }
+		static void Static_NativeMouseLeaveDelegate(void* window) { GetBFWindow(window)?.MouseLeave(); }
 		[MonoPInvokeCallback(typeof(NativeMenuItemSelectedDelegate))]
-		static void Static_NativeMenuItemSelectedDelegate(void* window, void* item) { GetBFWindow(window).NativeMenuItemSelected(item); }
+		static void Static_NativeMenuItemSelectedDelegate(void* window, void* item) { GetBFWindow(window)?.NativeMenuItemSelected(item); }
 		#else
-		static void Static_NativeMovedDelegate(void* window) { GetBFWindow(window).Moved(); }
-		static void Static_NativeClosedDelegate(void* window) { GetBFWindow(window).Closed(); }
-		static int32 Static_NativeCloseQueryDelegate(void* window) { return GetBFWindow(window).CloseQuery(); }
-		static void Static_NativeGotFocusDelegate(void* window) { GetBFWindow(window).GotFocus(); }
-		static void Static_NativeLostFocusDelegate(void* window) { GetBFWindow(window).LostFocus(null); }
-		static void Static_NativeKeyCharDelegate(void* window, char32 c) { GetBFWindow(window).KeyChar(c); }
-		static bool Static_NativeKeyDownDelegate(void* window, int32 key, int32 isRepeat) { return GetBFWindow(window).KeyDown(key, isRepeat); }
-		static void Static_NativeKeyUpDelegate(void* window, int32 key) { GetBFWindow(window).KeyUp(key); }
-        static int32 Static_NativeHitTestDelegate(void* window, int32 x, int32 y) { return (int32)GetBFWindow(window).HitTest(x, y); }        
-        static void Static_NativeMouseMoveDelegate(void* window, int32 mouseX, int32 mouseY) { GetBFWindow(window).MouseMove(mouseX, mouseY); }
-		static void Static_NativeMouseProxyMoveDelegate(void* window, int32 mouseX, int32 mouseY) { GetBFWindow(window).MouseProxyMove(mouseX, mouseY); }
-		static void Static_NativeMouseDownDelegate(void* window, int32 mouseX, int32 mouseY, int32 btnNum, int32 btnCount) { GetBFWindow(window).MouseDown(mouseX, mouseY, btnNum, btnCount); }
-		static void Static_NativeMouseUpDelegate(void* window, int32 mouseX, int32 mouseY, int32 btnNum) { GetBFWindow(window).MouseUp(mouseX, mouseY, btnNum); }
-		static void Static_NativeMouseWheelDelegate(void* window, int32 mouseX, int32 mouseY, float deltaX, float deltaY) { GetBFWindow(window).MouseWheel(mouseX, mouseY, deltaX, deltaY); }
-		static void Static_NativeMouseLeaveDelegate(void* window) { GetBFWindow(window).MouseLeave(); }
-		static void Static_NativeMenuItemSelectedDelegate(void* window, void* item) { GetBFWindow(window).NativeMenuItemSelected(item); }
-		static void Static_NativeDragDropFileDelegate(void* window, char8* filePath) { GetBFWindow(window).DragDropFile(StringView(filePath)); }
+		static void Static_NativeMovedDelegate(void* window) { GetBFWindow(window)?.Moved(); }
+		static void Static_NativeClosedDelegate(void* window) { GetBFWindow(window)?.Closed(); }
+		static int32 Static_NativeCloseQueryDelegate(void* window) { let bfWindow = GetBFWindow(window); return (bfWindow != null) ? bfWindow.CloseQuery() : 1; }
+		static void Static_NativeGotFocusDelegate(void* window) { GetBFWindow(window)?.GotFocus(); }
+		static void Static_NativeLostFocusDelegate(void* window) { GetBFWindow(window)?.LostFocus(null); }
+		static void Static_NativeKeyCharDelegate(void* window, char32 c) { GetBFWindow(window)?.KeyChar(c); }
+		static bool Static_NativeKeyDownDelegate(void* window, int32 key, int32 isRepeat) { let bfWindow = GetBFWindow(window); return (bfWindow != null) ? bfWindow.KeyDown(key, isRepeat) : false; }
+		static void Static_NativeKeyUpDelegate(void* window, int32 key) { GetBFWindow(window)?.KeyUp(key); }
+        static int32 Static_NativeHitTestDelegate(void* window, int32 x, int32 y) { let bfWindow = GetBFWindow(window); return (int32)((bfWindow != null) ? bfWindow.HitTest(x, y) : HitTestResult.NotHandled); }
+        static void Static_NativeMouseMoveDelegate(void* window, int32 mouseX, int32 mouseY) { GetBFWindow(window)?.MouseMove(mouseX, mouseY); }
+		static void Static_NativeMouseProxyMoveDelegate(void* window, int32 mouseX, int32 mouseY) { GetBFWindow(window)?.MouseProxyMove(mouseX, mouseY); }
+		static void Static_NativeMouseDownDelegate(void* window, int32 mouseX, int32 mouseY, int32 btnNum, int32 btnCount) { GetBFWindow(window)?.MouseDown(mouseX, mouseY, btnNum, btnCount); }
+		static void Static_NativeMouseUpDelegate(void* window, int32 mouseX, int32 mouseY, int32 btnNum) { GetBFWindow(window)?.MouseUp(mouseX, mouseY, btnNum); }
+		static void Static_NativeMouseWheelDelegate(void* window, int32 mouseX, int32 mouseY, float deltaX, float deltaY) { GetBFWindow(window)?.MouseWheel(mouseX, mouseY, deltaX, deltaY); }
+		static void Static_NativeMouseLeaveDelegate(void* window) { GetBFWindow(window)?.MouseLeave(); }
+		static void Static_NativeMouseDeltaDelegate(void* window, int32 dx, int32 dy) { GetBFWindow(window)?.MouseDelta(dx, dy); }
+		static void Static_NativeRelativeMouseModeAbortedDelegate(void* window) { GetBFWindow(window)?.RelativeMouseModeAborted(); }
+		static void Static_NativeMenuItemSelectedDelegate(void* window, void* item) { GetBFWindow(window)?.NativeMenuItemSelected(item); }
+		static void Static_NativeDragDropFileDelegate(void* window, char8* filePath) { GetBFWindow(window)?.DragDropFile(StringView(filePath)); }
 		#endif
 
 		public Rect<int32> ClientRect => .(mClientX, mClientY, mClientWidth, mClientHeight);
 		public Rect<int32> WindowRect => .(mX, mY, mWindowWidth, mWindowHeight);
- 		
+
 		public this()
 		{
 		}
@@ -342,8 +406,36 @@ namespace Beefy
 
 		public ~this()
 		{
-			bool worked = sWindowDictionary.Remove((int)mNativeWindow);
-			Debug.Assert(worked);
+			// Native addresses may be reused before deferred Beef deletion.
+			if (sWindowDictionary.GetValueOrDefault((int)mNativeWindow) == this)
+				sWindowDictionary.Remove((int)mNativeWindow);
+		}
+
+		public static BFWindow.Flags GetStartupFlags()
+		{
+			BFWindow.Flags flags = default;
+
+#if BF_PLATFORM_WINDOWS
+			Windows.StartupInfo si = .();
+			Windows.GetStartupInfoA(&si);
+			if ((si.mFlags & 1) != 0) // STARTF_USESHOWWINDOW
+			{
+				switch (si.mShowWindow)
+				{
+				case Windows.SW_HIDE:
+					flags |= .NoShow;
+				case Windows.SW_SHOWMINNOACTIVE:
+					flags |= .ShowMinimized | .NoActivate;
+				case Windows.SW_SHOWMINIMIZED:
+					flags |= .ShowMinimized;
+				case Windows.SW_MAXIMIZE:
+					flags |= .Maximize;
+				case Windows.SW_SHOWNOACTIVATE:
+					flags |= .NoActivate;
+				}
+			}
+#endif
+			return flags;
 		}
 
 		void Init(BFWindow parent, String title, int x, int y, int width, int height, BFWindow.Flags windowFlags)
@@ -363,7 +455,7 @@ namespace Beefy
 			if (windowFlags.HasFlag(.NoShow))
 				mVisible = false;
 
-            mNativeWindow = BFApp_CreateWindow((parent != null) ? (parent.mNativeWindow) : null, title, (int32)x, (int32)y, (int32)width, (int32)height, (int32)useFlags);
+            mNativeWindow = BFApp_CreateWindow((parent != null) ? (parent.mNativeWindow) : null, title, (int32)x, (int32)y, (int32)width, (int32)height, (.)useFlags);
             sWindowDictionary[(int)mNativeWindow] = this;
 
             if (sNativeMovedDelegate == null)
@@ -383,6 +475,8 @@ namespace Beefy
 				sNativeMouseUpDelegate = new => Static_NativeMouseUpDelegate;
 				sNativeMouseWheelDelegate = new => Static_NativeMouseWheelDelegate;
 				sNativeMouseLeaveDelegate = new => Static_NativeMouseLeaveDelegate;
+				sNativeMouseDeltaDelegate = new => Static_NativeMouseDeltaDelegate;
+				sNativeRelativeMouseModeAbortedDelegate = new => Static_NativeRelativeMouseModeAbortedDelegate;
 				sNativeMenuItemSelectedDelegate = new => Static_NativeMenuItemSelectedDelegate;
 				sNativeDragDropFileDelegate = new => Static_NativeDragDropFileDelegate;
             }
@@ -390,7 +484,8 @@ namespace Beefy
             BFWindow_SetCallbacks(mNativeWindow, sNativeMovedDelegate.GetFuncPtr(), sNativeCloseQueryDelegate.GetFuncPtr(), sNativeClosedDelegate.GetFuncPtr(), sNativeGotFocusDelegate.GetFuncPtr(), sNativeLostFocusDelegate.GetFuncPtr(),
                 sNativeKeyCharDelegate.GetFuncPtr(), sNativeKeyDownDelegate.GetFuncPtr(), sNativeKeyUpDelegate.GetFuncPtr(), sNativeHitTestDelegate.GetFuncPtr(),
                 sNativeMouseMoveDelegate.GetFuncPtr(), sNativeMouseProxyMoveDelegate.GetFuncPtr(), sNativeMouseDownDelegate.GetFuncPtr(), sNativeMouseUpDelegate.GetFuncPtr(), sNativeMouseWheelDelegate.GetFuncPtr(), sNativeMouseLeaveDelegate.GetFuncPtr(),
-                sNativeMenuItemSelectedDelegate.GetFuncPtr(), sNativeDragDropFileDelegate.GetFuncPtr());            
+                sNativeMenuItemSelectedDelegate.GetFuncPtr(), sNativeDragDropFileDelegate.GetFuncPtr(), sNativeMouseDeltaDelegate.GetFuncPtr(),
+				sNativeRelativeMouseModeAbortedDelegate.GetFuncPtr());
             BFApp.sApp.mWindows.Add(this);
 
             mDefaultDrawLayer = new DrawLayer(this);
@@ -398,7 +493,7 @@ namespace Beefy
             if (windowFlags.HasFlag(Flags.Menu))
             {
                 mSysMenu = new SysMenu();
-                mSysMenu.mWindow = this;                
+                mSysMenu.mWindow = this;
             }
             mWindowFlags = windowFlags;
 
@@ -444,8 +539,8 @@ namespace Beefy
         }
 
         public virtual void Dispose()
-        {            
-            Close(true);            
+        {
+            Close(true);
         }
 
         public virtual int32 CloseQuery()
@@ -461,7 +556,7 @@ namespace Beefy
 				return;
 			mNativeWindowClosed = true;*/
 
-			while (mChildWindows.Count > 0)	
+			while (mChildWindows.Count > 0)
 				mChildWindows[mChildWindows.Count - 1].Close(force);
 
 			//for (var childWindow in mChildWindows)
@@ -505,7 +600,7 @@ namespace Beefy
         {
             // Does checking of mouse coords against all window even when this window has mouse capture,
             //  helps some dragging scenarios.  Gets turned off automatically on mouse up.
-            BFWindow_SetNonExclusiveMouseCapture(mNativeWindow);            
+            BFWindow_SetNonExclusiveMouseCapture(mNativeWindow);
         }
 
 		public bool HasParent(BFWindow widgetWindow)
@@ -532,7 +627,7 @@ namespace Beefy
 
             if (mWindowFlags.HasFlag(Flags.QuitOnClose))
                 BFApp.sApp.Stop();
-            
+
             if (mParent != null)
             {
                 mParent.mChildWindows.Remove(this);
@@ -551,7 +646,15 @@ namespace Beefy
 
 		public virtual void RehupSize()
 		{
+			mPositionKnown = true;
 			BFWindow_GetPosition(mNativeWindow, out mX, out mY, out mWindowWidth, out mWindowHeight, out mClientX, out mClientY, out mClientWidth, out mClientHeight);
+			//Console.WriteLine($"BFWindow_GetPosition {mX},{mY},{mWindowWidth},{mWindowHeight}");
+			if (mX == Int32.MinValue)
+			{
+				mX = 0;
+				mY = 0;
+				mPositionKnown = false;
+			}
 
 			int32 showKind = 0;
 			BFWindow_GetPlacement(mNativeWindow, out mNormX, out mNormY, out mNormWidth, out mNormHeight, out showKind);
@@ -561,7 +664,7 @@ namespace Beefy
 		}
 
         public virtual void Moved()
-        {            
+        {
             RehupSize();
         }
 
@@ -594,6 +697,33 @@ namespace Beefy
 			return BFWindow_IsMouseCaptured(mNativeWindow);
 		}
 
+		// Hides the cursor, restricts it to this window, and delivers movement via MouseDelta instead
+		// of MouseMove -- MouseMove will not fire again until EndRelativeMouseMode. A focus loss
+		// (alt-tab etc) ends the mode and fires RelativeMouseModeAborted; it does NOT resume on its
+		// own when focus returns.
+		public virtual void StartRelativeMouseMode()
+		{
+			BFWindow_StartRelativeMouseMode(mNativeWindow);
+		}
+
+		public virtual void EndRelativeMouseMode()
+		{
+			BFWindow_EndRelativeMouseMode(mNativeWindow);
+		}
+
+		public bool IsInRelativeMouseMode()
+		{
+			return BFWindow_IsInRelativeMouseMode(mNativeWindow);
+		}
+
+		// Covers the window's current monitor with no frame or caption, at the desktop's own display
+		// mode. Leaving restores the previous placement.
+		public bool BorderlessFullscreen
+		{
+			get => BFWindow_IsBorderlessFullscreen(mNativeWindow);
+			set => BFWindow_SetBorderlessFullscreen(mNativeWindow, value);
+		}
+
         public virtual void* AddMenuItem(void* parent, int insertIdx, String text, String hotKey, void* bitmap, bool enabled, int checkState, bool radioCheck)
         {
             return BFWindow_AddMenuItem(mNativeWindow, parent, (int32)insertIdx, text, hotKey, bitmap, enabled ? 1 : 0, (int32)checkState, radioCheck ? 1 : 0);
@@ -617,7 +747,7 @@ namespace Beefy
         public virtual void NativeMenuItemSelected(void* menu)
         {
             SysMenu aSysMenu = mSysMenuMap[(int)menu];
-            MenuItemSelected(aSysMenu);                      
+            MenuItemSelected(aSysMenu);
         }
 
 		public virtual void DragDropFile(StringView filePath)
@@ -629,31 +759,67 @@ namespace Beefy
             return null;
         }
 
+		// Keeps the window focused for widgets whatever the OS says, for a window whose input another process
+		// relays to it (eg. a game shown in an editor's view).
+		public bool ForceHasFocus
+		{
+			get => mForceHasFocus;
+			set
+			{
+				if (mForceHasFocus == value)
+					return;
+				mForceHasFocus = value;
+				UpdateHasFocus(null);
+			}
+		}
+
         public virtual void GotFocus()
         {
-            if (mHasFocus)
+            if (mPhysHasFocus)
                 return;
-            mHasFocus = true;
-            //Console.WriteLine("GotFocus {0}", mTitle);
+            mPhysHasFocus = true;
+			UpdateHasFocus(null);
         }
 
         public virtual void LostFocus(BFWindow newFocus)
-        {			
-            if (!mHasFocus)
+        {
+            if (!mPhysHasFocus)
                 return;
-			mHasFocus = false;
+			mPhysHasFocus = false;
             if (mNativeWindow != null)
-                BFWindow_LostFocus(mNativeWindow, (newFocus != null) ? newFocus.mNativeWindow : null);            
-
-			//TODO: REMOVE
-            //Debug.WriteLine("LostFocus {0}", mTitle);
+                BFWindow_LostFocus(mNativeWindow, (newFocus != null) ? newFocus.mNativeWindow : null);
+			UpdateHasFocus(newFocus);
         }
+
+		void UpdateHasFocus(BFWindow newFocus)
+		{
+			bool hasFocus = mPhysHasFocus || mForceHasFocus;
+			if (hasFocus == mHasFocus)
+				return;
+			mHasFocus = hasFocus;
+			if (hasFocus)
+				FocusGained();
+			else
+				FocusLost(newFocus);
+		}
+
+		// mHasFocus has just turned on.
+		protected virtual void FocusGained()
+		{
+		}
+
+		// mHasFocus has just turned off.
+		protected virtual void FocusLost(BFWindow newFocus)
+		{
+		}
 
 		public virtual int GetDPI()
 		{
 			return BFWindow_GetDPI(mNativeWindow);
 		}
-        
+
+		public float MonitorRefreshRate => BFWindow_GetMonitorRefreshRate(mNativeWindow);
+
         public virtual void KeyChar(char32 theChar)
         {
         }
@@ -665,7 +831,7 @@ namespace Beefy
 
         public virtual void KeyUp(int32 keyCode)
         {
-			
+
         }
 
         public virtual HitTestResult HitTest(int32 x, int32 y)
@@ -697,12 +863,26 @@ namespace Beefy
         {
         }
 
+        // Fired instead of MouseMove while relative mouse mode is active -- see
+        // StartRelativeMouseMode. dx/dy are raw movement, not a screen/client position.
+        public virtual void MouseDelta(int32 dx, int32 dy)
+        {
+        }
+
+        // The OS took relative mouse mode away (alt-tab, a modal dialog, clicking another app) --
+        // the mode is already fully ended when this fires. Not fired by an explicit
+        // EndRelativeMouseMode call. Re-establishing is this app's decision: call
+        // StartRelativeMouseMode right here to resume on refocus, or wait for some user action.
+        public virtual void RelativeMouseModeAborted()
+        {
+        }
+
         public override void Draw(Graphics g)
         {
         }
 
         public virtual void Update()
-        {            
+        {
         }
 
 		public virtual void UpdateF(float updatePct)
@@ -712,7 +892,7 @@ namespace Beefy
     }
 #else
     public class BFWindow : BFWindowBase, IStudioClientWindow
-    {        
+    {
         //IStudioWidgetWindow mProxy;
         public int mClientWidth;
         public int mClientHeight;
@@ -721,7 +901,7 @@ namespace Beefy
         public float mAlpha = 1.0f;
         public bool mVisible = true;
         public Flags mWindowFlags;
-        
+
         public IPCProxy<IStudioHostWindow> mRemoteWindow;
         public IPCEndpoint<IStudioClientWindow> mStudioClientWindow;
 
@@ -815,7 +995,7 @@ namespace Beefy
 
         public virtual void KeyChar(char32 theChar)
         {
-        }        
+        }
 
         public virtual void KeyDown(int keyCode, int isRepeat)
         {
@@ -848,13 +1028,13 @@ namespace Beefy
         public virtual void MouseLeave()
         {
         }
-                
+
         public virtual void Update()
         {
         }
 
         public override void PreDraw(Graphics g)
-        {                        
+        {
             base.PreDraw(g);
             mRemoteWindow.Proxy.RemoteDrawingStarted();
         }

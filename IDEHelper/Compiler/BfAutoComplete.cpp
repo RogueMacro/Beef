@@ -742,8 +742,12 @@ void BfAutoComplete::AddInnerTypes(BfTypeInstance* typeInst, const StringImpl& f
 			}
 		}
 
-		if (CheckProtection(innerType->mProtection, innerType, allowProtected, allowPrivate))
-			AddTypeDef(innerType, filter);
+		auto useInnerType = innerType;
+		if (useInnerType->mIsPartial)
+			useInnerType = mModule->GetCombinedPartialTypeDef(useInnerType);
+
+		if (CheckProtection(useInnerType->mProtection, useInnerType, allowProtected, allowPrivate))
+			AddTypeDef(useInnerType, filter);
 	}
 
 	allowPrivate = false;
@@ -981,6 +985,13 @@ void BfAutoComplete::AddTypeMembers(BfTypeInstance* typeInst, bool addStatic, bo
 
 		bool canUseMethod;
 		canUseMethod = (methodDef->mMethodType == BfMethodType_Normal) || (methodDef->mMethodType == BfMethodType_Mixin);
+
+		if ((methodDef->mMethodType == BfMethodType_Ctor) && (typeInst->IsStruct()))
+		{
+			AddMethod(typeInst, methodDef, NULL, methodDef->GetMethodDeclaration(), "this", filter);
+			continue;
+		}
+
 		if (isInterface)
 		{
 			// Always allow
@@ -1362,8 +1373,10 @@ void BfAutoComplete::AddExtensionMethods(BfTypeInstance* targetType, BfTypeInsta
 				auto genericParamType = (BfGenericParamType*)thisType;
 				if (genericParamType->mGenericParamKind == BfGenericParamKind_Method)
 				{
+					BfTypeVector genericTypeVector;
+					genericTypeVector.Add(targetType);
 					auto& genericParams = methodInstance->mMethodInfoEx->mGenericParams;
-					if (!mModule->CheckGenericConstraints(BfGenericParamSource(methodInstance), targetType, NULL, genericParams[genericParamType->mGenericParamIdx], NULL, NULL))
+					if (!mModule->CheckGenericConstraints(BfGenericParamSource(methodInstance), targetType, NULL, genericParams[genericParamType->mGenericParamIdx], &genericTypeVector, NULL))
 						continue;
 					paramValidated = true;
 				}
@@ -3545,6 +3558,8 @@ void BfAutoComplete::CheckInterfaceFixit(BfTypeInstance* typeInstance, BfAstNode
 
 		for (int iMethodIdx = 0; iMethodIdx < iMethodCount; iMethodIdx++)
 		{
+			if (iMethodIdx + startIdx >= typeInstance->mInterfaceMethodTable.mSize)
+				continue;
 			auto matchedMethodRef = &typeInstance->mInterfaceMethodTable[iMethodIdx + startIdx].mMethodRef;
 			BfMethodInstance* matchedMethod = *matchedMethodRef;
 			auto ifaceMethodInst = ifaceInst->mMethodInstanceGroups[iMethodIdx].mDefault;

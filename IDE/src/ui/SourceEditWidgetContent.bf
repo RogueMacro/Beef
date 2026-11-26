@@ -563,7 +563,7 @@ namespace IDE.ui
 					g.FillRect(rect.mX + 1, rect.mY + 1, rect.mWidth - 2, rect.mHeight - 2);
 				}
 
-				if ((mEditWidgetContent.CurSelection != null) && (mCollapseIndex < mEditWidgetContent.mOrderedCollapseEntries.Count))
+				if ((mEditWidgetContent.CurSelection != null) && (mCollapseIndex >= 0) && (mCollapseIndex < mEditWidgetContent.mOrderedCollapseEntries.Count))
 				{
 					var collapseEntry = mEditWidgetContent.mOrderedCollapseEntries[mCollapseIndex];
 					int32 startIdx = mEditWidgetContent.mData.mLineStarts[collapseEntry.mStartLine];
@@ -792,6 +792,7 @@ namespace IDE.ui
 				0xFFFFFFFF, // Local
 				0xFFFFFFFF, // Parameter
 				0xFFFFFFFF, // Member
+				0xFFFFFFFF, // Static
                 0xFFA6E22A, // Method
 				0xFF66D9EF, // Type
 				0xFF66D9EF, // PrimitiveType
@@ -806,6 +807,7 @@ namespace IDE.ui
 
                 0xFFFF0000, // Error
 
+				0xFF808080, // BuildText,
 				0xFFFF8080, // BuildError
 				0xFFFFFF80, // BuildWarning
 				0xFF80FF80, // BuildSuccess
@@ -3819,6 +3821,12 @@ namespace IDE.ui
 			mData.mUndoManager.Add(undoBatchStart.mBatchEnd);
 		}
 
+		public override void TextChanged()
+		{
+			base.TextChanged();
+			mData.mTextChangeIdx++;
+		}
+
         public override void ContentChanged()
         {
             base.ContentChanged();
@@ -3924,7 +3932,8 @@ namespace IDE.ui
             int32 startRevision = mData.mCurTextVersionId;
             
             bool doAutocomplete = isCompletionChar;
-			if ((mAutoComplete != null) && (keyChar == '\r') &&
+			if ((mAutoComplete != null) &&
+				((keyChar == '\r') || (keyChar == '\n')) &&
 				((!mIsMultiline) || (mAutoComplete.mIsUserRequested)))
 				doAutocomplete = true;
             bool hasEmptyAutocompleteReplace = true;
@@ -3988,7 +3997,7 @@ namespace IDE.ui
 					doAutocomplete = true;
 				}
 
-				if ((mAutoComplete != null) && (!doAutocomplete) && (mAutoComplete.mInsertStartIdx == mAutoComplete.mInsertEndIdx) && (!keyChar.IsWhiteSpace))
+				if ((mAutoComplete != null) && (!doAutocomplete) && (mAutoComplete.IsInsertEmpty()) && (!keyChar.IsWhiteSpace))
 				{
 					// Handle tag insertion even if we have no text
 					var insertText = mAutoComplete.GetInsertText(.. scope .());
@@ -4016,7 +4025,7 @@ namespace IDE.ui
                     doAutocomplete = false;
                 }*/
 
-				if ((keyChar == '[') && (mAutoComplete.mInsertStartIdx >= 0) && (mData.mText[mAutoComplete.mInsertStartIdx].mChar != '.'))
+				if ((keyChar == '[') && (mAutoComplete.mInsertStartIdx.Value >= 0) && (mData.mText[mAutoComplete.mInsertStartIdx.Value].mChar != '.'))
 				{
 					// Don't autocomplete for ".[" (member access attributes)
 					doAutocomplete = false;
@@ -4029,7 +4038,7 @@ namespace IDE.ui
 					doAutocomplete = false;
 				}
 
-				if ((mAutoComplete.mUncertain) && (keyChar != '\t') && (keyChar != '\r'))
+				if ((mAutoComplete.mUncertain) && (keyChar != '\t') && (keyChar != '\r') && (keyChar != '\n'))
 					doAutocomplete = false;
 				if (keyChar == '\x7F') /* Ctrl+Backspace */
 					doAutocomplete = false;
@@ -5055,6 +5064,7 @@ namespace IDE.ui
 						if ((mSourceViewPanel.mIsBeefSource) && (mSourceViewPanel.FilteredProjectSource != null) && (gApp.mSymbolReferenceHelper?.IsLocked != true))
 						{
 							ResolveParams resolveParams = scope .();
+							resolveParams.mOverrideCursorPos = (.)CursorTextPos;
 							mSourceViewPanel.DoClassify(ResolveType.GetFixits, resolveParams, true);
 							menuItem = menu.AddItem("Fixit");
 							
@@ -7335,4 +7345,16 @@ namespace IDE.ui
 			base.RemoveSecondaryTextCursors(force);
 		}
     }
+}
+
+namespace Beefy.widgets
+{
+	extension EditWidgetContent
+	{
+		extension Data
+		{
+			// Goes up each time the text changes. Unlike mCurTextVersionId, undo never takes this back to an earlier value
+			public int32 mTextChangeIdx;
+		}
+	}
 }

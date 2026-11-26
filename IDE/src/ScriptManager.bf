@@ -82,6 +82,9 @@ namespace IDE
 		public bool mIsBuildScript;
 		public bool mSoftFail;
 		public Verbosity mVerbosity = .Quiet;
+		// Raised with the failure message before it is reported, so a host (the MCP server) can
+		// capture it
+		public Event<delegate void(StringView err)> mOnFail ~ _.Dispose();
 
 		public bool Failed
 		{
@@ -112,6 +115,17 @@ namespace IDE
 			AddTarget(mScriptHelper);
 
 			//Exec("OutputLine(\"Hey bro!\", 2)");
+		}
+
+		// Whether the IDE is idle by the same measure Update uses to gate the next command (no
+		// compile, resolve finished, debugger settled). IsPaused reads sActiveManager, which Update
+		// sets around its own loop, so this sets it for callers outside Update.
+		public bool IsIdle()
+		{
+			var prevManager = sActiveManager;
+			sActiveManager = this;
+			defer { sActiveManager = prevManager; }
+			return mScriptHelper.IsPaused();
 		}
 
 		public void MarkNotHandled()
@@ -183,6 +197,7 @@ namespace IDE
 					errStr.AppendF(" at line {} in {}\n\t{}", mCurCmd.mLineNum + 1, mCurCmd.mSrcFile, mCurCmd.mCmd);
 			}
 
+			mOnFail(errStr);
 			if (mSoftFail)
 				gApp.OutputErrorLine(errStr);
 			else
@@ -452,11 +467,19 @@ namespace IDE
 										if (project != null)
 											projectOptions = gApp.GetCurProjectOptions(project);
 									}
+									// A test script has no project of its own, so project macros such as
+									//  $(TargetPath) resolve against the workspace's startup project
+									if (project == null)
+									{
+										project = gApp.mWorkspace.mStartupProject;
+										if (project != null)
+											projectOptions = gApp.GetCurProjectOptions(project);
+									}
 								}
 
 								String newStr = scope:: .();
 								String err = scope .();
-								if (!gApp.DoResolveConfigString("", workspaceOptions, project, projectOptions, str, err, newStr))
+								if (!gApp.DoResolveConfigString("", workspaceOptions, project, projectOptions, str, err, newStr, mContext))
 								{
 									Fail(scope String()..AppendF("Unknown macro string '{}' in '{}'", err, str));
 								}
@@ -984,7 +1007,8 @@ namespace IDE
 					}
 				}
 
-				if ((gApp.mBfResolveCompiler != null) && (gApp.mBfResolveCompiler.IsPerformingBackgroundOperation()))
+				// A classify queues the resolve-all pass a couple of updates later; a script has to wait for that too
+				if ((gApp.mBfResolveCompiler != null) && ((gApp.mBfResolveCompiler.IsPerformingBackgroundOperation()) || (!gApp.mBfResolveCompiler.HasResolvedAll())))
 					return false;
 				if (gApp.[Friend]mDeferredOpen != .None)
 					return false;
@@ -1086,7 +1110,7 @@ namespace IDE
 		public void WaitForResolve()
 		{
 			var curCmd = ScriptManager.sActiveManager.mCurCmd;
-			curCmd.mHandled = IsPaused() && (!gApp.mBfResolveCompiler.IsPerformingBackgroundOperation());
+			curCmd.mHandled = IsPaused() && (!gApp.mBfResolveCompiler.IsPerformingBackgroundOperation()) && (gApp.mBfResolveCompiler.HasResolvedAll());
 		}
 
 		[IDECommand]
@@ -1152,6 +1176,15 @@ namespace IDE
 		}
 
 		[IDECommand]
+		public void CopyFile(String origPath, String newPath)
+		{
+			if (File.Copy(origPath, newPath) case .Err)
+			{
+				mScriptManager.Fail("Failed to move file '{}' to '{}'", origPath, newPath);
+			}
+		}
+
+		[IDECommand]
 		public void DeleteFile(String path)
 		{
 			if (File.Delete(path) case .Err)
@@ -1161,9 +1194,90 @@ namespace IDE
 		}
 
 		[IDECommand]
+		public void TryDeleteFile(String path)
+		{
+			File.Delete(path).IgnoreError();
+		}
+
+		[IDECommand]
 		public void Echo(String str)
 		{
 			gApp.OutputLine(str);
+		}
+
+		[IDECommand]
+		public void Pwd()
+		{
+			gApp.OutputLine(Directory.GetCurrentDirectory(.. scope .()));
+		}
+
+		[IDECommand]
+		public void PrintBreakpoints()
+		{
+			for (var breakpoint in gApp.mDebugger.mBreakpointList)
+			{
+				var str = scope $"BREAKPOINT ";
+				if (breakpoint.mFileName != null)
+					str.AppendF($"{breakpoint.mFileName}:{breakpoint.mLineNum+1}");
+				else
+					breakpoint.ToString_Location(str);
+				if (breakpoint.IsBound())
+					str.Append(" BOUND");
+				else
+					str.Append(" UNBOUND");
+				gApp.OutputLine(str);
+			}
+		}
+
+		[IDECommand]
+		public void PrintDebugLoc()
+		{
+			String str = scope $"DEBUGLOC ";
+
+			String frameInfo = scope .();
+			String fileName = scope .();
+
+			if (gApp.mDebugger.IsRunning)
+			{
+				if (!gApp.mDebugger.IsPaused())
+				{
+					str.Append("NOT PAUSED");
+				}
+				else
+				{
+					gApp.mDebugger.GetStackFrameInfo(0, frameInfo, ?, fileName, var hotIdx, var defLineStart, var defLineEnd, var line, var column, ?, ?, var flags);
+					if (!fileName.IsEmpty)
+					{
+						int hashPos = fileName.IndexOf('#');
+						if (hashPos != -1)
+							fileName.RemoveToEnd(hashPos);
+						// Note: Line from GetStackFrameInfo is zero-based
+						str.AppendF($"{fileName}:{line+1}");
+					}
+					else
+					{
+						str.Append("FAILED");
+					}
+				}
+			}
+			else
+			{
+				str.Append("NOT RUNNING");
+			}
+
+			gApp.OutputLine(str);
+		}
+
+		[IDECommand]
+		public void PrintDbgAllocInfo()
+		{
+			String info = scope .();
+			gApp.mDebugger.GetDbgAllocInfo(info);
+			for (let line in info.Split('\n'))
+			{
+				if (!line.IsEmpty)
+					gApp.OutputLine(scope $"DBGALLOC {line}");
+			}
 		}
 
 		[IDECommand]
@@ -1354,10 +1468,25 @@ namespace IDE
 								return true;
 							}
 
-							if (File.CopyIfNewer(srcPath, destPath) case .Err)
+							bool wantCopy = true;
+
+							DateTime srcDate;
+							if (!(File.GetLastWriteTime(srcPath) case .Ok(out srcDate)))
+								wantCopy = false;
+							if (File.GetLastWriteTime(destPath) case .Ok(let destDate))
+								wantCopy = srcDate > destDate;
+
+							if (wantCopy)
 							{
-								mScriptManager.Fail("Failed to copy file '{}' to '{}'", srcPath, destPath);
-								return false;
+								if (File.CopyIfNewer(srcPath, destPath) case .Err)
+								{
+									mScriptManager.Fail("Failed to copy file '{}' to '{}'", srcPath, destPath);
+									return false;
+								}
+								else
+								{
+									gApp.OutputLine("Copied from '{}' to '{}'", srcPath, destPath);
+								}
 							}
 							return true;
 						}
@@ -1458,6 +1587,8 @@ namespace IDE
 			String dir = scope .();
 			dir.Set(gApp.mInstallDir);
 			var project = GetProject(true);
+			if (project == null)
+				project = gApp.mWorkspace.mStartupProject; // a test script runs in its startup project's directory
 			if (project?.mProjectDir.IsEmpty == false)
 				dir.Set(project.mProjectDir);
 			gApp.DoRun(exePath, exeArgs, dir, .None, null, null, runFlags);
@@ -1609,7 +1740,7 @@ namespace IDE
 			String outVal = scope String();
 			if (!Evaluate(evalStr, outVal))
 				return;
-			gApp.OutputLineSmart(outVal);
+			gApp.OutputLine(outVal);
 		}
 
 		[IDECommand]
@@ -1694,6 +1825,29 @@ namespace IDE
 		}
 
 		[IDECommand]
+		public void AssertSelectedWatchContains(String val)
+		{
+			UpdateWatches();
+
+			int foundIdx = 0;
+			gApp.mWatchPanel.mListView.GetRoot().WithItems(scope [?] (item) =>
+				{
+					let watchItem = (WatchListViewItem)item;
+					if (watchItem.Selected)
+					{
+						foundIdx++;
+						ForceWatchItem(watchItem);
+
+						let valueWatchItem = (WatchListViewItem)watchItem.GetSubItem(1);
+						if (!valueWatchItem.Label.Contains(val))
+							mScriptManager.Fail("Assert failed: {} contains {}", valueWatchItem.Label, val);
+					}
+				});
+			if (foundIdx == 0)
+				mScriptManager.Fail("No watches selected");
+		}
+
+		[IDECommand]
 		public void UpdateWatches()
 		{
 			gApp.mWatchPanel.CheckClearDirtyWatches();
@@ -1740,6 +1894,12 @@ namespace IDE
 							});
 					}
 				});
+		}
+
+		[IDECommand]
+		public void DeleteSelectedWatches()
+		{
+			gApp.mWatchPanel.[Friend]DeleteSelectedItems();
 		}
 
 		[IDECommand]
@@ -1884,6 +2044,12 @@ namespace IDE
 		}
 
 		[IDECommand]
+		public void CompileAndStartStep()
+		{
+			gApp.[Friend]StepOver();
+		}
+
+		[IDECommand]
 		public void SelectThread(String threadName)
 		{
 			String threadInfo = scope .();
@@ -1904,6 +2070,46 @@ namespace IDE
 					break;
 				}
 			}
+		}
+
+		[IDECommand]
+		public void FreezeThread(String threadName)
+		{
+			SetThreadFrozen(threadName, true);
+		}
+
+		[IDECommand]
+		public void ThawThread(String threadName)
+		{
+			SetThreadFrozen(threadName, false);
+		}
+
+		void SetThreadFrozen(String threadName, bool frozen)
+		{
+			String threadInfo = scope .();
+			gApp.mDebugger.GetThreadInfo(threadInfo);
+
+			for (var infoLine in threadInfo.Split('\n'))
+			{
+				if (@infoLine.Pos == 0)
+					continue;
+
+				var infoSections = infoLine.Split('\t');
+				StringView id = infoSections.GetNext().GetValueOrDefault();
+				StringView name = infoSections.GetNext().GetValueOrDefault();
+
+				if ((threadName == name) || (threadName == id))
+				{
+					int32 threadId = int32.Parse(id).GetValueOrDefault();
+					if (frozen)
+						gApp.mDebugger.FreezeThread(threadId);
+					else
+						gApp.mDebugger.ThawThread(threadId);
+					return;
+				}
+			}
+
+			mScriptManager.Fail("Thread '{0}' not found", threadName);
 		}
 
 		[IDECommand]
@@ -2338,7 +2544,8 @@ namespace IDE
 		[IDECommand]
 		public void AssertCompileSucceeded()
 		{
-			if (gApp.IsCompiling)
+			// A hot compile is decided only once its type data has been resolved against the program
+			if ((gApp.IsCompiling) || (gApp.mHotResolveState != .None))
 			{
 				ScriptManager.sActiveManager.mCurCmd.mHandled = false;
 				return;
@@ -2346,6 +2553,19 @@ namespace IDE
 			
 			if (gApp.mLastCompileFailed)
 				mScriptManager.Fail("Compile failed");
+		}
+
+		[IDECommand]
+		public void AssertCompileFailed()
+		{
+			if ((gApp.IsCompiling) || (gApp.mHotResolveState != .None))
+			{
+				ScriptManager.sActiveManager.mCurCmd.mHandled = false;
+				return;
+			}
+
+			if (!gApp.mLastCompileFailed)
+				mScriptManager.Fail("Compile succeeded");
 		}
 
 		[IDECommand]

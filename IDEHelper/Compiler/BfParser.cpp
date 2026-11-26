@@ -242,6 +242,7 @@ BfParserData::~BfParserData()
 {
 	if (mParseFileData != NULL)
 	{
+		AutoCrit autoCrit(gBfParserCache->mCritSect);
 		BF_ASSERT(mParseFileData->mRefCount >= 0);
 		mParseFileData->mRefCount--;
 		if (mParseFileData->mRefCount == 0)
@@ -259,6 +260,7 @@ void BfParserData::InitFileData()
 {
 	BF_ASSERT(mParseFileData == NULL);
 
+	AutoCrit autoCrit(gBfParserCache->mCritSect);
 	BfParseFileData** valuePtr = NULL;
 	if (gBfParserCache->mParseFileDataMap.TryAdd(mFileName, NULL, &valuePtr))
 	{
@@ -3019,7 +3021,7 @@ void BfParser::NextToken(int endIdx, bool outerIsInterpolate, bool disablePrepro
 						}
 						mTokenEnd = mSrcIdx;
 						mLiteral.mTypeCode = BfTypeCode_UIntPtr;
-						mLiteral.mUInt32 = (uint32)val;
+						mLiteral.mUInt64 = (uint32)val;
 						if ((hadOverflow) || ((uint64)val != (uint64)mLiteral.mUInt32))
 							mPassInstance->FailAt("Value doesn't fit into uint32", mSourceData, mTokenStart, mSrcIdx - mTokenStart);
 						mSyntaxToken = BfSyntaxToken_Literal;
@@ -3867,7 +3869,9 @@ void BfParser::Parse(BfPassInstance* passInstance)
 
 	if (mJumpTable != NULL)
 	{
-		for (int i = (startIdx / PARSER_JUMPTABLE_DIVIDE) + 1; i < mJumpTableSize; i++)
+		// Leave spare-capacity entries unset so later emissions can fill them.
+		int endIdx = mSrcLength / PARSER_JUMPTABLE_DIVIDE;
+		for (int i = (startIdx / PARSER_JUMPTABLE_DIVIDE) + 1; i <= endIdx; i++)
 			if (mJumpTable[i].mCharIdx == 0)
 				mJumpTable[i] = mJumpTable[i - 1];
 	}

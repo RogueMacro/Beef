@@ -1,4 +1,5 @@
 #include "RenderDevice.h"
+#include "ModelInstance.h"
 #include "BFApp.h"
 #include "Shader.h"
 #include "Texture.h"
@@ -15,16 +16,41 @@
 
 USING_NS_BF;
 
+static Array<String> gShaderIncludeDirs;
+
+void Beefy::AddShaderIncludeDir(const StringImpl& dir)
+{
+	if (dir.IsEmpty())
+		return;
+	String entry = dir;
+	char last = entry[entry.length() - 1];
+	if ((last != '\\') && (last != '/'))
+		entry += "\\";
+	if (!gShaderIncludeDirs.Contains(entry))
+		gShaderIncludeDirs.Add(entry);
+}
+
+const Array<String>& Beefy::GetShaderIncludeDirs()
+{
+	return gShaderIncludeDirs;
+}
+
 RenderState::RenderState()
 {
 	mWriteDepthBuffer = false;
 	mCullMode = CullMode_None;
+	mFrontFace = FrontFace_Clockwise;
 	mDepthFunc = DepthFunc_Always;
+	mStencilMode = StencilMode_Disabled;
 	mTopology = Topology3D_TriangleList;
 	mShader = NULL;
 	mClipped = false;
-	mTexWrap = false;
+	mSamplerKind = SamplerKind_Clamp;
 	mWireframe = false;
+	mDisablePixelShader = false;
+	mDisableRenderTarget = false;
+	mDisableBlend = false;
+	mAlphaToCoverage = false;
 }
 
 RenderTarget::RenderTarget()
@@ -61,6 +87,7 @@ RenderDevice::RenderDevice() :
 	mCurRenderState = NULL;
 	mDefaultRenderState = NULL;
 	mPhysRenderState = mDefaultRenderState;
+	mWindowMsaaSampleCount = 1;
 	mResizeCount = 0;
 	mCurRenderTarget = NULL;
 	mCurDrawLayer = NULL;
@@ -68,10 +95,26 @@ RenderDevice::RenderDevice() :
 	mApp = NULL;
 }
 
+void RenderDevice::DeleteModelInstance(ModelInstance* modelInstance)
+{
+	delete modelInstance;
+}
+
 RenderDevice::~RenderDevice()
 {
 	for (auto batch : mDrawBatchPool)
 		delete batch;
+}
+
+void RenderDevice::RecordSubmission(int category, Topology3D topology, int indexCount, int instanceCount)
+{
+	if ((category < 1) || (category > 3))
+		return;
+	auto& counts = mSubmissionStats[category - 1];
+	if (topology == Topology3D_TriangleList)
+		counts[0] += (int64)(indexCount / 3) * instanceCount;
+	counts[1]++;
+	counts[2] += instanceCount;
 }
 
 void RenderDevice::AddRenderWindow(RenderWindow* renderWindow)
@@ -96,6 +139,19 @@ RenderState* RenderDevice::CreateRenderState(RenderState* srcRenderState)
 	return renderState;
 }
 
+void RenderDevice::ReleaseRenderState(RenderState* renderState)
+{
+	// PhysSetRenderState diffs against mPhysRenderState, so it must not dangle -- and a later state allocated
+	// at the freed address would compare equal and skip being applied at all.
+	if (renderState == mPhysRenderState)
+	{
+		mReleasedPhysRenderState = *renderState;
+		mReleasedPhysRenderState.mShader = NULL; // The shader may be freed next; NULL forces a rebind
+		mPhysRenderState = &mReleasedPhysRenderState;
+	}
+	delete renderState;
+}
+
 VertexDefinition* Beefy::RenderDevice::CreateVertexDefinition(VertexDefData* elementData, int numElements)
 {
 	VertexDefinition* vertexDefinition = new VertexDefinition();
@@ -105,7 +161,7 @@ VertexDefinition* Beefy::RenderDevice::CreateVertexDefinition(VertexDefData* ele
 	return vertexDefinition;
 }
 
-Texture* RenderDevice::LoadTexture(const StringImpl& fileName, int flags)
+ImageData* RenderDevice::DecodeImage(const StringImpl& fileName, int flags)
 {
 	int dotPos = (int)fileName.LastIndexOf('.');
 	String ext;
@@ -114,7 +170,6 @@ Texture* RenderDevice::LoadTexture(const StringImpl& fileName, int flags)
 
 	ImageData* imageData = NULL;
 	bool handled = false;
-	bool failed = false;
 
 	if (fileName == "!white")
 	{
@@ -158,15 +213,15 @@ Texture* RenderDevice::LoadTexture(const StringImpl& fileName, int flags)
 
 	if (!handled)
 	{
-		imageData->mWantsAlphaPremultiplied = (flags & TextureFlag_NoPremult) == 0;
+		// sRGB uploads premultiply after decoding, not inside the file decoder.
+		imageData->mWantsAlphaPremultiplied = (flags & (TextureFlag_NoPremult | TextureFlag_Srgb)) == 0;
 
 		void* memPtr = NULL;
 		int memLen = 0;
 		if (ParseMemorySpan(fileName, memPtr, memLen))
-		{			
+		{
 			if (!imageData->LoadFromMemory(memPtr, memLen))
 			{
-				failed = true;
 				delete imageData;
 				return NULL;
 			}
@@ -175,19 +230,32 @@ Texture* RenderDevice::LoadTexture(const StringImpl& fileName, int flags)
 		{
 			if (!imageData->LoadFromFile(fileName))
 			{
-				failed = true;
 				delete imageData;
 				return NULL;
 			}
 		}
 	}
+	return imageData;
+}
 
-	Texture* aTexture = NULL;
-	if (!failed)
-		aTexture = LoadTexture(imageData, flags);
-
+Texture* RenderDevice::LoadTexture(const StringImpl& fileName, int flags)
+{
+	ImageData* imageData = DecodeImage(fileName, flags);
+	if (imageData == NULL)
+		return NULL;
+	Texture* aTexture = LoadTexture(imageData, flags);
 	imageData->Deref();
 	return aTexture;
+}
+
+void RenderDevice::ReleaseShader(Shader* shader)
+{
+	delete shader;
+}
+
+void RenderDevice::ReleaseComputeShader(ComputeShader* shader)
+{
+	delete shader;
 }
 
 

@@ -53,6 +53,9 @@ namespace System.Reflection
 		public bool IsStatic => Compiler.IsComptime ?
 			Type.[Friend]Comptime_Method_GetInfo(mData.mComptimeMethodInstance).mMethodFlags.HasFlag(.Static) :
 			mData.mMethodData.[Friend]mFlags.HasFlag(.Static);
+		public bool IsAbstract => Compiler.IsComptime ?
+			Type.[Friend]Comptime_Method_GetInfo(mData.mComptimeMethodInstance).mMethodFlags.HasFlag(.Abstract) :
+			mData.mMethodData.[Friend]mFlags.HasFlag(.Abstract);
 		public bool CanReflect => Compiler.IsComptime ?
 			Type.[Friend]Comptime_Method_GetInfo(mData.mComptimeMethodInstance).mComptimeMethodFlags.HasFlag(.NoReflect) :
 			mData.mMethodData.[Friend]mFlags.HasFlag(.SpecialName);
@@ -539,14 +542,26 @@ namespace System.Reflection
 			void* retData = variantData;
 
 			// Struct return? Manually add it as an arg after 'this'.  Revisit this - this is architecture-dependent.
+			#unwarn // unused in aarch64
 			int unusedRetVal;
 			FFIType* ffiRetType = null;
 			if (retType.IsStruct)
 			{
+#if BF_MACHINE_AARCH64
+				let ffiRetElements = scope:: List<FFIType*>(8);
+				for (let fi in retType.GetFields(.Instance | .DeclaredOnly))
+				{
+					let ffiType = GetFFIType!::(fi.FieldType);
+					ffiRetElements.Add(ffiType);
+				}
+				ffiRetElements.Add(null);
+				ffiRetType = scope::FFIType(Math.Max(24, retType.Size), retType.Align, .Struct, ffiRetElements.Ptr); // Force use of indirect return
+#else
 				ffiRetType = &FFIType.Void;
 				ffiParamList.Add(&FFIType.Pointer);
 				ffiArgList.Add(&variantData);
 				retData = &unusedRetVal;
+#endif
 			}
 			else
 				ffiRetType = GetFFIType!::(retType);
@@ -765,7 +780,17 @@ namespace System.Reflection
 
 					Type underlyingType = argType.UnderlyingType;
 					if (underlyingType == paramType)
+					{
 						handled = true;
+					}
+					else if ((paramType.IsValueType) && (underlyingType == typeof(Pointer<void>)))
+					{
+						ffiParamList.Add(&FFIType.Pointer);
+						ffiArgList.Add(dataPtr);
+						dataPtr = *(void**)dataPtr;
+						handled = true;
+						added = true;
+					}
 
 					if ((paramType.IsPrimitive) && (underlyingType.IsTypedPrimitive)) // Boxed primitive?
 						underlyingType = underlyingType.UnderlyingType;
@@ -933,14 +958,26 @@ namespace System.Reflection
 			void* retData = variantData;
 
 			// Struct return? Manually add it as an arg after 'this'.  Revisit this - this is architecture-dependent.
+			#unwarn // unused in aarch64
 			int unusedRetVal;
 			FFIType* ffiRetType = null;
 			if (retType.IsStruct)
 			{
+#if BF_MACHINE_AARCH64
+				let ffiRetElements = scope:: List<FFIType*>(8);
+				for (let fi in retType.GetFields(.Instance | .DeclaredOnly))
+				{
+					let ffiType = GetFFIType!::(fi.FieldType);
+					ffiRetElements.Add(ffiType);
+				}
+				ffiRetElements.Add(null);
+				ffiRetType = scope::FFIType(Math.Max(24, retType.Size), retType.Align, .Struct, ffiRetElements.Ptr); // Force use of indirect return
+#else
 				ffiRetType = &FFIType.Void;
 				ffiParamList.Add(&FFIType.Pointer);
 				ffiArgList.Add(&variantData);
 				retData = &unusedRetVal;
+#endif
 			}
 			else
 				ffiRetType = GetFFIType!::(retType);
@@ -1132,10 +1169,23 @@ namespace System.Reflection
 						let info = Type.[Friend]Comptime_Method_GetInfo(nativeMethodHandle);
 						if (info.mComptimeMethodFlags.HasFlag(.NoReflect))
 							continue;
-						bool matches = (mBindingFlags.HasFlag(BindingFlags.Static) && (info.mMethodFlags.HasFlag(.Static)));
-						matches |= (mBindingFlags.HasFlag(BindingFlags.Instance) && (!info.mMethodFlags.HasFlag(.Static)));
-						matches |= (mBindingFlags.HasFlag(BindingFlags.Public) && (info.mMethodFlags.HasFlag(.Public)));
-						matches |= (mBindingFlags.HasFlag(BindingFlags.NonPublic) && (!info.mMethodFlags.HasFlag(.Public)));
+
+						bool matches = true;
+						if (mBindingFlags & (.Static | .Instance) != 0)
+						{
+							matches &=
+								(mBindingFlags.HasFlag(.Static) && (info.mMethodFlags.HasFlag(.Static))) ||
+								(mBindingFlags.HasFlag(.Instance) && (!info.mMethodFlags.HasFlag(.Static)));
+						}
+
+						// For backwards compatibility we treat missing protection specifiers the same as '.Public | .NonPublic'
+						if (mBindingFlags & (.Public | .NonPublic) != 0)
+						{
+							matches &=
+								(mBindingFlags.HasFlag(.Public) && (info.mMethodFlags.HasFlag(.Public))) ||
+								(mBindingFlags.HasFlag(.NonPublic) && (!info.mMethodFlags.HasFlag(.Public)));
+						}
+
 						if (matches)
 							break;
 					}
@@ -1156,10 +1206,22 @@ namespace System.Reflection
 							continue;
 						}	
 						var methodData = &mTypeInstance.[Friend]mMethodDataPtr[mIdx];
-						bool matches = (mBindingFlags.HasFlag(BindingFlags.Static) && (methodData.mFlags.HasFlag(.Static)));
-						matches |= (mBindingFlags.HasFlag(BindingFlags.Instance) && (!methodData.mFlags.HasFlag(.Static)));
-						matches |= (mBindingFlags.HasFlag(BindingFlags.Public) && (methodData.mFlags.HasFlag(.Public)));
-						matches |= (mBindingFlags.HasFlag(BindingFlags.NonPublic) && (!methodData.mFlags.HasFlag(.Public)));
+						bool matches = true;
+						if (mBindingFlags & (.Static | .Instance) != 0)
+						{
+							matches &=
+								(mBindingFlags.HasFlag(.Static) && (methodData.mFlags.HasFlag(.Static))) ||
+								(mBindingFlags.HasFlag(.Instance) && (!methodData.mFlags.HasFlag(.Static)));
+						}
+
+						// For backwards compatibility we treat missing protection specifiers the same as '.Public | .NonPublic'
+						if (mBindingFlags & (.Public | .NonPublic) != 0)
+						{
+							matches &=
+								(mBindingFlags.HasFlag(.Public) && (methodData.mFlags.HasFlag(.Public))) ||
+								(mBindingFlags.HasFlag(.NonPublic) && (!methodData.mFlags.HasFlag(.Public)));
+						}
+
 						if (matches)
 							break;
 					}

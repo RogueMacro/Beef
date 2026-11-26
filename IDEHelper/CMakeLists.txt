@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.12)
 
 ################### Variables. ####################
 # Change if you want modify path or other values. #
@@ -34,6 +34,10 @@ add_definitions(
 )
 
 set (CMAKE_CXX_STANDARD 17)
+# Compiler/CeZmij.c needs C99+ with GNU extensions (zmij uses the 'asm' keyword
+# on GCC/Clang, which strict ISO mode disables)
+set (CMAKE_C_STANDARD 11)
+set (CMAKE_C_EXTENSIONS ON)
 #add_definitions(-D_GLIBCXX_USE_CXX11_ABI=1)
 
 INCLUDE(CheckIncludeFiles)
@@ -122,8 +126,10 @@ file(GLOB SRC_FILES
     SpellChecker.cpp
     Targets.cpp
     X86XmmInfo.cpp
-
-    LinuxDebugger.cpp
+    LLDBDebugger.cpp
+    LLDBDebuggerHost.cpp
+    LLDBDebuggerShadow.cpp
+    GDBDebugger.cpp
 
     Beef/BfCommon.cpp
     Clang/CDepChecker.cpp
@@ -160,6 +166,7 @@ file(GLOB SRC_FILES
     Compiler/BfVarDeclChecker.cpp
     Compiler/BfTargetTriple.cpp
     Compiler/CeMachine.cpp
+    Compiler/CeZmij.c
     Compiler/CeDebugger.cpp
     Compiler/MemReporter.cpp
 
@@ -168,7 +175,7 @@ file(GLOB SRC_FILES
     Backend/BeModule.cpp
 )
 
-find_package(LLVM 19.1 CONFIG COMPONENTS)
+find_package(LLVM 22.1 CONFIG COMPONENTS)
 
 if (LLVM_FOUND)
   message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
@@ -177,10 +184,65 @@ if (LLVM_FOUND)
   include_directories(${LLVM_INCLUDE_DIRS})
   add_definitions(${LLVM_DEFINITIONS})
 
-  string(APPEND TARGET_LIBS_OS "-lLLVM-19 ${LLVM_SYSTEM_LIBS}")
+  string(APPEND TARGET_LIBS_OS "-lLLVM-22 ${LLVM_SYSTEM_LIBS}")
   string(STRIP ${TARGET_LIBS_OS} TARGET_LIBS_OS)
 else()
   message(FATAL_ERROR "LLVM not found")
+endif()
+
+option(BF_DBG_HOST "Build the Beef debug info and expression evaluation layer" ON)
+
+if(UNIX)
+  if (APPLE)
+    # Link Apple's LLDB.framework (from Xcode or the Command Line Tools), which keeps its LLVM internal. Homebrew's
+    # liblldb links Homebrew's newer libLLVM, and that can't share a process with the LLVM 22 we link: its
+    # expression parser crashes. Apple ships no SB API headers, so those come from Homebrew's 'lldb' formula -
+    # the SB API is ABI stable.
+    execute_process(COMMAND xcode-select -p OUTPUT_VARIABLE XCODE_DEVELOPER_DIR OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    find_library(LLDB_LIBRARY NAMES LLDB PATHS "${XCODE_DEVELOPER_DIR}/../SharedFrameworks" "${XCODE_DEVELOPER_DIR}/Library/PrivateFrameworks" NO_DEFAULT_PATH)
+    find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h PATHS /opt/homebrew/opt/lldb/include /usr/local/opt/lldb/include NO_DEFAULT_PATH)
+    if (LLDB_LIBRARY)
+      get_filename_component(LLDB_FRAMEWORK_DIR "${LLDB_LIBRARY}" DIRECTORY)
+      set(LLDB_LINK_FLAGS "-F${LLDB_FRAMEWORK_DIR} -framework LLDB -Wl,-rpath,${LLDB_FRAMEWORK_DIR}")
+    endif()
+  else()
+    find_path(LLDB_INCLUDE_DIR lldb/API/LLDB.h HINTS ${LLVM_INCLUDE_DIRS})
+    find_library(LLDB_LIBRARY NAMES lldb-22 liblldb-22 lldb liblldb HINTS ${LLVM_LIBRARY_DIRS})
+    set(LLDB_LINK_FLAGS "${LLDB_LIBRARY}")
+  endif()
+
+  if (NOT BF_DBG_HOST)
+    message(WARNING "BF_DBG_HOST is OFF; IDE debugger support will be disabled")
+  elseif (LLDB_INCLUDE_DIR AND LLDB_LIBRARY)
+    message(STATUS "Found LLDB: ${LLDB_LIBRARY}")
+    include_directories(SYSTEM ${LLDB_INCLUDE_DIR})
+    add_definitions(-DLLDB_ENABLED)
+    string(APPEND TARGET_LIBS_OS " ${LLDB_LINK_FLAGS}")
+    string(STRIP ${TARGET_LIBS_OS} TARGET_LIBS_OS)
+  elseif (APPLE)
+    message(WARNING "LLDB was not found (needs Xcode or the Command Line Tools, and 'brew install lldb' for headers); IDE debugger support will be disabled")
+  else()
+    message(WARNING "LLDB was not found; IDE debugger support will be disabled")
+  endif()
+
+endif()
+
+if (BF_DBG_HOST AND NOT MSVC)
+  set(DBG_HOST_FILES
+    DbgModule.cpp
+    DebugTarget.cpp
+    DbgTypeMap.cpp
+    DbgExprEvaluator.cpp
+    DbgEvalSupport.cpp
+    DbgSymbolSupport.cpp
+    DbgEvalPool.cpp
+    HotHeap.cpp
+  )
+  if (UNIX AND NOT APPLE)
+    list(APPEND DBG_HOST_FILES ElfDbgModule.cpp)
+  endif()
+  set_source_files_properties(${DBG_HOST_FILES} PROPERTIES COMPILE_DEFINITIONS BF_DBG_64)
+  list(APPEND SRC_FILES ${DBG_HOST_FILES})
 endif()
 
 # Add library to build.
@@ -190,6 +252,10 @@ add_library(${PROJECT_NAME} STATIC
 
 if (HAVE_BACKTRACE_HEADERS)
   string(APPEND TARGET_LIBS_OS " -lbacktrace")
+  string(STRIP ${TARGET_LIBS_OS} TARGET_LIBS_OS)
+endif()
+
+if (DEFINED BF_ENABLE_SDL)
   string(STRIP ${TARGET_LIBS_OS} TARGET_LIBS_OS)
 endif()
 

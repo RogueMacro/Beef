@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.12)
 
 ################### Variables. ####################
 # Change if you want modify path or other values. #
@@ -32,6 +32,7 @@ add_definitions(
    -DFT2_BUILD_LIBRARY
    -DBFSYSLIB_DYNAMIC
    -DBP_DYNAMIC
+   -DPNG_ARM_NEON_OPT=0
 )
 
 INCLUDE(CheckIncludeFileCXX)
@@ -108,6 +109,16 @@ endif(NOT MSVC)
 
 if (DEFINED BF_ENABLE_SDL)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBF_ENABLE_SDL")
+  if (${APPLE})
+    # SDL3 is loaded at runtime, so only its headers are needed here. Homebrew's include dir
+    # isn't on the default search path (notably /opt/homebrew on Apple Silicon).
+    find_path(SDL3_INCLUDE_DIR SDL3/SDL.h HINTS /opt/homebrew/include /usr/local/include)
+    if (SDL3_INCLUDE_DIR)
+      include_directories(SYSTEM ${SDL3_INCLUDE_DIR})
+    else()
+      message(FATAL_ERROR "SDL3 headers not found. Install SDL3 (for example 'brew install sdl3').")
+    endif()
+  endif()
 endif()
 
 ################ Files ################
@@ -180,8 +191,10 @@ file(GLOB SRC_FILES
     third_party/freetype/src/pshinter/pshinter.c
     third_party/freetype/src/psnames/psmodule.c
     third_party/freetype/src/raster/raster.c
+    third_party/freetype/src/sdf/sdf.c
     third_party/freetype/src/sfnt/sfnt.c
     third_party/freetype/src/smooth/smooth.c
+    third_party/freetype/src/svg/svg.c
     third_party/freetype/src/truetype/truetype.c
     third_party/freetype/src/type1/type1.c
     third_party/freetype/src/type42/type42.c
@@ -313,8 +326,13 @@ if (${APPLE})
     file(GLOB SRC_FILES_OS
         platform/darwin/BFPlatform.cpp
         platform/darwin/DarwinCommon.cpp
+        platform/darwin/DarwinDialogs.mm
+        platform/darwin/DarwinFonts.cpp
         HeadlessApp.cpp
     )
+    # Apple framework shims. Users of these symbols must link -framework AppKit -framework UniformTypeIdentifiers
+    # (DarwinDialogs) and -framework CoreText (DarwinFonts)
+    set_source_files_properties(platform/darwin/DarwinDialogs.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 else()
     file(GLOB SRC_FILES_OS
         platform/linux/BFPlatform.cpp
@@ -324,10 +342,11 @@ else()
 endif()
 
 if (DEFINED BF_ENABLE_SDL)
-    file(GLOB SRC_FILES_OS
+    file(GLOB SRC_FILES_SDL
         platform/sdl/SdlBFApp.cpp
         platform/sdl/GLRenderDevice.cpp
     )
+    list(APPEND SRC_FILES_OS ${SRC_FILES_SDL})
 endif()
 
 # Add library to build.

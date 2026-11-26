@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.12)
 project("Beef")
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -20,5 +20,12 @@ add_subdirectory(extern/hunspell)
 add_subdirectory(IDEHelper)
 add_subdirectory(BeefBoot)
 
+if (BF_DBG_HOST AND UNIX AND NOT APPLE)
+  add_subdirectory(BeefTools/DbgModuleCheck)
+endif()
+
+if (DEFINED BUILD_IMGCREATE)
+  add_subdirectory(BeefTools/ImgCreate)
+endif()
 
 endif()

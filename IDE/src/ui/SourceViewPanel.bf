@@ -31,6 +31,7 @@ namespace IDE.ui
 		Local,
 		Parameter,
 		Member,
+		Static,
         Method,
 		Type,
 		PrimitiveType,
@@ -45,6 +46,7 @@ namespace IDE.ui
 
         Error,
 
+		BuildText,
 		BuildError,
 		BuildWarning,
 		BuildSuccess,
@@ -432,15 +434,14 @@ namespace IDE.ui
 
 		public bool mAsyncAutocomplete = true;
 
-        public SourceEditWidget mEditWidget;        
-        public ProjectSource mProjectSource;
+        public SourceEditWidget mEditWidget;
 		public FileEditData mEditData;
 		public FileRecovery.Entry mFileRecoveryEntry ~ delete _;
         public List<TrackedTextElementView> mTrackedTextElementViewList ~ DeleteContainerAndItems!(_);
         public List<BfPassInstance.BfError> mErrorList = new List<BfPassInstance.BfError>() ~ DeleteContainerAndItems!(_);
 		public List<ResolveParams> mDeferredResolveResults = new .() ~ DeleteContainerAndItems!(_);
         public bool mTrackedTextElementViewListDirty;
-        public String mFilePath ~ delete _;
+        // mFilePath is declared in ContentPanel
 		public int32 mEmitRevision = -1;
 		public SourceEmbedKind mEmbedKind;
 		public SourceViewPanel mEmbedParent;
@@ -453,6 +454,8 @@ namespace IDE.ui
         public int32 mLastTextVersionId;
         public int32 mAutocompleteTextVersionId;
         public int32 mClassifiedTextVersionId;
+        public int32 mClassifiedTextChangeIdx;
+        public int32 mResolveAllTextChangeIdx = -1;
 		public int32 mLastRecoveryTextVersionId;
 		public bool mLoadFailed;
 		String mOldVerLoadCmd ~ delete _;
@@ -835,6 +838,13 @@ namespace IDE.ui
             return ((SourceEditWidgetContent)mEditWidget.Content).mAutoComplete;
         }
 
+        public override void Describe(StructuredData data)
+        {
+            base.Describe(data);
+            if (mFilePath != null)
+                data.Add("file", mFilePath);
+        }
+
         public override void Serialize(StructuredData data)
         {
             base.Serialize(data);
@@ -907,7 +917,7 @@ namespace IDE.ui
             return true;
         }
 
-        public void QueueFullRefresh(bool configMayHaveChanged)
+        public override void QueueFullRefresh(bool configMayHaveChanged)
         {
 #if IDE_C_SUPPORT
             if ((mIsClang) && (configMayHaveChanged))
@@ -980,7 +990,7 @@ namespace IDE.ui
 			return mEditWidget == users[users.Count - 1].mEditWidget;
 		}
 
-        public bool HasUnsavedChanges()
+        public override bool HasUnsavedChanges()
         {
             //return mLastFileTextVersion != mEditWidget.Content.mData.mCurTextVersionId;
 			if (mFilePath == null)
@@ -1374,6 +1384,7 @@ namespace IDE.ui
 					resolveParams.mDocumentationName = new String(selectedEntry.mEntryDisplay);
 				}
 				resolveParams.mTextVersion = Content.mData.mCurTextVersionId;
+				resolveParams.mTextChangeIdx = Content.mData.mTextChangeIdx;
 
 				compiler.CheckThreadDone(); // Process any pending thread done callbacks
 
@@ -1389,20 +1400,30 @@ namespace IDE.ui
                     bfSystem.PerfZoneStart("DoBackground");
 				//ProcessResolveData();
 
-				bool hasFocus = mEditWidget.mHasFocus;
+				//sbool hasFocus = mEditWidget.mHasFocus;
 
 				//Debug.Assert(mProcessResolveCharData == null);
                 DuplicateEditState(out resolveParams.mCharData, out resolveParams.mCharIdSpan);
 				//Debug.WriteLine("Edit State: {0}", mProcessResolveCharData);
 
-				if (hasFocus)
+				/*if (hasFocus)
 				{
 	                if ((useResolveType == .Autocomplete) || (useResolveType == .GetSymbolInfo) || (mIsClang))
 					{
-						resolveParams.mOverrideCursorPos = (.)mEditWidget.Content.mTextCursors.Front.mCursorTextPos;
+						resolveParams.mOverrideCursorPos = (.)mEditWidget.Content.CursorTextPos;
 						/*if (useResolveType == .Autocomplete)
 							resolveParams.mOverrideCursorPos--;*/
 					}
+				}*/
+
+				resolveParams.mEditWidgetContent = ewc;
+				if (resolveParams.mOverrideCursorPos == -1)
+					resolveParams.mOverrideCursorPos = (.)ewc.CursorTextPos;
+
+				if (ewc.HasTextCursorBefore(resolveParams.mOverrideCursorPos))
+				{
+					resolveParams.mCursorTextPosition = new .(resolveParams.mOverrideCursorPos);
+					ewc.PersistentTextPositions.Add(resolveParams.mCursorTextPosition);
 				}
                     
                 //Debug.Assert(mCurParser == null);
@@ -1424,6 +1445,12 @@ namespace IDE.ui
                     mBackgroundResolveType = useResolveType;
                     mIsPerformingBackgroundClassify = true;
 					mResolveJobCount++;
+
+					if (useResolveType == .Autocomplete)
+					{
+						//Debug.WriteLine($"DoBackground {useResolveType} CursorPos:{resolveParams.mOverrideCursorPos}");
+					}
+
                     if (useResolveType == .Autocomplete)
                         compiler.DoBackgroundHi(new () => { DoClassify(.Autocomplete, resolveParams, true); }, new => ClassifyThreadDone);
 						//BackgroundResolve(new () => { DoClassify(.Autocomplete, resolveParams); });
@@ -1665,7 +1692,7 @@ namespace IDE.ui
 			}
 		}
 
-        void HandleAutocompleteInfo(ResolveType resolveType, String autocompleteInfo, bool clearList, bool changedAfterInfo)
+        void HandleAutocompleteInfo(ResolveType resolveType, String autocompleteInfo, bool clearList, bool changedAfterInfo, int32 textPosOffset = 0)
         {
             var editWidgetContent = (SourceEditWidgetContent)mEditWidget.Content;
 
@@ -1702,7 +1729,7 @@ namespace IDE.ui
 				if (editWidgetContent.mAutoComplete.mIsDocumentationPass)
 					editWidgetContent.mAutoComplete.UpdateInfo(autocompleteInfo);
 				else
-                	editWidgetContent.mAutoComplete.SetInfo(autocompleteInfo, clearList, 0, changedAfterInfo);
+                	editWidgetContent.mAutoComplete.SetInfo(autocompleteInfo, clearList, textPosOffset, changedAfterInfo);
             }
             else if ((editWidgetContent.mAutoComplete != null) && (!editWidgetContent.mAutoComplete.mIsDocumentationPass))
                 editWidgetContent.mAutoComplete.Close();
@@ -1969,10 +1996,14 @@ namespace IDE.ui
 				{
 					bool changedAfterInfo = (resolveParams != null) && (resolveParams.mTextVersion != Content.mData.mCurTextVersionId);
 
+					int32 textPosOffset = 0;
+					if (resolveParams?.mCursorTextPosition != null)
+						textPosOffset = resolveParams.mCursorTextPosition.mIndex - resolveParams.mOverrideCursorPos;
+
 					var autoComplete = GetAutoComplete();
 					if ((autoComplete != null) && (resolveParams != null))
 						autoComplete.mIsDocumentationPass = resolveParams.mDocumentationName != null;
-				    HandleAutocompleteInfo(resolveType, autocompleteInfo, true, changedAfterInfo);
+				    HandleAutocompleteInfo(resolveType, autocompleteInfo, true, changedAfterInfo, textPosOffset);
 					autoComplete = GetAutoComplete();
 					if (autoComplete != null)
 					{
@@ -1992,11 +2023,27 @@ namespace IDE.ui
         {
 			scope AutoBeefPerf("SourceViewPanel.DoClassify");
 
-			if (gApp.mDbgDelayedAutocomplete)
-				Thread.Sleep(250);
-
 			if ((resolveType == .Classify) || (resolveType == .ClassifyFullRefresh))
-				gApp.mErrorsPanel.SetNeedsResolveAll();
+			{
+				// A workspace ResolveAll exists to refresh workspace-wide errors, and those can only
+				//  change if this file's content changed. Re-classifying unchanged text - a newly shown
+				//  panel, or a refresh queued by RefreshVisibleViews after some other resolve finished -
+				//  cannot change them. Asking for one anyway closes a loop: classify -> ResolveAll ->
+				//  RefreshVisibleViews -> QueueFullRefresh -> classify -> ResolveAll
+				//
+				// A queued classify works on the text it was queued with, and we can be running on the compiler thread after
+				//  more edits have been made. Recording the live state here would mark text that has not been classified yet
+				//  as having had its ResolveAll, so the classify that does parse it would then skip the request.
+				//
+				// We compare the text change index rather than the text version id, since undo restores an earlier version id
+				//  and the next edit then reuses an id that different text already had.
+				int32 resolveAllTextChangeIdx = ((resolveParams != null) && (resolveParams.mTextChangeIdx != -1)) ? resolveParams.mTextChangeIdx : mEditWidget.Content.mData.mTextChangeIdx;
+				if (mResolveAllTextChangeIdx != resolveAllTextChangeIdx)
+				{
+					mResolveAllTextChangeIdx = resolveAllTextChangeIdx;
+					gApp.mErrorsPanel.SetNeedsResolveAll();
+				}
+			}
 
 			if ((resolveType.IsClassify) && (!resolveParams.mCharIdSpan.IsEmpty))
 			{
@@ -2056,7 +2103,10 @@ namespace IDE.ui
 
 			ProjectSource projectSource = FilteredProjectSource;
 
-			int cursorPos = mEditWidget.mEditWidgetContent.mTextCursors.Front.mCursorTextPos;
+			int cursorPos = 0;//mEditWidget.mEditWidgetContent.CursorTextPos;
+
+			if (resolveParams == null)
+				cursorPos = mEditWidget.mEditWidgetContent.CursorTextPos;
 
 			if ((resolveParams != null) && (resolveParams.mOverrideCursorPos != -1))
 				cursorPos = resolveParams.mOverrideCursorPos;
@@ -2256,6 +2306,9 @@ namespace IDE.ui
                 //  and building defs
                 parser.SetAutocomplete(Math.Max(0, mEditWidget.mEditWidgetContent.CursorTextPos - 1));
             }*/
+
+			if (gApp.mDbgDelayedAutocomplete)
+				Thread.Sleep(250);
 
 			if ((!isFastClassify) && (bfCompiler != null))
             {
@@ -2491,7 +2544,7 @@ namespace IDE.ui
             }
         }
 
-        public bool FileNameMatches(String fileName)
+        public override bool FileNameMatches(String fileName)
         {
 			if (mFilePath == null)
 				return false;
@@ -2632,7 +2685,7 @@ namespace IDE.ui
 
 		}
 
-		public void AttachToProjectSource(ProjectSource projectSource)
+		public override void AttachToProjectSource(ProjectSource projectSource)
 		{
 			mProjectSource = projectSource;
 			if (mEditData != null)
@@ -2650,7 +2703,7 @@ namespace IDE.ui
 			QueueFullRefresh(true);
 		}
 
-		public void DetachFromProjectItem(bool fileDeleted)
+		public override void DetachFromProjectItem(bool fileDeleted)
 		{
 			if (mProjectSource == null)
 				return;
@@ -2853,6 +2906,13 @@ namespace IDE.ui
 				EditGotFocus();
         }
 
+		public override void Activate(ActivateKind activateKind)
+		{
+			base.Activate(activateKind);
+			if (activateKind >= .Active)
+				FocusEdit();
+		}
+
         public override void SetFocus()
         {			
             //mEditWidget.SetFocus();
@@ -2867,7 +2927,7 @@ namespace IDE.ui
 					return true;
 				if ((mSplitBottomPanel != null) && (mSplitBottomPanel.mEditWidget.mHasFocus))
 					return true;
-				if ((mOldVersionPanel != null) && (mOldVersionPanel.mEditWidget.mHasFocus))
+				if ((mOldVersionPanel != null) && (mOldVersionPanel?.mEditWidget?.mHasFocus == true))
 					return true;
 			}
 			if (mEditWidget.mHasFocus)
@@ -2877,24 +2937,16 @@ namespace IDE.ui
 			return false;
 		}
 
-		public void SyncWithWorkspacePanel()
+		public override void SyncWithWorkspacePanel()
 		{
-			if (gApp.mProjectPanel.[Friend]mProjectToListViewMap.TryGet(mProjectSource, var matchKey, var projectListViewItem))
-			{
-				var checkLVItem = projectListViewItem.mParentItem;
-				while (checkLVItem != null)
-				{
-					checkLVItem.Open(true);
-					checkLVItem = (ProjectListViewItem)checkLVItem.mParentItem;
-				}
-
-				projectListViewItem.mListView.GetRoot().SelectItemExclusively(projectListViewItem);
-				projectListViewItem.mListView.EnsureItemVisible(projectListViewItem, false);
-			}
+			if (mProjectSource != null)
+				gApp.mProjectPanel.SelectProjectItem(mProjectSource);
 		}
 
         public override void EditGotFocus()
         {
+			ContentGotFocus();
+
 			if ((mFilePath != null) && (mEmbedKind == .None))
 				gApp.AddToRecentDisplayedFilesList(mFilePath);
 			if (mLoadFailed)
@@ -2943,6 +2995,8 @@ namespace IDE.ui
 				{
 					SyncWithWorkspacePanel();
 				}
+
+				gApp.mErrorsPanel?.OnActiveSourceViewChanged();
 			}
         }
 
@@ -3324,6 +3378,7 @@ namespace IDE.ui
 
 			ClearLoadFailed();
 
+			Debug.Assert(filePath != "Target View");
 			Debug.Assert(!mDisposed);
 
 			String useFilePath = null;
@@ -3875,7 +3930,7 @@ namespace IDE.ui
             public String mLine;
         }*/
 
-        public void Reload()
+        public override void Reload()
         {
 			bool needsFreshLoad = mLoadFailed;
 			if ((mEditData != null) && (!Path.Equals(mFilePath, mEditData.mFilePath)))
@@ -3984,7 +4039,7 @@ namespace IDE.ui
 			}
 		}
 
-		public void RefusedReload()
+		public override void RefusedReload()
 		{
 			if (mEditData != null)
 			{
@@ -5223,7 +5278,7 @@ namespace IDE.ui
             	mNavigationBar.ShowDropdown();            
         }
 
-		public void FixitAtCursor()
+		public virtual void FixitAtCursor()
 		{
 			if (!mIsBeefSource)
 				return;
@@ -6773,8 +6828,11 @@ namespace IDE.ui
             }
 #endif
 
+            // Undo restores an earlier text version id, so the text can change and still show the version id we last saw.
+            //  The change index only ever goes up, so it catches that.
             if ((mLastTextVersionId != mEditWidget.Content.mData.mCurTextVersionId) ||
-                (mClassifiedTextVersionId != mEditWidget.Content.mData.mCurTextVersionId))
+                (mClassifiedTextVersionId != mEditWidget.Content.mData.mCurTextVersionId) ||
+                (mClassifiedTextChangeIdx != mEditWidget.Content.mData.mTextChangeIdx))
             {
                 if ((mIsBeefSource) && (projectSource != null))
                 {
@@ -6792,11 +6850,13 @@ namespace IDE.ui
                 }
 #endif
 
-                if (mClassifiedTextVersionId != mEditWidget.Content.mData.mCurTextVersionId)
+                if ((mClassifiedTextVersionId != mEditWidget.Content.mData.mCurTextVersionId) ||
+                    (mClassifiedTextChangeIdx != mEditWidget.Content.mData.mTextChangeIdx))
                 {
                     mWantsSpellCheck = true;
                     mWantsFullClassify = true;
                     mClassifiedTextVersionId = mEditWidget.Content.mData.mCurTextVersionId;
+                    mClassifiedTextChangeIdx = mEditWidget.Content.mData.mTextChangeIdx;
 
                     if ((mProjectSource != null) && (IDEApp.sApp.mWakaTime != null) && (IsControllingEditData()))
                     {

@@ -305,6 +305,8 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	[CLink]
 	public static extern Windows.IntBool FillConsoleOutputAttribute(Windows.Handle handle, uint16 attribute, int32 length, POINT writeCoord, out int32 numCharsWritten);
+
+	public static function int32 (Windows.HWnd hwnd) sGetDpiForWindow;
 #endif
 
 	ScreenInfo mScreenInfo ~ delete _;
@@ -344,7 +346,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 		get
 		{
 #if BF_PLATFORM_WINDOWS
-			var outHandle = Console.[Friend]GetStdHandle(Console.STD_OUTPUT_HANDLE);
+			var outHandle = OpenConsoleHandle(false);
+			defer
+			{
+				if (!outHandle.IsInvalid)
+					outHandle.Close();
+			}
 			CONSOLE_SCREEN_BUFFER_INFOEX info = default;
 			info.mSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
 			if (GetConsoleScreenBufferInfoEx(outHandle, ref info))
@@ -359,6 +366,16 @@ class WinNativeConsoleProvider : ConsoleProvider
 	public override int ScrollTop => (mScreenInfo != null) ? mScreenInfo.mScrollTop : 0;
 	public override bool CursorVisible => (mScreenInfo != null) ? (mScreenInfo.mCursorInfo.mVisible != 0) : true;
 	public override float CursorHeight => (mScreenInfo != null) ? (mScreenInfo.mCursorInfo.mSize / 100.0f) : 0.15f;
+
+
+	public this()
+	{
+		if (sGetDpiForWindow == null)
+		{
+			var lib = Windows.LoadLibraryA("user32.dll");
+			sGetDpiForWindow = (.)Windows.GetProcAddress(lib, "GetDpiForWindow");
+		}
+	}
 
 	public ~this()
 	{
@@ -389,6 +406,8 @@ class WinNativeConsoleProvider : ConsoleProvider
 		if (mScreenInfo.mFullCharInfo != null)
 		{
 			int bufRow = row + mScreenInfo.mScrollTop;
+			if (col >= mScreenInfo.mInfo.mWidth)
+				return default;
 			int idx = bufRow * mScreenInfo.mInfo.mWidth + col;
 			int maxIdx = (int)mScreenInfo.mInfo.mWidth * mScreenInfo.mInfo.mHeight;
 			if ((idx < 0) || (idx >= maxIdx))
@@ -397,17 +416,35 @@ class WinNativeConsoleProvider : ConsoleProvider
 			return .() { mChar = info.mChar, mAttributes = info.mAttributes };
 		}
 
-		int idx = row * mScreenInfo.mInfo.mWindowRect.Width + col;
-		int maxIdx = (int)mScreenInfo.mInfo.mWindowRect.Width * mScreenInfo.mInfo.mWindowRect.Height;
+		int cols = mScreenInfo.mInfo.mWindowRect.Width;
+		int rows = mScreenInfo.mInfo.mWindowRect.Height;
+		if (col >= cols)
+			return default;
+		int idx = row * cols + col;
+		int maxIdx = (int)cols * rows;
 		if ((idx < 0) || (idx >= maxIdx))
 			return default;
 		var info = mScreenInfo.mCharInfo[idx];
 		return .() { mChar = info.mChar, mAttributes = info.mAttributes };
 	}
 
+	// Standard handles may be redirected to files or pipes. Open the console devices
+	// directly without changing the process's redirection. Reopen for each operation
+	// so output follows the active screen buffer, including after a console reattach.
+	static Windows.Handle OpenConsoleHandle(bool input)
+	{
+		return Windows.CreateFileA(input ? "CONIN$" : "CONOUT$",
+			Windows.GENERIC_READ | Windows.GENERIC_WRITE, .ReadWrite, null, .Open, 0, default);
+	}
+
 	public bool GetScreenInfo(ScreenInfo screenInfo)
 	{
-		var outHandle = Console.[Friend]GetStdHandle(Console.STD_OUTPUT_HANDLE);
+		var outHandle = OpenConsoleHandle(false);
+		defer
+		{
+			if (!outHandle.IsInvalid)
+				outHandle.Close();
+		}
 
 		CONSOLE_SCREEN_BUFFER_INFOEX info = default;
 		info.mSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
@@ -460,7 +497,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 		DeleteAndNullify!(screenInfo.mCharInfo);
 
-		var outHandle = Console.[Friend]GetStdHandle(Console.STD_OUTPUT_HANDLE);
+		var outHandle = OpenConsoleHandle(false);
+		defer
+		{
+			if (!outHandle.IsInvalid)
+				outHandle.Close();
+		}
 		POINT bufferSize = .(screenInfo.mInfo.mWidth, screenInfo.mInfo.mHeight);
 		screenInfo.mFullCharInfo = new .[(int32)screenInfo.mInfo.mWidth * screenInfo.mInfo.mHeight]*;
 		RECT readRegion = .(0, 0, screenInfo.mInfo.mWidth, screenInfo.mInfo.mHeight);
@@ -516,7 +558,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 		if (!mHasConsole)
 			return;
 
-		var outHandle = Console.[Friend]GetStdHandle(Console.STD_OUTPUT_HANDLE);
+		var outHandle = OpenConsoleHandle(false);
+		defer
+		{
+			if (!outHandle.IsInvalid)
+				outHandle.Close();
+		}
 		CONSOLE_SCREEN_BUFFER_INFOEX info = default;
 		info.mSize = sizeof(CONSOLE_SCREEN_BUFFER_INFOEX);
 #if BF_PLATFORM_WINDOWS
@@ -539,7 +586,24 @@ class WinNativeConsoleProvider : ConsoleProvider
 		uint32 style = (.)Windows.GetWindowLong(window, Windows.GWL_STYLE);
 		uint32 styleEx = (.)Windows.GetWindowLong(window, Windows.GWL_EXSTYLE);
 
-		Windows.Rect rect = .(0, 0, (.)(cols * fontInfo.mSize.x), (.)(rows * fontInfo.mSize.y));
+		float colsF = cols;
+		float rowsF = rows;
+
+		float scale = 1.0f;
+		if (sGetDpiForWindow != null)
+		{
+			int32 dpi = sGetDpiForWindow(window);
+			if ((dpi > 0) && (dpi != 96))
+			{
+				scale = dpi / 96.0f;
+				fontInfo.mSize.x = (.)(fontInfo.mSize.x * scale + 0.05f);
+				fontInfo.mSize.y = (.)(fontInfo.mSize.y * scale + 0.05f);
+				colsF -= 0.85f;
+				rowsF -= 0.85f;
+			}
+		}
+
+		Windows.Rect rect = .(0, 0, (.)(colsF * fontInfo.mSize.x), (.)(rowsF * fontInfo.mSize.y));
 		Windows.AdjustWindowRectEx(ref rect, style, false, styleEx);
 
 		Windows.SetWindowPos(window, default, 0, 0, rect.Width, rect.Height,
@@ -629,7 +693,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	public override void MouseDown(int col, int row, int btnState, int btnCount, KeyFlags keyFlags)
 	{
-		var inHandle = Console.[Friend]GetStdHandle(Console.STD_INPUT_HANDLE);
+		var inHandle = OpenConsoleHandle(true);
+		defer
+		{
+			if (!inHandle.IsInvalid)
+				inHandle.Close();
+		}
 		INPUT_RECORD input = default;
 		input.mEventType = 2 /*MOUSE_EVENT */;
 		input.mEventData.mMouseEvent.mButtonState = (.)btnState;
@@ -642,7 +711,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	public override void MouseMove(int col, int row, int btnState, KeyFlags keyFlags)
 	{
-		var inHandle = Console.[Friend]GetStdHandle(Console.STD_INPUT_HANDLE);
+		var inHandle = OpenConsoleHandle(true);
+		defer
+		{
+			if (!inHandle.IsInvalid)
+				inHandle.Close();
+		}
 		INPUT_RECORD input = default;
 		input.mEventType = 2 /*MOUSE_EVENT */;
 		input.mEventData.mMouseEvent.mEventFlags |= 1; /* MOUSE_MOVED */
@@ -654,7 +728,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	public override void MouseUp(int col, int row, int btnState, KeyFlags keyFlags)
 	{
-		var inHandle = Console.[Friend]GetStdHandle(Console.STD_INPUT_HANDLE);
+		var inHandle = OpenConsoleHandle(true);
+		defer
+		{
+			if (!inHandle.IsInvalid)
+				inHandle.Close();
+		}
 		INPUT_RECORD input = default;
 		input.mEventType = 2 /*MOUSE_EVENT */;
 		input.mEventData.mMouseEvent.mButtonState = (.)btnState;
@@ -678,7 +757,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	public override void KeyDown(KeyCode keyCode, KeyFlags keyFlags)
 	{
-		var inHandle = Console.[Friend]GetStdHandle(Console.STD_INPUT_HANDLE);
+		var inHandle = OpenConsoleHandle(true);
+		defer
+		{
+			if (!inHandle.IsInvalid)
+				inHandle.Close();
+		}
 		INPUT_RECORD input = default;
 
 		/*if (keyEvent.mKeyCode == .F1)
@@ -760,7 +844,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	public override void KeyUp(KeyCode keyCode)
 	{
-		var inHandle = Console.[Friend]GetStdHandle(Console.STD_INPUT_HANDLE);
+		var inHandle = OpenConsoleHandle(true);
+		defer
+		{
+			if (!inHandle.IsInvalid)
+				inHandle.Close();
+		}
 		INPUT_RECORD input = default;
 		input.mEventType = 1 /*KEY_EVENT */;
 		input.mEventData.mKeyEvent.mVirtualKeyCode = (.)keyCode;
@@ -769,7 +858,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	public override void SendInput(StringView str)
 	{
-		var inHandle = Console.[Friend]GetStdHandle(Console.STD_INPUT_HANDLE);
+		var inHandle = OpenConsoleHandle(true);
+		defer
+		{
+			if (!inHandle.IsInvalid)
+				inHandle.Close();
+		}
 		for (var c in str.DecodedChars)
 		{
 			INPUT_RECORD input = default;
@@ -821,7 +915,12 @@ class WinNativeConsoleProvider : ConsoleProvider
 
 	public static void ClearConsole()
 	{
-		var outHandle = Console.[Friend]GetStdHandle(Console.STD_OUTPUT_HANDLE);
+		var outHandle = OpenConsoleHandle(false);
+		defer
+		{
+			if (!outHandle.IsInvalid)
+				outHandle.Close();
+		}
 
 		POINT coordScreen = default;    // home for the cursor
 		int32 cCharsWritten;

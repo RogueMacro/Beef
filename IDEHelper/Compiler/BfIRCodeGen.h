@@ -3,6 +3,7 @@
 #include "BfIRBuilder.h"
 #include "BfSystem.h"
 #include "BfTargetTriple.h"
+#include "llvm/IR/ValueMap.h"
 
 namespace llvm
 {
@@ -116,19 +117,16 @@ enum BfIRSizeAlignKind
 	BfIRSizeAlignKind_Aligned,
 };
 
-enum BfIRSimdType
-{
-	BfIRSimdType_None,
-	BfIRSimdType_SSE,
-	BfIRSimdType_SSE2,
-	BfIRSimdType_AVX,
-	BfIRSimdType_AVX2,
-	BfIRSimdType_AVX512
-};
-
 class BfIRCodeGen : public BfIRCodeGenBase
 {
 public:
+	struct FunctionOptions
+	{
+		BfFloatingPointMode mFloatingPointMode;
+		BfSIMDSetting mSIMDSetting;
+		BfFMASetting mFMASetting;
+	};
+
 	BfIRBuilder* mBfIRBuilder;
 
 	BumpAllocator mAlloc;
@@ -138,6 +136,8 @@ public:
 	llvm::LLVMContext* mLLVMContext;
 	llvm::Module* mLLVMModule;
 	llvm::Function* mActiveFunction;
+	// AllowFMA: a*b +- c is fused only when the fmul is a direct operand, i.e. within one expression
+	bool mContractFMulAdd;
 	BfIRTypeEx* mActiveFunctionType;
 	llvm::IRBuilder<>* mIRBuilder;
 	llvm::AttributeList* mAttrSet;
@@ -168,10 +168,13 @@ public:
 	Array<llvm::Constant*> mConfigConsts64;
 	Dictionary<BfIRTypeEx*, BfIRTypedValue> mReflectDataMap;
 	Dictionary<BfIRTypeEx*, BfIRTypeEx*> mAlignedTypeToNormalType;
-	Dictionary<BfIRTypeEx*, int> mTypeToTypeIdMap;
-	HashSet<llvm::BasicBlock*> mLockedBlocks;
+	Dictionary<BfIRTypeEx*, int> mTypeToTypeIdMap;	
+	// Blocks split by inline checks -> the block continuing them. Uses value handles so entries for deleted blocks drop out
+	// rather than matching a new block that reuses the address
+	llvm::ValueMap<llvm::BasicBlock*, llvm::WeakVH> mRemappedEndingBlocks;
 	OwnedArray<BfIRIntrinsicData> mIntrinsicData;
-	Dictionary<llvm::Function*, BfIRSimdType> mFunctionsUsingSimd;
+	Dictionary<llvm::Function*, BfSIMDSetting> mFunctionsUsingSimd;
+	Dictionary<llvm::Function*, FunctionOptions> mFunctionOptions;
 	Array<BfIRTypeEx*> mIRTypeExs;
 	BfIRTypedValue mLastFuncCalled;
 
@@ -181,6 +184,7 @@ public:
 	void FixValues(llvm::StructType* structType, llvm::SmallVector<llvm::Constant*, 8>& values);
 	void FixIndexer(llvm::Value*& val);
 	void FixTypedValue(BfIRTypedValue& typedValue);
+	void FixEndingBlock(llvm::BasicBlock*& basicBlock);
 	BfTypeCode GetTypeCode(llvm::Type* type, bool isSigned);
 	llvm::Type* GetLLVMType(BfTypeCode typeCode, bool& isSigned);
 	BfIRTypeEx* GetTypeEx(llvm::Type* llvmType);
@@ -282,9 +286,15 @@ public:
 	void SetCodeGenOptions(BfCodeGenOptions codeGenOptions);
 	void SetConfigConst(int idx, int value) override;
 
-	void SetActiveFunctionSimdType(BfIRSimdType type);
-	String GetSimdTypeString(BfIRSimdType type);
-	BfIRSimdType GetSimdTypeFromFunction(llvm::Function* function);
+	void SetFunctionSimdType(llvm::Function* function, BfSIMDSetting type);
+	void SetActiveFunctionSimdType(BfSIMDSetting type);
+	String GetSimdTypeString(BfSIMDSetting type);
+	String GetTargetFeatures(BfSIMDSetting type, BfFMASetting fmaSetting);
+	FunctionOptions GetFunctionOptions(llvm::Function* function);
+	void UpdateFunctionOptions(llvm::Function* function);
+	void UpdateActiveFunctionMathFlags();
+	llvm::Value* CreateFAddSub(llvm::Value* lhs, llvm::Value* rhs, bool isSub);
+	BfSIMDSetting GetSimdTypeFromFunction(llvm::Function* function);
 
 	BfIRTypedValue GetTypedValue(int streamId);
 	llvm::Value* GetLLVMValue(int streamId);

@@ -193,7 +193,6 @@ bool BfGenericParamInstance::IsEnum()
 		if ((module != NULL) && (mTypeConstraint->IsInstanceOf(module->mCompiler->mEnumTypeDef)))
 			return true;
 	}
-	return true;
 	return false;
 }
 
@@ -278,6 +277,7 @@ BfType::BfType()
 	mTypeId = -1;
 	mContext = NULL;
 	mRevision = -1;
+	mActiveRevision = -1;
 
 	//mLastUsedRevision = -1;
 
@@ -335,6 +335,8 @@ BfNonGenericMethodRef::operator BfMethodInstance* () const
 	if (mTypeInstance == NULL)
 		return NULL;
 	if (mMethodNum < 0)
+		return NULL;
+	if (mMethodNum >= mTypeInstance->mMethodInstanceGroups.mSize)
 		return NULL;
 	auto& methodSpecializationGroup = mTypeInstance->mMethodInstanceGroups[mMethodNum];
 	BF_ASSERT((methodSpecializationGroup.mDefault != NULL) || (mTypeInstance->mTypeFailed));
@@ -461,7 +463,7 @@ BfMethodRef& BfMethodRef::operator=(BfMethodInstance* methodInstance)
 				mMethodGenericArguments.Add(type);
 		}
 		mSignatureHash = (int)mTypeInstance->mTypeDef->mSignatureHash;
-		if (methodInstance->mAlwaysInline)
+		if (methodInstance->mInlineKind == BfInlineKind_Always)
 			mMethodRefFlags = BfMethodRefFlag_AlwaysInclude;
 		else
 			mMethodRefFlags = BfMethodRefFlag_None;
@@ -632,7 +634,7 @@ int BfFieldInstance::GetAlign(int packing)
 				{
 					BfIRConstHolder* constHolder = module->mCurTypeInstance->mConstHolder;
 					auto constant = constHolder->GetConstant(attrib.mCtorArgs[0]);
-					if (constant != NULL)
+					if ((constant != NULL) && (constant->mConstType != BfConstType_Undef))
 					{
 						int alignOverride = (int)BF_MAX(1, constant->mInt64);
 						if ((alignOverride & (alignOverride - 1)) == 0)
@@ -740,6 +742,7 @@ void BfMethodInstance::Dispose(bool isDeleting)
 	if (mMethodInstanceGroup != NULL)
 	{
 		BfLogSys(GetOwner()->mModule->mSystem, "BfMethodInstance::~BfMethodInstance %p Local:%d InCEMachine:%d Deleting:%d\n", this, mMethodDef->mIsLocalMethod, mInCEMachine, isDeleting);
+		BF_ASSERT(!mInCEMachine);
 	}
 	else
 	{
@@ -766,6 +769,12 @@ void BfMethodInstance::Dispose(bool isDeleting)
 	}
 }
 
+void BfMethodInstance::RemoveMethodFromCEMachine(BfCompiler* compiler)
+{
+	if (mInCEMachine)
+		compiler->mCeMachine->RemoveMethod(this);
+}
+
 void BfMethodInstance::CopyFrom(BfMethodInstance* methodInstance)
 {
 	*this = *methodInstance;
@@ -783,6 +792,7 @@ void BfMethodInstance::CopyFrom(BfMethodInstance* methodInstance)
 			*mMethodInfoEx->mClosureInstanceInfo = *methodInstance->mMethodInfoEx->mClosureInstanceInfo;
 		}
 	}
+	mInCEMachine = false;
 	mHasMethodRefType = false;
 	mHasBeenProcessed = false;
 	mIRFunction = BfIRValue();
@@ -823,6 +833,8 @@ BfMethodFlags BfMethodInstance::GetMethodFlags()
 		methodFlags = (BfMethodFlags)(methodFlags | BfMethodFlags_Static);
 	if ((mMethodDef->mIsVirtual) || (mVirtualTableIdx != -1))
 		methodFlags = (BfMethodFlags)(methodFlags | BfMethodFlags_Virtual);
+	if (mMethodDef->mIsAbstract)
+		methodFlags = (BfMethodFlags)(methodFlags | BfMethodFlags_Abstract);
 	if (mMethodDef->mCallingConvention == BfCallingConvention_Fastcall)
 		methodFlags = (BfMethodFlags)(methodFlags | BfMethodFlags_FastCall);
 	if (mMethodDef->mIsMutating)
@@ -976,11 +988,18 @@ int BfMethodInstance::GetStructRetIdx(bool forceStatic)
 		if ((returnTypeInst != NULL) && (returnTypeInst->mHasUnderlyingArray))
 			return -1;
 
-		auto thisType = mMethodInstanceGroup->mOwner;
-		if (thisType->mModule->mCompiler->mOptions.mPlatformType != BfPlatformType_Windows)
+		auto owner = mMethodInstanceGroup->mOwner;
+		if (owner->mModule->mCompiler->mOptions.mPlatformType != BfPlatformType_Windows)
 			return 0;
+		BfType* thisType = owner;
 		if ((mMethodInfoEx != NULL) && (mMethodInfoEx->mClosureInstanceInfo != NULL) && (mMethodInfoEx->mClosureInstanceInfo->mThisOverride != NULL))
 			thisType = mMethodInfoEx->mClosureInstanceInfo->mThisOverride;
+		else if ((mMethodDef->mHasExplicitThis) && (!mParams.IsEmpty()))
+		{
+			// A function type with an explicit 'this' calls an instance method of that type, so the sret position
+			//  must follow that type (not the function type itself), or the sret and 'this' args are swapped
+			thisType = mParams[0].mResolvedType;
+		}
 
 		if ((!HasThis()) || (forceStatic))
 			return 0;
@@ -1061,7 +1080,7 @@ bool BfMethodInstance::IsVarArgs()
 
 bool BfMethodInstance::AlwaysInline()
 {
-	return mAlwaysInline;
+	return mInlineKind == BfInlineKind_Always;
 }
 
 BfImportCallKind BfMethodInstance::GetImportCallKind()
@@ -1174,7 +1193,10 @@ void BfMethodInstance::GetParamName(int paramIdx, StringImpl& name, int& namePre
 	{
 		if (paramIdx < (int)mMethodInfoEx->mClosureInstanceInfo->mCaptureEntries.size())
 		{
-			name = mMethodInfoEx->mClosureInstanceInfo->mCaptureEntries[paramIdx].mName;
+			auto& captureEntry = mMethodInfoEx->mClosureInstanceInfo->mCaptureEntries[paramIdx];
+			name = captureEntry.mName;
+			// So '@x' inside the local method finds a local declared as '@x', as it does outside
+			namePrefixCount = captureEntry.mNamePrefixCount;
 			return;
 		}
 	}
@@ -1300,6 +1322,17 @@ BfParamKind BfMethodInstance::GetParamKind(int paramIdx)
 	if (methodParam->mDelegateParamIdx != -1)
 		return BfParamKind_DelegateParam;
 	return paramDef->mParamKind;
+}
+
+bool BfMethodInstance::GetParamHasDefault(int paramIdx)
+{
+	if (paramIdx == -1)
+		return false;
+	BfMethodParam* methodParam = &mParams[paramIdx];
+	if ((methodParam->mParamDefIdx < 0) || (methodParam->mParamDefIdx >= mMethodDef->mParams.mSize))
+		return false;
+	BfParameterDef* paramDef = mMethodDef->mParams[methodParam->mParamDefIdx];
+	return (paramDef->mParamDeclaration != NULL) && (paramDef->mParamDeclaration->mInitializer != NULL);
 }
 
 bool BfMethodInstance::WasGenericParam(int paramIdx)
@@ -1490,11 +1523,12 @@ void BfMethodInstance::GetIRFunctionInfo(BfModule* module, BfIRType& returnType,
 		bool doSplat = false;
 		if (paramIdx == -1)
 		{
+			// A NoSplat 'this' is passed by pointer, as PushThis does - it has reference semantics there
 			if (ForcingThisPtr())
 			{
 				// Pass by pointer even for typed primitives
 			}
-			else if ((!mMethodDef->mIsMutating) && (checkType->IsTypedPrimitive()))
+			else if ((!mMethodDef->HasNoThisSplat()) && (checkType->IsTypedPrimitive()))
 			{
 				checkType = checkType->GetUnderlyingType();
 			}
@@ -1502,7 +1536,7 @@ void BfMethodInstance::GetIRFunctionInfo(BfModule* module, BfIRType& returnType,
 			{
 				doSplat = true;
 			}
-			else if ((!module->mIsComptimeModule) && (!mMethodDef->mIsMutating) && (mCallingConvention == BfCallingConvention_Unspecified))
+			else if ((!module->mIsComptimeModule) && (AllowsSplatting(-1)))
 				checkLowered = true;
 		}
 		else
@@ -1801,6 +1835,20 @@ BfMethodInstanceGroup::~BfMethodInstanceGroup()
 	delete mDefaultCustomAttributes;
 }
 
+void BfMethodInstanceGroup::RemoveMethodsFromCEMachine(BfCompiler* compiler)
+{
+	if (mDefault != NULL)
+		mDefault->RemoveMethodFromCEMachine(compiler);
+	if (mMethodSpecializationMap != NULL)
+	{
+		for (auto& methodSpecializationItr : *mMethodSpecializationMap)
+		{
+			auto methodInstance = methodSpecializationItr.mValue;
+			methodInstance->RemoveMethodFromCEMachine(compiler);			
+		}
+	}
+}
+
 //////////////////////////////////////////////////////////////////////////
 
 BfTypeInstance::~BfTypeInstance()
@@ -2094,7 +2142,64 @@ bool BfTypeInstance::GetLoweredType(BfTypeUsage typeUsage, BfTypeCode* outTypeCo
 	if ((mTypeDef->mTypeCode != BfTypeCode_Struct) || (IsBoxed()) || (mIsSplattable))
 		return false;
 	if (mHasUnderlyingArray)
+	{
+		BfType* underlyingArrayType = NULL;
+		int underlyingArraySize = -1;
+		bool underlyingIsVector = false;
+		GetUnderlyingArray(underlyingArrayType, underlyingArraySize, underlyingIsVector);
+
+		// Only vector types get lowered - sized arrays were never lowered here, and FloatX types don't follow the Win64 ABI
+		if ((underlyingArrayType == NULL) || (!underlyingIsVector) || (!underlyingArrayType->IsPrimitiveType()))
+			return false;
+		auto primType = (BfPrimitiveType*)underlyingArrayType;
+		auto underlyingArrayTypeCode = primType->mTypeDef->mTypeCode;
+
+		if ((underlyingArrayTypeCode == BfTypeCode_Float) && (underlyingArraySize == 2))
+		{
+			if (outTypeCode != NULL)
+				*outTypeCode = BfTypeCode_Float2;
+			return true;
+		}
+		if ((underlyingArrayTypeCode == BfTypeCode_Float) && (underlyingArraySize == 4))
+		{
+			if (outTypeCode != NULL)
+				*outTypeCode = BfTypeCode_Float4;
+			return true;
+		}
+		if ((underlyingArrayTypeCode == BfTypeCode_Int32) && (underlyingArraySize == 4))
+		{
+			if (!underlyingIsVector)
+				return false;
+			if (outTypeCode != NULL)
+				*outTypeCode = BfTypeCode_Int32_4;
+			return true;
+		}
+		if ((underlyingArrayTypeCode == BfTypeCode_Boolean) && (underlyingArraySize == 2))
+		{
+			if (!underlyingIsVector)
+				return false;
+			if (outTypeCode != NULL)
+				*outTypeCode = BfTypeCode_Bool2;
+			return true;
+		}
+		if ((underlyingArrayTypeCode == BfTypeCode_Boolean) && (underlyingArraySize == 4))
+		{
+			if (!underlyingIsVector)
+				return false;
+			if (outTypeCode != NULL)
+				*outTypeCode = BfTypeCode_Bool4;
+			return true;
+		}
+		if ((underlyingArrayTypeCode == BfTypeCode_UInt8) && (underlyingArraySize == 16))
+		{
+			if (!underlyingIsVector)
+				return false;
+			if (outTypeCode != NULL)
+				*outTypeCode = BfTypeCode_V128;
+			return true;
+		}
 		return false;
+	}
 
 	bool deepCheck = false;
 
@@ -2160,6 +2265,10 @@ bool BfTypeInstance::GetLoweredType(BfTypeUsage typeUsage, BfTypeCode* outTypeCo
 				{
 					if (typeInst->IsValueType())
 					{
+						// Layout queries must not reify already populated types.
+						if (typeInst->IsDataIncomplete())
+							mModule->PopulateType(typeInst, BfPopulateType_Data);
+
 						if (typeInst->mBaseType != NULL)
 							_CheckType(typeInst->mBaseType, offset);
 
@@ -2197,6 +2306,15 @@ bool BfTypeInstance::GetLoweredType(BfTypeUsage typeUsage, BfTypeCode* outTypeCo
 				bool writeOutCode = (typeUsage != BfTypeUsage_Return_NonStatic) && (typeUsage != BfTypeUsage_Return_Static);
 
 				if ((types[0] == BfTypeCode_Float) &&
+					(types[1] == BfTypeCode_None)  &&
+				    (types[2] == BfTypeCode_None))
+				{
+					if ((outTypeCode != NULL) && (writeOutCode))
+						*outTypeCode = BfTypeCode_FloatX1;
+					return true;
+				}
+
+				if ((types[0] == BfTypeCode_Float) &&
 					(types[1] == BfTypeCode_Float) &&
 					(types[2] == BfTypeCode_None))
 				{
@@ -2223,6 +2341,14 @@ bool BfTypeInstance::GetLoweredType(BfTypeUsage typeUsage, BfTypeCode* outTypeCo
 				{
 					if ((outTypeCode != NULL) && (writeOutCode))
 						*outTypeCode = BfTypeCode_FloatX4;
+					return true;
+				}
+
+				if ((types[0] == BfTypeCode_Double) &&
+					(types[2] == BfTypeCode_None))
+				{
+					if ((outTypeCode != NULL) && (writeOutCode))
+						*outTypeCode = BfTypeCode_DoubleX1;
 					return true;
 				}
 
@@ -2300,73 +2426,92 @@ bool BfTypeInstance::GetLoweredType(BfTypeUsage typeUsage, BfTypeCode* outTypeCo
 			}
 			else
 			{
-				if (mInstSize >= 8)
+				if (!mIsCRepr)
 				{
-					if (outTypeCode != NULL)
-						*outTypeCode = BfTypeCode_Int64;
+					if ((types[0] == BfTypeCode_Float) && (types[1] == BfTypeCode_Float) && (types[2] == BfTypeCode_Float) && (types[3] == BfTypeCode_Float))
+					{
+						handled = true;
+						if (outTypeCode != NULL)
+							*outTypeCode = BfTypeCode_Float4;
+					}
+					if ((types[0] == BfTypeCode_Int32) && (types[1] == BfTypeCode_Int32) && (types[2] == BfTypeCode_Int32) && (types[3] == BfTypeCode_Int32))
+					{
+						handled = true;
+						if (outTypeCode != NULL)
+							*outTypeCode = BfTypeCode_Int32_4;
+					}
 				}
 
-				if (mInstSize == 8)
+				if (!handled)
 				{
-					handled = true;
-				}
+					if (mInstSize >= 8)
+					{
+						if (outTypeCode != NULL)
+							*outTypeCode = BfTypeCode_Int64;
+					}
 
-				if (mInstSize == 9)
-				{
-					handled = true;
-					if (outTypeCode2 != NULL)
-						*outTypeCode2 = BfTypeCode_Int8;
-				}
-				if (mInstSize == 10)
-				{
-					handled = true;
-					if (outTypeCode2 != NULL)
-						*outTypeCode2 = BfTypeCode_Int16;
-				}
-				if (mInstSize == 12)
-				{
-					handled = true;
-					if (outTypeCode2 != NULL)
-						*outTypeCode2 = BfTypeCode_Int32;
-				}
-				if (mInstSize == 16)
-				{
-					handled = true;
-					if (outTypeCode2 != NULL)
-						*outTypeCode2 = BfTypeCode_Int64;
-				}
+					if (mInstSize == 8)
+					{
+						handled = true;
+					}
 
-				if ((types[0] == BfTypeCode_Float) && (types[1] == BfTypeCode_None))
-				{
-					handled = true;
-					if (outTypeCode != NULL)
-						*outTypeCode = BfTypeCode_Float;
-				}
-				if ((types[0] == BfTypeCode_Float) && (types[1] == BfTypeCode_Float))
-				{
-					if (outTypeCode != NULL)
-						*outTypeCode = BfTypeCode_Float2;
-				}
-				if (types[0] == BfTypeCode_Double)
-				{
-					if (outTypeCode != NULL)
-						*outTypeCode = BfTypeCode_Double;
-				}
+					if (mInstSize == 9)
+					{
+						handled = true;
+						if (outTypeCode2 != NULL)
+							*outTypeCode2 = BfTypeCode_Int8;
+					}
+					if (mInstSize == 10)
+					{
+						handled = true;
+						if (outTypeCode2 != NULL)
+							*outTypeCode2 = BfTypeCode_Int16;
+					}
+					if (mInstSize == 12)
+					{
+						handled = true;
+						if (outTypeCode2 != NULL)
+							*outTypeCode2 = BfTypeCode_Int32;
+					}
+					if (mInstSize == 16)
+					{
+						handled = true;
+						if (outTypeCode2 != NULL)
+							*outTypeCode2 = BfTypeCode_Int64;
+					}
 
-				if ((types[2] == BfTypeCode_Float) && (mInstSize == 12))
-				{
-					if (outTypeCode2 != NULL)
-						*outTypeCode2 = BfTypeCode_Float;
-				}
-				if ((types[2] == BfTypeCode_Float) && (types[3] == BfTypeCode_Float))
-				{
-					if (outTypeCode2 != NULL)
-						*outTypeCode2 = BfTypeCode_Float2;
-				}
-				if (types[2] == BfTypeCode_Double)
-				{
-					if (outTypeCode2 != NULL)
-						*outTypeCode2 = BfTypeCode_Double;
+					if ((types[0] == BfTypeCode_Float) && (types[1] == BfTypeCode_None))
+					{
+						handled = true;
+						if (outTypeCode != NULL)
+							*outTypeCode = BfTypeCode_Float;
+					}
+					if ((types[0] == BfTypeCode_Float) && (types[1] == BfTypeCode_Float))
+					{
+						if (outTypeCode != NULL)
+							*outTypeCode = BfTypeCode_Float2;
+					}
+					if (types[0] == BfTypeCode_Double)
+					{
+						if (outTypeCode != NULL)
+							*outTypeCode = BfTypeCode_Double;
+					}
+
+					if ((types[2] == BfTypeCode_Float) && (mInstSize == 12))
+					{
+						if (outTypeCode2 != NULL)
+							*outTypeCode2 = BfTypeCode_Float;
+					}
+					if ((types[2] == BfTypeCode_Float) && (types[3] == BfTypeCode_Float))
+					{
+						if (outTypeCode2 != NULL)
+							*outTypeCode2 = BfTypeCode_Float2;
+					}
+					if (types[2] == BfTypeCode_Double)
+					{
+						if (outTypeCode2 != NULL)
+							*outTypeCode2 = BfTypeCode_Double;
+					}
 				}
 
 				if (handled)
@@ -2537,6 +2682,14 @@ bool BfTypeInstance::HasAppendedField(bool checkBase)
 		return mBaseType->HasAppendedField(checkBase);
 
 	return false;
+}
+
+void BfTypeInstance::RemoveMethodsFromCEMachine()
+{	
+	for (auto& methodInstGroup : mMethodInstanceGroups)
+	{
+		methodInstGroup.RemoveMethodsFromCEMachine(mContext->mCompiler);
+	}		
 }
 
 void BfTypeInstance::ReportMemory(MemReporter* memReporter)
@@ -2732,6 +2885,15 @@ bool BfTypeInstance::HasVarConstraints()
 
 bool BfTypeInstance::IsTypeMemberIncluded(BfTypeDef* typeDef, BfTypeDef* activeTypeDef, BfModule* module)
 {
+	if (IsBoxed())
+	{
+		auto boxedType = (BfBoxedType*)this;		
+		auto unboxedTypeInst = boxedType->mElementType->ToTypeInstance();
+		if (unboxedTypeInst != NULL)
+			return unboxedTypeInst->IsTypeMemberIncluded(typeDef, activeTypeDef, module);
+		return false;
+	}
+
 	if (mGenericTypeInfo == NULL)
 		return true;
 	if (mGenericTypeInfo->mGenericExtensionInfo == NULL)
@@ -3248,6 +3410,17 @@ BfType* BfMethodRefType::GetCaptureType(int captureDataIdx)
 	return mMethodRef->GetParamType(mDataToParamIdx[captureDataIdx]);
 }
 
+bool BfMethodRefType::WantsGCMarking()
+{
+	// A method reference's data is its captures, which can hold references the GC must follow
+	for (int dataIdx = 0; dataIdx < GetCaptureDataCount(); dataIdx++)
+	{
+		if (GetCaptureType(dataIdx)->WantsGCMarking())
+			return true;
+	}
+	return false;
+}
+
 int BfMethodRefType::GetDataIdxFromParamIdx(int paramIdx)
 {
 	if (paramIdx == -1)
@@ -3329,6 +3502,63 @@ BfCustomAttribute* BfCustomAttributes::Get(int idx)
 
 BfResolvedTypeSet::~BfResolvedTypeSet()
 {
+}
+
+// Called only when an implausible number of entries in one bucket claim the exact same 32-bit hash yet all
+//  compare unequal to what we are inserting. That pattern means either Hash and Equals disagree (a real bug,
+//  and the way we end up inserting the same type over and over) or we got extraordinarily unlucky. We can tell
+//  the two apart exactly: the set's contract is that no two entries are Equals-equal, so if any pair of the
+//  colliding entries compares equal we have caught the bug outright. This is O(k^2) in the number of colliding
+//  entries, but k only gets here when something is already wrong, so it costs nothing in the normal case and is
+//  safe to leave enabled in release.
+void BfResolvedTypeSet::CheckHashPileup(int bucket, int hashVal, LookupContext* ctx)
+{
+	Array<BfType*> collidingTypes;
+	auto checkEntryIdx = mHashHeads[bucket];
+	while (checkEntryIdx != -1)
+	{
+		auto checkEntry = &mEntries[checkEntryIdx];
+		if ((checkEntry->mValue != NULL) && (checkEntry->mHashCode == hashVal))
+			collidingTypes.Add(checkEntry->mValue);
+		checkEntryIdx = checkEntry->mNext;
+	}
+
+	// Equals can set these, and our caller has already acted on their current values
+	bool prevFailed = ctx->mFailed;
+	bool prevHadVar = ctx->mHadVar;
+
+	BfType* dupType = NULL;
+	for (int i = 0; (i < collidingTypes.mSize) && (dupType == NULL); i++)
+	{
+		for (int j = i + 1; j < collidingTypes.mSize; j++)
+		{
+			if (Equals(collidingTypes[i], collidingTypes[j], ctx))
+			{
+				dupType = collidingTypes[i];
+				break;
+			}
+		}
+	}
+
+	ctx->mFailed = prevFailed;
+	ctx->mHadVar = prevHadVar;
+
+	if (ctx->mModule == NULL)
+		return;
+
+	if (dupType != NULL)
+	{
+		// Two entries in the set compare equal to each other, which breaks uniquing outright. There is no
+		//  interpretation of this that is not bad state, so we report it even in release
+		ctx->mModule->InternalError(StrFormat("Duplicate entries in the resolved type set for '%s'",
+			ctx->mModule->TypeToString(dupType).c_str()), ctx->mRootTypeRef);
+		return;
+	}
+
+	// We could not prove a duplicate, so these may be genuine hash collisions -- but at this count that is
+	//  unlikely enough to be worth a look, so say so where it costs a release build nothing
+	BfLogSys(ctx->mModule->mSystem, "Warning: %d resolved type set entries share hash %d with no confirmed duplicate\n", collidingTypes.mSize, hashVal);
+	BF_ASSERT(false);
 }
 
 #define HASH_MIX(origHashVal, newHashVal) ((((origHashVal) << 5) - (origHashVal)) ^ (newHashVal))
@@ -3610,7 +3840,7 @@ void BfResolvedTypeSet::HashGenericArguments(BfTypeReference* typeRef, LookupCon
 			int argHashVal = 0;
 			if (genericArgTypeRef != NULL)
 			{
-				argHashVal = Hash(genericArgTypeRef, ctx, BfHashFlag_AllowGenericParamConstValue, hashSeed + 1);
+				argHashVal = Hash(genericArgTypeRef, ctx, (BfHashFlags)(BfHashFlag_AllowGenericParamConstValue | BfHashFlag_DisallowUnknownSizedArray), hashSeed + 1);
 				if ((allowUnboundGeneric) && ((ctx->mResolveFlags & BfResolveTypeRefFlag_ForceUnboundGeneric) != 0))
 					genericArgTypeRef = NULL;
 			}
@@ -4029,9 +4259,13 @@ int BfResolvedTypeSet::DoHash(BfTypeReference* typeRef, LookupContext* ctx, BfHa
 					else if (constant->mConstType == BfConstType_Undef)
 					{
 						elementCount = -1; // Marker for undef
-						if ((arrayType->IsInferredSize()) && ((ctx->mResolveFlags & BfResolveTypeRefFlag_AllowInferredSizedArray) == 0))
-						{
+						if ((arrayType->IsInferredSize()) && 
+							(((ctx->mResolveFlags & BfResolveTypeRefFlag_AllowInferredSizedArray) == 0) ||
+							 ((flags & BfHashFlag_DisallowUnknownSizedArray) != 0)))
+						{							
 							ctx->mModule->Fail("Invalid use of inferred-sized array", sizeExpr);
+							if ((flags & BfHashFlag_DisallowUnknownSizedArray) != 0)
+								ctx->mFailed = true;
 						}
 					}
 					else if (!BfIRBuilder::IsInt(constant->mTypeCode))

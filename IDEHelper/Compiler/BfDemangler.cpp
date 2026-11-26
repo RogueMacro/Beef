@@ -116,6 +116,12 @@ bool DwDemangler::DemangleBuiltinType(StringImpl& outName)
 		RETURN_STR("__float128");
 	case 'z':
 		RETURN_STR("...");
+	case 'u':
+		// A vendor extended type named by a source name, as "u3int" and "u4uint" are written for int and uint
+		if (DemangleSourceName(outName))
+			return true;
+		mCurIdx--;
+		return false;
 	case 'D':
 		{
 			char nextChar = SafeGetChar(mMangledName, mCurIdx++);
@@ -421,7 +427,8 @@ bool DwDemangler::DemangleFunctionType(StringImpl& outName)
 
 		for (int paramNum = 0; true; paramNum++)
 		{
-			if (DemangleEnd())
+			// A parameter that failed to parse consumed nothing, so retrying it would never end
+			if ((DemangleEnd()) || (mFailed))
 				break;
 
 			if (paramNum > 0)
@@ -689,6 +696,8 @@ bool DwDemangler::DemangleExprPriamry(StringImpl& outName)
 			auto c = SafeGetChar(mMangledName, mCurIdx++);
 			if (c == 'E')
 				break;
+			if (mCurIdx > (int)mMangledName.length())
+				return Failed();
 			value += c;
 		}
 		if (outType == "bool")
@@ -779,6 +788,8 @@ bool DwDemangler::DemangleSubstitution(StringImpl& outName)
 		while (true)
 		{
 			char idxChar = SafeGetChar(mMangledName, mCurIdx++);
+			if (mCurIdx > (int)mMangledName.length())
+				return Failed();
 			if (idxChar == 't')
 			{
 				DemangleUnqualifiedName(outName);
@@ -850,6 +861,8 @@ bool DwDemangler::DemangleTemplateParam(StringImpl& outName)
 		while (true)
 		{
 			char idxChar = SafeGetChar(mMangledName, mCurIdx++);
+			if (mCurIdx > (int)mMangledName.length())
+				return Failed();
 			if (idxChar == '?')
 				break;
 			if (idxChar == '_')
@@ -937,13 +950,14 @@ bool DwDemangler::DemangleName(StringImpl& outName, bool* outHasTemplateArgs)
 					int arrayDims = 0;
 					if (!mRawDemangle)
 					{
-						if (outName == "__TUPLE")
+						// A failed parse leaves templateArgs unclosed, possibly just "<", so only strip a complete list
+						if ((outName == "__TUPLE") && (templateArgs.length() >= 2))
 						{
 							outName = "(" + templateArgs.Substring(1, templateArgs.length() - 2) + ")";
 							mSubstituteList.push_back(outName);
 							continue;
 						}
-						else if (outName == "Box")
+						else if ((outName == "Box") && (templateArgs.length() >= 2))
 						{
 							outName = templateArgs.Substring(1, templateArgs.length() - 2) + "^";
 							mSubstituteList.push_back(outName);

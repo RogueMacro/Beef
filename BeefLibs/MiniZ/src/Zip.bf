@@ -193,6 +193,7 @@ namespace MiniZ
 
 		MiniZ.ZipArchive mFile;
 		bool mInitialized;
+		bool mIsWriting;
 #if ALLOW_FILE_MAPPING
 		Windows.FileHandle mShareFileHandle ~ _.Close();
 		Windows.Handle mShareFileMapping ~ _.Close();
@@ -203,7 +204,58 @@ namespace MiniZ
 		public ~this()
 		{
 			if (mInitialized)
-				MiniZ.ZipReaderEnd(&mFile);
+			{
+				if (mIsWriting)
+					MiniZ.zip_writer_end(&mFile);
+				else
+					MiniZ.ZipReaderEnd(&mFile);
+			}
+		}
+
+		// Creates a new zip archive on disk for writing. Add entries with AddFile(),
+		// then Close() to finalize the central directory - the archive is invalid
+		// until Close() succeeds.
+		public Result<void> Create(StringView fileName)
+		{
+			Debug.Assert(!mInitialized);
+			if (!MiniZ.ZipWriterInitFile(&mFile, scope String(fileName, .NullTerminate), 0))
+				return .Err;
+			mInitialized = true;
+			mIsWriting = true;
+			return .Ok;
+		}
+
+		public Result<void> AddFile(StringView archiveName, StringView srcFilePath)
+		{
+			Debug.Assert(mIsWriting);
+			// Stored (uncompressed), not deflated: the ported tinfl_decompress has a bug
+			// that corrupts/fails large files needing multiple buffer refills to inflate.
+			// Storing sidesteps decompression on read entirely - see reader Entry.ExtractTo*.
+			if (!MiniZ.ZipWriterAddFile(&mFile, scope String(archiveName, .NullTerminate), scope String(srcFilePath, .NullTerminate), null, 0, (MiniZ.ZipFlags)MiniZ.CompressionLevel.NO_COMPRESSION))
+				return .Err;
+			return .Ok;
+		}
+
+		public Result<void> AddFile(StringView archiveName, Span<uint8> data)
+		{
+			Debug.Assert(mIsWriting);
+			if (!MiniZ.ZipWriterAddMemEx(&mFile, scope String(archiveName, .NullTerminate), data.Ptr, data.Length, null, 0, (MiniZ.ZipFlags)MiniZ.CompressionLevel.NO_COMPRESSION, 0, 0))
+				return .Err;
+			return .Ok;
+		}
+
+		// Finalizes the central directory and closes the archive. Must be called
+		// for a written zip to be valid - the destructor alone will not do this.
+		public Result<void> Close()
+		{
+			Debug.Assert(mIsWriting);
+			bool ok = MiniZ.zip_writer_finalize_archive(&mFile);
+			ok = MiniZ.zip_writer_end(&mFile) && ok;
+			mIsWriting = false;
+			mInitialized = false;
+			if (!ok)
+				return .Err;
+			return .Ok;
 		}
 
 		public Result<void> Open(StringView fileName)
@@ -442,7 +494,7 @@ namespace MiniZ
 
 		}
 
-		enum ZipFlags
+		public enum ZipFlags
 		{
 			None = 0,
 			CaseSensitive = 0x0100,
@@ -2904,25 +2956,33 @@ namespace MiniZ
 		[CallingConvention(.Stdcall), CLink]
 		static extern int32 fflush(FILE* stream);
 
-		//[CallingConvention(.Stdcall), CLink]
-		//static extern int64 ftell64(FILE* stream);
 		static int64 ftell64(FILE* stream)
 		{
+#if BF_PLATFORM_WINDOWS
 			return _ftelli64(stream);
+#else
+			return ftello(stream);
+#endif
 		}
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern int64 _ftelli64(FILE* stream);
+		[CallingConvention(.Cdecl), CLink]
+		static extern int64 ftello(FILE* stream);
 
-		//[CallingConvention(.Stdcall), CLink]
-		//static extern int64 fseek64(FILE* stream, int64 offset, int32 origin);
 		static int32 fseek64(FILE* stream, int64 offset, int32 origin)
 		{
+#if BF_PLATFORM_WINDOWS
 			return _fseeki64(stream, offset, origin);
+#else
+			return fseeko(stream, offset, origin);
+#endif
 		}
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern int32 _fseeki64(FILE* stream, int64 offset, int32 origin);
+		[CallingConvention(.Cdecl), CLink]
+		static extern int32 fseeko(FILE* stream, int64 offset, int32 origin);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern int fread(void* buf, int elementSize, int elementCount, FILE* stream);
@@ -3054,7 +3114,7 @@ namespace MiniZ
 		{
 			FILE_STAT_STRUCT file_stat = default;
 			// On Linux with x86 glibc, this call will fail on large files (>= 0x80000000 bytes) unless you compiled with _LARGEFILE64_SOURCE. Argh.
-			if (_fstat64i32(pFilename, &file_stat) != 0)
+			if (_stat64(pFilename, &file_stat) != 0)
 				return false;
 			zip_time_to_dos_time(file_stat.st_mtime, pDOS_time, pDOS_date);
 			return true;
@@ -4285,7 +4345,9 @@ namespace MiniZ
 			level = (CompressionLevel)((int32)level_and_flags & 0xF);
 			store_data_uncompressed = ((level == 0) || (level_and_flags.HasFlag(.CompressedData)));
 
-			if ((pZip == null) || (pZip.m_pState != null) || (pZip.m_zip_mode != .Writing) || ((buf_size != 0) && (pBuf == null)) ||
+			// NOTE: was mistakenly "!= null" in this port, which made every call fail
+			// since a properly-initialized writer always has a non-null m_pState.
+			if ((pZip == null) || (pZip.m_pState == null) || (pZip.m_zip_mode != .Writing) || ((buf_size != 0) && (pBuf == null)) ||
 				(pArchive_name == null) || ((comment_size != 0) && (pComment == null)) || (pZip.m_total_files == 0xFFFF) || (level > .UBER_COMPRESSION))
 				return false;
 
@@ -4722,7 +4784,7 @@ namespace MiniZ
 			return true;
 		}
 
-		static bool zip_writer_finalize_archive(ZipArchive* pZip)
+		public static bool zip_writer_finalize_archive(ZipArchive* pZip)
 		{
 			ZipInternalState* pState;
 			int64 central_dir_ofs, central_dir_size;
@@ -4786,7 +4848,7 @@ namespace MiniZ
 			return true;
 		}
 
-		static bool zip_writer_end(ZipArchive* pZip)
+		public static bool zip_writer_end(ZipArchive* pZip)
 		{
 			ZipInternalState* pState;
 			bool status = true;
@@ -4834,8 +4896,13 @@ namespace MiniZ
 			public time_t st_ctime;
 		};
 
+		// NOTE: this was mistakenly named/bound to _fstat64i32 in this port, which
+		// actually takes a file descriptor (int), not a filename - it crashes the CRT's
+		// invalid-parameter handler as soon as a real path gets passed in. _stat64 is the
+		// filename-taking variant, and its struct layout (dev/ino/mode/nlink/uid/gid/
+		// rdev/size/3x time64) matches FILE_STAT_STRUCT field-for-field.
 		[CLink, CallingConvention(.Stdcall)]
-		static extern int32 _fstat64i32(char8* fileName, FILE_STAT_STRUCT* stat);
+		static extern int32 _stat64(char8* fileName, FILE_STAT_STRUCT* stat);
 
 		bool zip_add_mem_to_archive_file_in_place(char8* pZip_filename, char8* pArchive_name, void* pBuf, int buf_size, void* pComment, uint16 comment_size, ZipFlags level_and_flags_in)
 		{
@@ -4851,7 +4918,7 @@ namespace MiniZ
 				return false;
 			if (!zip_writer_validate_archive_name(pArchive_name))
 				return false;
-			if (_fstat64i32(pZip_filename, &file_stat) != 0)
+			if (_stat64(pZip_filename, &file_stat) != 0)
 			{
 			  // Create a new archive.
 				if (!ZipWriterInitFile(&zip_archive, pZip_filename, 0))

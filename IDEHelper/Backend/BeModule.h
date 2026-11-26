@@ -563,7 +563,7 @@ public:
 #endif
 	BfIRLinkageType mLinkageType;
 	bool mIsVarReturn;
-	bool mAlwaysInline;
+	BfInlineKind mInlineKind;
 	bool mNoUnwind;
 	bool mUWTable;
 	bool mNoReturn;
@@ -572,6 +572,9 @@ public:
 	bool mIsDLLExport;
 	bool mIsDLLImport;
 	BfIRCallingConv mCallingConv;
+	BfFloatingPointMode mFloatingPointMode;
+	BfSIMDSetting mSIMDSetting;
+	BfFMASetting mFMASetting;
 	Array<BeBlock*> mBlocks;
 	Array<BeFunctionParam> mParams;
 	BeDbgFunction* mDbgFunction;
@@ -581,11 +584,14 @@ public:
 	BeFunction()
 	{
 		mCallingConv = BfIRCallingConv_CDecl;
+		mFloatingPointMode = BfFloatingPointMode_Precise;
+		mSIMDSetting = BfSIMDSetting_None;
+		mFMASetting = BfFMASetting_TargetDefault;
 		mLinkageType = BfIRLinkageType_External;
 		mModule = NULL;
 		mDbgFunction = NULL;
 		mIsVarReturn = false;
-		mAlwaysInline = false;
+		mInlineKind = BfInlineKind_NotSet;
 		mDidInlinePass = false;
 		mNoUnwind = false;
 		mUWTable = false;
@@ -611,6 +617,8 @@ public:
 	{
 		return (!mParams.IsEmpty()) && (mParams[0].mStructRet);
 	}
+
+	int GetInstructionCount();
 
 	virtual void HashContent(BeHashContext& hashCtx) override;
 };
@@ -1376,6 +1384,7 @@ public:
 	SizedArray<Arg, 4> mArgs;
 	BfIRCallingConv mCallingConv;
 	bool mNoReturn;
+	bool mNoInline;
 	bool mTailCall;
 
 	virtual BeType* GetType() override;
@@ -1386,6 +1395,7 @@ public:
 		mFunc = NULL;
 		mCallingConv = BfIRCallingConv_CDecl;
 		mNoReturn = false;
+		mNoInline = false;
 		mTailCall = false;
 	}
 
@@ -1405,6 +1415,7 @@ public:
 		}
 		hashCtx.Mixin(mCallingConv);
 		hashCtx.Mixin(mNoReturn);
+		hashCtx.Mixin(mNoInline);
 		hashCtx.Mixin(mTailCall);
 	}
 
@@ -2349,6 +2360,7 @@ public:
 	Array<BeArgument*> mArgs;
 	Array<BeFunction*> mFunctions;
 	Dictionary<String, BeFunction*> mFunctionMap;
+	Dictionary<String, BeGlobalVariable*> mRemapBindVarMap; // Hot swap 'bf_hs_preserve@' variables by name
 	int mCurDbgLocIdx;
 	int mCurLexBlockId;
 

@@ -47,8 +47,8 @@ namespace IDE.ui
                 base.DrawSelect(g);
         }
 
-        public override void Draw(Graphics g)
-        {
+		public virtual void UpdateTextColor()
+		{
 			uint32 color = DarkTheme.COLOR_TEXT;
 			let projectPanel = ((ProjectListView)mListView).mProjectPanel;
 
@@ -80,38 +80,61 @@ namespace IDE.ui
 
 				mTextColor = color;
 			}
+		}
+
+		public virtual bool HasChanged(ref float changeX)
+		{
+			if (mRefObject == null)
+				return false;
+
+			bool hasChanged = false;
+			var workspace = mRefObject as Workspace;
+			if (workspace != null)
+			    hasChanged = workspace.mHasChanged;
+			var project = mRefObject as Project;
+			if (project != null)
+			{
+				hasChanged = project.mHasChanged;
+				if (project.mDeferState != .None)
+				{
+					changeX += GS!(12);
+				}
+				else if (project.mLocked)
+				{
+					changeX += GS!(12);
+				}
+			}
+			return hasChanged;
+		}
+
+        public override void Draw(Graphics g)
+        {
+			UpdateTextColor();
 
             base.Draw(g);
 
+			float changeX = mLabelOffset + ((DarkListView)mListView).mLabelX + GS!(1);
             if (mRefObject != null)
             {
-				float changeX = mLabelOffset + ((DarkListView)mListView).mLabelX + GS!(1);
-
-                bool hasChanged = false;
-                var workspace = mRefObject as Workspace;
-                if (workspace != null)
-                    hasChanged = workspace.mHasChanged;
-                var project = mRefObject as Project;
-                if (project != null)
-                {
-					hasChanged = project.mHasChanged;
+				var project = mRefObject as Project;
+				if (project != null)
+				{
 					if (project.mDeferState != .None)
 					{
 						g.DrawString(scope String()..Append('.', 1 + (mUpdateCnt / 20) % 3), g.mFont.GetWidth(mLabel) + mLabelOffset + LabelX + GS!(3), 0);
-						changeX += GS!(12);
 					}
 					else if (project.mLocked)
 					{
 						g.Draw(DarkTheme.sDarkTheme.GetImage(.LockIcon), g.mFont.GetWidth(mLabel) + GS!(42), 0);
-						changeX += GS!(12);
 					}
 				}
-                if (hasChanged)
-				{
-					changeX += g.mFont.GetWidth(mLabel);
-                    g.DrawString("*", changeX, 0);
-				}
-            } 
+            }
+
+			if (HasChanged(ref changeX))
+			{
+				changeX += g.mFont.GetWidth(mLabel);
+			    g.DrawString("*", changeX, 0);
+			}
         }
 
 		public override void DrawAll(Graphics g)
@@ -135,6 +158,7 @@ namespace IDE.ui
 			mIconX = GS!(20);
 			mOpenButtonX = GS!(4);
 			mLabelX = GS!(44);
+			mLabelY = GS!(-1);
 			mChildIndent = GS!(16);
 			mHiliteOffset = GS!(-2);
 		}
@@ -162,6 +186,8 @@ namespace IDE.ui
 		public bool mSortDirty;
 		public bool mWantsRehup;
 		public HashSet<String> mClipboardCutQueued ~ DeleteContainerAndItems!(_);
+		double mPendingScrollPos = -1;
+		List<String> mPendingOpenFolders = new .() ~ DeleteContainerAndItems!(_);
 
         public this()
         {
@@ -215,7 +241,7 @@ namespace IDE.ui
 			}
 		}
 
-        void FocusChangedHandler(ListViewItem listViewItem)
+        protected virtual void FocusChangedHandler(ListViewItem listViewItem)
         {
             if (listViewItem.Focused)
             {
@@ -233,11 +259,64 @@ namespace IDE.ui
             base.Serialize(data);
 
             data.Add("Type", "ProjectPanel");
+
+            data.Add("ScrollPos", (float)mListView.mVertScrollbar.mContentPos);
+
+            using (data.CreateArray("OpenFolders"))
+            {
+                mListView.GetRoot().WithItems(scope (listViewItem) =>
+                    {
+                        var darkListViewItem = (DarkListViewItem)listViewItem;
+                        if (!darkListViewItem.IsOpen)
+                            return;
+
+                        String path = scope String();
+                        if (mListViewToWorkspaceFolderMap.GetValue(listViewItem) case .Ok(let folder))
+                        {
+                            path.Append("WF:");
+                            folder.GetFullPath(path);
+                        }
+                        else if (mListViewToProjectMap.GetValue(listViewItem) case .Ok(let projectItem))
+                        {
+                            path.Append("PI:");
+                            GetProjectItemPath(projectItem, path);
+                        }
+                        else
+                            return;
+
+                        data.Add(path);
+                    });
+            }
         }
 
         public override bool Deserialize(StructuredData data)
         {
-            return base.Deserialize(data);
+            if (!base.Deserialize(data))
+                return false;
+
+            mPendingScrollPos = data.GetFloat("ScrollPos", -1);
+
+            ClearAndDeleteItems!(mPendingOpenFolders);
+            for (var itemKey in data.Enumerate("OpenFolders"))
+            {
+                String path = new String();
+                data.GetCurString(path);
+                mPendingOpenFolders.Add(path);
+            }
+
+            return true;
+        }
+
+        void GetProjectItemPath(ProjectItem item, String outPath)
+        {
+            if (item.mParentFolder != null)
+            {
+                GetProjectItemPath(item.mParentFolder, outPath);
+                outPath.Append("/");
+                outPath.Append(item.mName);
+            }
+            else
+                outPath.Append(item.mProject.mProjectName);
         }
 
         void HandleDragUpdate(DragEvent theEvent)
@@ -393,6 +472,9 @@ namespace IDE.ui
 							targetProjectFolder = targetProjectItem.mParentFolder;
 						var targetListItem = mProjectToListViewMap[targetProjectFolder];
 
+						bool hasLinkMove = false;
+						bool hasFileMove = false;
+
 						int moveCount = 0;
 						int selectCount = 0;
 						mListView.GetRoot().WithSelectedItems(scope [&] (selectedItem) =>
@@ -400,7 +482,14 @@ namespace IDE.ui
 								if (mListViewToProjectMap.GetValue(selectedItem) case .Ok(var sourceProjectItem))
 								{
 									if (sourceProjectItem.mParentFolder != targetProjectFolder)
+									{
+										if (sourceProjectItem.mIncludeKind == .Manual)
+											hasLinkMove = true;
+										else
+											hasFileMove = true;
+
 										moveCount++;
+									}
 								}
 								selectCount++;
 							});
@@ -415,13 +504,13 @@ namespace IDE.ui
 						Dialog dialog;
 						if (selectCount == 1)
 						{
-							dialog = ThemeFactory.mDefault.CreateDialog("Move file to a new location?",
-								scope $"Are you sure you want to move this file to '{targetDisplayName}'?");
+							dialog = ThemeFactory.mDefault.CreateDialog(scope $"Move {hasFileMove ? "file" : "link"} to a new location?",
+								scope $"Are you sure you want to move {hasFileMove ? "file" : "link"} file to '{targetDisplayName}'?");
 						}
 						else
 						{
-							dialog = ThemeFactory.mDefault.CreateDialog("Move files to a new location?",
-								scope $"Are you sure you want to move these files to '{targetDisplayName}'?");
+							dialog = ThemeFactory.mDefault.CreateDialog(scope $"Move {hasFileMove ? "files" : "links"} to a new location?",
+								scope $"Are you sure you want to move these {hasFileMove ? "files" : "links"} to '{targetDisplayName}'?");
 						}
 						dialog.AddButton("Yes", new (evt) =>
 							{
@@ -451,20 +540,26 @@ namespace IDE.ui
 										}
 										else
 										{
-											if (File.Move(sourcePath, destPath) case .Ok)
+											bool isLink = sourceProjectFileItem.mIncludeKind == .Manual;
+
+											if ((isLink) || (File.Move(sourcePath, destPath) case .Ok))
 											{
-												gApp.FileRenamed(sourceProjectFileItem, sourcePath, destPath);
+												if (!isLink)
+													gApp.FileRenamed(sourceProjectFileItem, sourcePath, destPath);
 
 												if (targetProjectFolder != sourceProjectItem.mParentFolder)
 												{
 													source.mParentItem.RemoveChildItem(source, false);
-													sourceProjectItem.mParentFolder.RemoveChild(sourceProjectItem);
+													sourceProjectItem.mParentFolder.RemoveChild(sourceProjectItem, false);
 
 													targetListItem.AddChildAtIndex(0, source);
 													targetListItem.mOpenButton.Open(true, false);
 													targetProjectFolder.AddChildAtIndex(0, sourceProjectItem);
 
-													sourceProjectFileItem.RecalcPath();
+													targetProjectFolder.mProject.SetChanged();
+
+													if (!isLink)
+														sourceProjectFileItem.RecalcPath();
 												}
 											}
 											else
@@ -637,7 +732,52 @@ namespace IDE.ui
 			}	
 
 			RehupProjects();
+
+			ApplyPendingViewState();
         }
+
+		void ApplyPendingViewState()
+		{
+			if (mPendingOpenFolders.Count > 0)
+			{
+				HashSet<String> openSet = scope .();
+				for (var path in mPendingOpenFolders)
+					openSet.Add(path);
+
+				mListView.GetRoot().WithItems(scope (listViewItem) =>
+					{
+						var darkListViewItem = (DarkListViewItem)listViewItem;
+						if (darkListViewItem.mOpenButton == null)
+							return;
+
+						String path = scope String();
+						if (mListViewToWorkspaceFolderMap.GetValue(listViewItem) case .Ok(let folder))
+						{
+							path.Append("WF:");
+							folder.GetFullPath(path);
+						}
+						else if (mListViewToProjectMap.GetValue(listViewItem) case .Ok(let projectItem))
+						{
+							path.Append("PI:");
+							GetProjectItemPath(projectItem, path);
+						}
+						else
+							return;
+
+						if (openSet.Contains(path))
+							darkListViewItem.Open(true, true);
+					});
+
+				ClearAndDeleteItems!(mPendingOpenFolders);
+			}
+
+			if (mPendingScrollPos >= 0)
+			{
+				mListView.UpdateListSize();
+				mListView.VertScrollTo(mPendingScrollPos, true);
+				mPendingScrollPos = -1;
+			}
+		}
 
         ProjectListViewItem InitProjectItem(ProjectItem item)
         {
@@ -699,10 +839,7 @@ namespace IDE.ui
             {
                 let listViewParent = mProjectToListViewMap[projectItem.mParentFolder];
                 listViewItem = (ProjectListViewItem)listViewParent.CreateChildItem();
-                if (projectItem is ProjectFolder)
-                    listViewItem.mIconImage = DarkTheme.sDarkTheme.GetImage(DarkTheme.ImageIdx.ProjectFolder);
-                else
-                    listViewItem.mIconImage = DarkTheme.sDarkTheme.GetImage(DarkTheme.ImageIdx.Document);
+				listViewItem.mIconImage = projectItem.GetIcon();
                 listViewItem.Label = projectItem.mName;
                 if (projectItem is ProjectFolder)
                     listViewItem.MakeParent();
@@ -836,6 +973,9 @@ namespace IDE.ui
 				    continue;
 				}
 
+				if (!projectFolder.mAutoInclude)
+					continue;
+
 				let newRelDir = scope String(projectFolder.mPath);
 				if (!newRelDir.IsEmpty)
 					newRelDir.Append("/");
@@ -881,13 +1021,32 @@ namespace IDE.ui
 						DoDeleteItem(listItem, null, .ForceRemove);
 						continue;
 					}
-
-					if ((rehupFlags.HasFlag(.FullTraversal)) && (child.mIncludeKind == .Manual) && (var childProjectFolder = child as ProjectFolder))
-					{
-						RehupFolder(childProjectFolder, rehupFlags);
-					}
 				}
 			}
+
+			// The scan above only descends into auto-included folders; listed ones are refreshed here.
+			if (rehupFlags.HasFlag(.FullTraversal))
+			{
+				for (let child in projectFolder.mChildItems)
+				{
+					if ((child.mIncludeKind == .Manual) && (let childProjectFolder = child as ProjectFolder))
+						RehupFolder(childProjectFolder, rehupFlags);
+				}
+			}
+		}
+
+		public void RefreshProject(Project project)
+		{
+			if (project.mNeedsCreate)
+			{
+				project.FinishCreate(false);
+				RebuildUI();
+				return;
+			}
+			if (project.mRootFolder.mIsWatching)
+				project.mRootFolder.StopWatching();
+			project.mRootFolder.StartWatching();
+			RehupFolder(project.mRootFolder, .FullTraversal);
 		}
 
 		public void QueueRehupFolder(ProjectFolder projectFolder)
@@ -922,14 +1081,14 @@ namespace IDE.ui
 			projectItem.mProject.SetChanged();
 		}
 
-        public void NewFolder(ProjectFolder folder)
+        public ProjectFolder NewFolder(ProjectFolder folder, StringView name = "New folder", bool autoRename = true)
         {
             ProjectFolder projectFolder = new ProjectFolder();
 
 			int checkIdx = 0;
 			while (true)
 			{
-	            projectFolder.mName.Set("New folder");
+	            projectFolder.mName.Set(name);
 				if (checkIdx > 0)
 					projectFolder.mName.AppendF("{}", checkIdx + 1);
 				if (!folder.mChildMap.ContainsKey(projectFolder.mName))
@@ -943,8 +1102,8 @@ namespace IDE.ui
             	projectFolder.mPath.Append("src", dirSepStr, projectFolder.mName);
 			else
 				projectFolder.mPath.Append(folder.mPath, dirSepStr, projectFolder.mName);
-			projectFolder.mIncludeKind = folder.mIncludeKind;
-			projectFolder.mAutoInclude = folder.IsAutoInclude();
+			projectFolder.mIncludeKind = folder.mAutoInclude ? .Auto : .Manual;
+			projectFolder.mAutoInclude = true;
             folder.AddChild(projectFolder);
             let projectItem = AddProjectItem(projectFolder);
 			if (projectItem != null)
@@ -954,7 +1113,8 @@ namespace IDE.ui
 				mListView.UpdateAll();
 				mListView.GetRoot().SelectItemExclusively(projectItem);
 				mListView.EnsureItemVisible(projectItem, false);
-				RenameItem(projectFolder);
+				if (autoRename)
+					RenameItem(projectFolder);
 			}
 			if (projectFolder.mIncludeKind != .Auto)
 				projectFolder.mProject.SetChanged();
@@ -966,6 +1126,7 @@ namespace IDE.ui
 				if (err != .AlreadyExists)
 					gApp.Fail(scope String()..AppendF("Failed to create directory '{]'", fullPath));
 			}
+			return projectFolder;
         }
 
         public void GenerateCode(ProjectFolder folder)
@@ -980,6 +1141,47 @@ namespace IDE.ui
 			var dialog = new GenerateDialog(folder);
 			dialog.PopupWindow(gApp.GetActiveWindow());
         }
+
+		public virtual bool CanRevert(ProjectSource projectSource)
+		{
+			let editData = projectSource.mEditData;
+			return (editData != null) && (editData.HasTextChanged()) && (File.Exists(editData.mFilePath));
+		}
+
+		// Loads the file over its unsaved edits as one undoable change.
+		public virtual void Revert(ProjectSource projectSource)
+		{
+			let editData = projectSource.mEditData;
+			if ((editData == null) || (!editData.HasTextChanged()) || (!File.Exists(editData.mFilePath)))
+				return;
+			if (let sourceViewPanel = gApp.FindSourceViewPanel(editData.mFilePath))
+			{
+				sourceViewPanel.Reload();
+			}
+			else
+			{
+				editData.Reload();
+				gApp.FileChanged(editData);
+			}
+		}
+
+		void WithSelectedSources(delegate void(ProjectSource) func)
+		{
+			mListView.GetRoot().WithSelectedItems(scope (selectedItem) =>
+				{
+					if ((mListViewToProjectMap.GetValue(selectedItem) case .Ok(let projectItem)) && (let projectSource = projectItem as ProjectSource))
+						func(projectSource);
+				});
+		}
+
+		public void RevertSelected()
+		{
+			WithSelectedSources(scope (projectSource) =>
+				{
+					if (CanRevert(projectSource))
+						Revert(projectSource);
+				});
+		}
 
 		public void Regenerate(bool allowHashMismatch)
 		{
@@ -999,7 +1201,7 @@ namespace IDE.ui
 			sourceViewPanel.mEditWidget.SetText(scope .(fileText));
 		}
 
-		public void Generate(ProjectFolder folder, StringView fileName, StringView fileText)
+		public bool Generate(ProjectFolder folder, StringView fileName, StringView fileText)
 		{
 			let project = folder.mProject;
 			if (project.mNeedsCreate)
@@ -1024,7 +1226,7 @@ namespace IDE.ui
 				var error = scope String();
 				error.AppendF("File '{0}' already exists", fullFilePath);
 				IDEApp.sApp.Fail(error);
-				return;
+				return false;
 			}
 
 			if (File.WriteAllText(fullFilePath, fileText) case .Err)
@@ -1032,11 +1234,11 @@ namespace IDE.ui
 				var error = scope String();
 				error.AppendF("Failed to create file '{0}'", fullFilePath);
 				gApp.Fail(error);
-				return;
+				return false;
 			}
 
 			ProjectSource projectSource = new ProjectSource();
-			projectSource.mIncludeKind = (folder.mIncludeKind == .Auto) ? .Auto : .Manual;
+			projectSource.mIncludeKind = (folder.mAutoInclude) ? .Auto : .Manual;
 			projectSource.mName.Set(relFileName);
 			projectSource.mPath = new String();
 			folder.mProject.GetProjectRelPath(fullFilePath, projectSource.mPath);
@@ -1056,6 +1258,10 @@ namespace IDE.ui
 			gApp.RecordHistoryLocation(true);
 			gApp.ShowProjectItem(projectSource);
 			gApp.RecordHistoryLocation(true);
+
+			gApp.MarkFileChanged(fullFilePath);
+
+			return true;
 		}
 
         void DoNewClass(ProjectFolder folder, DialogEvent evt)
@@ -1127,7 +1333,7 @@ namespace IDE.ui
 			}
 
             ProjectSource projectSource = new ProjectSource();
-			projectSource.mIncludeKind = (folder.mIncludeKind == .Auto) ? .Auto : .Manual;
+			projectSource.mIncludeKind = (folder.mAutoInclude) ? .Auto : .Manual;
             projectSource.mName.Set(relFileName);
 			projectSource.mPath = new String();
             folder.mProject.GetProjectRelPath(fullFilePath, projectSource.mPath);
@@ -1266,13 +1472,13 @@ namespace IDE.ui
             projectSource.GetFullImportPath(fullPath);
             IDEApp.sApp.WithTabs(scope (tab) =>
                 {
-                    var sourceViewPanel = tab.mContent as SourceViewPanel;
-                    if ((sourceViewPanel != null) &&
-                        (sourceViewPanel.mProjectSource == null) &&
-                        (sourceViewPanel.mFilePath != null) &&
-                        (Path.Equals(sourceViewPanel.mFilePath, fullPath)))
+                    var contentPanel = tab.mContent as ContentPanel;
+                    if ((contentPanel != null) &&
+                        (contentPanel.mProjectSource == null) &&
+                        (contentPanel.mFilePath != null) &&
+                        (Path.Equals(contentPanel.mFilePath, fullPath)))
                     {
-                        sourceViewPanel.AttachToProjectSource(projectSource);
+                        contentPanel.AttachToProjectSource(projectSource);
                     }
                 });
         }
@@ -1490,6 +1696,12 @@ namespace IDE.ui
                     mSelectedParentItem.mOpenButton.Open(true, false);
 
                 String dir = scope String(folderDialog.SelectedPath);
+				// It's possible for the path to end with / on linux
+				if (dir.EndsWith(Path.DirectorySeparatorChar))
+					dir.RemoveFromEnd(1);
+				if (dir.IsEmpty)
+					return;
+
                 int32 totalFileCount = AddFolder(folder, dir, alreadyHadFileList, true);
 				/*int32 totalFileCount = 1;
 				if (AlreadyHasPath(folder, dir))
@@ -1568,10 +1780,29 @@ namespace IDE.ui
             }
 
             mListView.GetRoot().SelectItem(item, checkKeyStates);
-            if (item == null)                            
+            if (item == null)
                 return;
             SetFocus();
         }
+
+		// Opens every ancestor of projectItem's list view entry so it's visible, then selects and
+		// scrolls to it -- used to sync the project panel's selection to whatever's active elsewhere
+		// (see ContentPanel.SyncWithWorkspacePanel).
+		public void SelectProjectItem(ProjectItem projectItem)
+		{
+			if (!mProjectToListViewMap.TryGet(projectItem, var matchKey, var projectListViewItem))
+				return;
+
+			var checkLVItem = projectListViewItem.mParentItem;
+			while (checkLVItem != null)
+			{
+				checkLVItem.Open(true);
+				checkLVItem = (ProjectListViewItem)checkLVItem.mParentItem;
+			}
+
+			projectListViewItem.mListView.GetRoot().SelectItemExclusively(projectListViewItem);
+			projectListViewItem.mListView.EnsureItemVisible(projectListViewItem, false);
+		}
 
         public override void LostFocus()
         {
@@ -1616,13 +1847,13 @@ namespace IDE.ui
 
 			    gApp.WithTabs(scope (tab) =>
 			        {
-			            var sourceViewPanel = tab.mContent as SourceViewPanel;
-			            if ((sourceViewPanel != null) && (sourceViewPanel.mProjectSource == projectSource))
+			            var contentPanel = tab.mContent as ContentPanel;
+			            if ((contentPanel != null) && (contentPanel.mProjectSource == projectSource))
 			            {
 							if (isRemovingProjectSource)
-			                	sourceViewPanel.DetachFromProjectItem(true);
+			                	contentPanel.DetachFromProjectItem(true);
 							else
-								sourceViewPanel.QueueFullRefresh(true);
+								contentPanel.QueueFullRefresh(true);
 			            }
 			        });
 
@@ -1668,13 +1899,13 @@ namespace IDE.ui
 
 				gApp.WithTabs(scope (tab) =>
 					{
-					    var sourceViewPanel = tab.mContent as SourceViewPanel;
+					    var contentPanel = tab.mContent as ContentPanel;
 					    //if (sourceViewPanel?.mProjectSource?.mProject == project)
-						if	((sourceViewPanel != null) &&
-							 (sourceViewPanel.mProjectSource != null) &&
-							 (sourceViewPanel.mProjectSource.mProject == project))
+						if	((contentPanel != null) &&
+							 (contentPanel.mProjectSource != null) &&
+							 (contentPanel.mProjectSource.mProject == project))
 					    {
-					        sourceViewPanel.DetachFromProjectItem(true);
+					        contentPanel.DetachFromProjectItem(true);
 					    }
 					});
 
@@ -1707,6 +1938,7 @@ namespace IDE.ui
 				{
 					if (let projectFileItem = projectItem as ProjectFileItem)
 					{
+						projectFileItem.PreDelete();
                         var path = scope String();
 						projectFileItem.GetFullImportPath(path);
 						doRemove = deletePathFunc(path);
@@ -1716,7 +1948,7 @@ namespace IDE.ui
 				if (doRemove)
 				{
 		            if (projectItem.mParentFolder != null)
-		                projectItem.mParentFolder.RemoveChild(projectItem);
+		                projectItem.mParentFolder.RemoveChild(projectItem, deleteKind == .Normal);
 					
 					mProjectToListViewMap.Remove(projectItem);
 					mListViewToProjectMap.Remove(listItem);
@@ -2108,7 +2340,9 @@ namespace IDE.ui
 				StringView sv = .((.)data, size);
 				for (var line in sv.Split('\n'))
 				{
-					var uri = IDEUtils.URLDecode(line, .. scope .());
+					String uri = scope .();
+					if (IDEUtils.URLDecode(line, uri) case .Err)
+						continue;
 					if (uri.StartsWith("file:///"))
 					{
 						var srcPath = scope String()..Append(uri.Substring("file:///".Length));
@@ -2129,7 +2363,7 @@ namespace IDE.ui
 
 			var projectItem = GetSelectedProjectItem();
 			var projectFolder = projectItem as ProjectFolder;
-			if (projectFolder == null)
+			if ((projectFolder == null) && (projectItem != null))
 				projectFolder = projectItem.mParentFolder;
 			if (projectFolder == null)
 				return;
@@ -2256,7 +2490,9 @@ namespace IDE.ui
 			StringView sv = .((.)data, size);
 			SrcLoop: for (var line in sv.Split('\n'))
 			{
-				var uri = IDEUtils.URLDecode(line, .. scope .());
+				String uri = scope .();
+				if (IDEUtils.URLDecode(line, uri) case .Err)
+					continue;
 				if (uri.StartsWith("file:///"))
 				{
 					var srcPath = scope String()..Append(uri.Substring("file:///".Length));
@@ -2637,6 +2873,7 @@ namespace IDE.ui
                                         new (evt) =>
                                         {
 											//FinishRenameFolder(newName, false);
+											QueueSortItem(parentLvItem);
 											projectFolder.Rename(newName, false);
 											Sort();
                                         }
@@ -2700,7 +2937,8 @@ namespace IDE.ui
 
 				if (!isWorkspaceFolder)
 					QueueSortItem(parentLvItem);
-				Sort();
+				if (didRename)
+					Sort();
             }
 
 			SetFocus();
@@ -2732,7 +2970,7 @@ namespace IDE.ui
             EditListViewItem(editItem);
         }
 
-        public void TryRenameItem()
+        public override void TryRenameItem()
         {
             ListViewItem selectedListViewItem = mListView.GetRoot().FindFocusedItem();           
             if (selectedListViewItem != null)
@@ -2955,16 +3193,9 @@ namespace IDE.ui
             newProjectDialog.PopupWindow(gApp.GetActiveWindow());
         }
 
-        protected override void ShowRightClickMenu(Widget relWidget, float x, float y)
-        {
-     		ProjectItem projectItem = null;
-            mSelectedParentItem = (DarkListViewItem)GetSelectedParentItem();
-			var focusedItem = mListView.GetRoot().FindFocusedItem();
-			if (focusedItem != null)
-				mListViewToProjectMap.TryGetValue(focusedItem, out projectItem);
-            
-            Menu menu = new Menu();
-            bool handled = false;
+		public virtual void PopulateRightClickMenu(Menu menu, ProjectItem projectItem, ListViewItem focusedItem)
+		{
+			bool handled = false;
 
 			void AddOpenContainingFolder()
 			{
@@ -2987,11 +3218,17 @@ namespace IDE.ui
 							else
 								projectFolder.GetFullImportPath(path);
 						}
+						else if (var projectFileItem = projectItem as ProjectSource)
+						{
+							var filePath = projectFileItem.GetFullImportPath(.. scope .());
+							Path.GetDirectoryPath(filePath, path);
+						}
 						else
 							projectItem.mParentFolder.GetFullImportPath(path);
 
 						if (!path.IsWhiteSpace)
 						{
+#if BF_PLATFORM_WINDOWS
 							ProcessStartInfo psi = scope ProcessStartInfo();
 							psi.SetFileName(path);
 							psi.UseShellExecute = true;
@@ -2999,6 +3236,54 @@ namespace IDE.ui
 
 							var process = scope SpawnedProcess();
 							process.Start(psi).IgnoreError();
+#elif BF_PLATFORM_LINUX
+							if (!Linux.IsSystemdAvailable)
+								return;
+
+							Linux.DBus* userDBus = ?;
+							if (Linux.SdBusOpenUser(&userDBus) < 0)
+								return;
+							defer Linux.SdBusUnref(userDBus);
+
+							Linux.DBusMsg* msg = ?;
+							if (Linux.SdBusNewMethodCall(userDBus, &msg,
+								"org.freedesktop.FileManager1",
+								"/org/freedesktop/FileManager1",
+								"org.freedesktop.FileManager1",
+								"ShowFolders") < 0)
+									return;
+							defer Linux.SdBusMessageUnref(msg);
+
+							if (Linux.SdBusMessageOpenContainer(msg, .Array, "s") < 0)
+								return;
+
+							String arg = new:ScopedAlloc! .(path.Length + 10);
+							arg..Append("file://")..Append(path);
+								
+							if (Linux.SdBusMessageAppend(msg, "s", arg.CStr()) < 0)
+								return;
+
+							if (Linux.SdBusMessageCloseContainer(msg) < 0)
+								return;
+
+							if (Linux.SdBusMessageAppend(msg, "s", "".CStr()) < 0)
+								return;
+
+							Linux.DBusErr error = default;
+							if (Linux.SdBusCall(userDBus, msg, 0, &error, null) < 0)
+							{
+								Linux.SdBusErrorFree(&error);
+								return;
+							}
+#elif BF_PLATFORM_MACOS
+							ProcessStartInfo psi = scope ProcessStartInfo();
+							psi.SetFileName("/usr/bin/open");
+							psi.SetArguments(scope $"\"{path}\"");
+							psi.UseShellExecute = false;
+
+							var process = scope SpawnedProcess();
+							process.Start(psi).IgnoreError();
+#endif
 						}
 				    });
 
@@ -3066,8 +3351,8 @@ namespace IDE.ui
 					});
 			}
 
-            if (projectItem == null)
-            {
+			if (projectItem == null)
+			{
 				Menu anItem;
 
 				void AddWorkspaceMenuItems()
@@ -3151,14 +3436,14 @@ namespace IDE.ui
 
 					menu.AddItem();
 
-	                AddWorkspaceMenuItems();
+			        AddWorkspaceMenuItems();
 					menu.AddItem();
-	                anItem = menu.AddItem("Properties...");
-	                anItem.mOnMenuItemSelected.Add(new (item) => { ShowWorkspaceProperties(); });
+			        anItem = menu.AddItem("Properties...");
+			        anItem.mOnMenuItemSelected.Add(new (item) => { ShowWorkspaceProperties(); });
 
-	                handled = true;
+			        handled = true;
 				}
-            }
+			}
 
 			bool isProject = false;
 			bool isFailedLoad = false;
@@ -3190,8 +3475,8 @@ namespace IDE.ui
 			    }
 			}
 
-            if ((projectItem != null) && (!handled))
-            {
+			if ((projectItem != null) && (!handled))
+			{
 				Menu item = null;
 
 				if (isProject)
@@ -3277,38 +3562,70 @@ namespace IDE.ui
 						    {
 								var projectItem = GetSelectedProjectItem();
 								if (projectItem != null)
-								{
-									let project = projectItem.mProject;
-									if (project.mNeedsCreate)
-									{
-										project.FinishCreate(false);
-										RebuildUI();
-									}
-									else
-									{
-										if (project.mRootFolder.mIsWatching)
-											project.mRootFolder.StopWatching();
-										project.mRootFolder.StartWatching();
-										RehupFolder(project.mRootFolder, .FullTraversal);
-									}
-								}
+									RefreshProject(projectItem.mProject);
 						    });
 					}
 
 					if (!isFailedLoad)
 					{
 						AddOpenContainingFolder();
+
+						menu.AddItem();
+						item = menu.AddItem("Build");
+						item.mOnMenuItemSelected.Add(new (menu) =>
+							{
+								var projectItem = GetSelectedProjectItem();
+								if (projectItem != null)
+								{
+									gApp.[Friend]Compile(.NormalTargeted(new .(projectItem.mProject.mProjectName)));
+								}
+									//gApp.[Friend](false, false, projectItem.mProject);
+							});
+
+						var testMenu = menu.AddItem("Test");
+						var testRunMenu = testMenu.AddItem("Run");
+						item = testRunMenu.AddItem("Normal Tests");
+						item.mOnMenuItemSelected.Add(new (menu) =>
+							{
+								var projectItem = GetSelectedProjectItem();
+								if (projectItem != null)
+									gApp.[Friend]DoRunTests(false, false, projectItem.mProject);
+							});
+						item = testRunMenu.AddItem("All Tests");
+						item.mOnMenuItemSelected.Add(new (menu) =>
+							{
+								var projectItem = GetSelectedProjectItem();
+								if (projectItem != null)
+									gApp.[Friend]DoRunTests(true, false, projectItem.mProject);
+							});
+
+						var testDebugMenu = testMenu.AddItem("Debug");
+						item = testDebugMenu.AddItem("Normal Tests");
+						item.mOnMenuItemSelected.Add(new (menu) =>
+							{
+								var projectItem = GetSelectedProjectItem();
+								if (projectItem != null)
+									gApp.[Friend]DoRunTests(false, true, projectItem.mProject);
+							});
+						item = testDebugMenu.AddItem("All Tests");
+						item.mOnMenuItemSelected.Add(new (menu) =>
+							{
+								var projectItem = GetSelectedProjectItem();
+								if (projectItem != null)
+									gApp.[Friend]DoRunTests(true, true, projectItem.mProject);
+							});
+
 						menu.AddItem();
 					}
 				}
 
-                if ((projectItem != null) && (!isProject))
-                {
-                    item = menu.AddItem("Remove ...|Del");
-                    item.mOnMenuItemSelected.Add(new (item) =>
-                        {
+			    if ((projectItem != null) && (!isProject))
+			    {
+			        item = menu.AddItem("Remove ...|Del");
+			        item.mOnMenuItemSelected.Add(new (item) =>
+			            {
 							RemoveSelectedItems();
-                        });
+			            });
 
 					item = gApp.AddMenuItem(menu, "Rename", "Rename Item");
 					item.mOnMenuItemSelected.Add(new (item) =>
@@ -3322,11 +3639,11 @@ namespace IDE.ui
 					{
 						item = menu.AddItem("Ignore");
 						item.mOnMenuItemSelected.Add(new (item) =>
-                            {
+			                {
 								mListView.GetRoot().WithSelectedItems(scope (selectedItem) =>
 									{
 										ProjectItem projectItem;
-	                                    mListViewToProjectMap.TryGetValue(selectedItem, out projectItem);
+			                            mListViewToProjectMap.TryGetValue(selectedItem, out projectItem);
 										DoDeleteItem(selectedItem, null, .Ignore);
 										if (projectItem != null)
 										{
@@ -3334,7 +3651,7 @@ namespace IDE.ui
 											projectItem.mProject.SetChanged();
 										}
 									});
-                            });
+			                });
 					}
 					else if (projectItem.mIncludeKind == .Manual)
 					{
@@ -3349,30 +3666,43 @@ namespace IDE.ui
 					else if (projectItem.mIncludeKind == .Ignore)
 					{
 						item = menu.AddItem("Unignore");
-                        item.mOnMenuItemSelected.Add(new (item) =>
-                            {
+			            item.mOnMenuItemSelected.Add(new (item) =>
+			                {
 								mListView.GetRoot().WithSelectedItems(scope (selectedItem) =>
 									{
 										ProjectItem projectItem;
 										mListViewToProjectMap.TryGetValue(selectedItem, out projectItem);
 										if (projectItem.mIncludeKind == .Ignore)
-		                                {
+			                            {
 											if (projectItem.mParentFolder.IsIgnored())
 												projectItem.mIncludeKind = .Auto;
 											else
 												Unignore(projectItem);
 										}
 									});
-                            });
+			                });
 					}
 
-					if (projectItem is ProjectSource)
+					if (var projectSource = projectItem as ProjectSource)
 					{
-						item = menu.AddItem("Regenerate");
+						bool canRevert = false;
+						WithSelectedSources(scope [&] (projectSource) => { canRevert |= CanRevert(projectSource); });
+						item = menu.AddItem("Revert");
+						item.SetDisabled(!canRevert);
 						item.mOnMenuItemSelected.Add(new (item) =>
 						    {
-								Regenerate(false);
+								RevertSelected();
 						    });
+
+						
+						if (projectSource.IsBeefFile)
+						{
+							item = menu.AddItem("Regenerate");
+							item.mOnMenuItemSelected.Add(new (item) =>
+							    {
+									Regenerate(false);
+							    });
+						}
 					}
 					else if (let projectFolder = projectItem as ProjectFolder)
 					{
@@ -3448,7 +3778,7 @@ namespace IDE.ui
 							String path = scope String();
 							if (var projectFileItem = projectItem as ProjectFileItem)
 							{
-                                projectFileItem.GetFullImportPath(path);
+			                    projectFileItem.GetFullImportPath(path);
 								gApp.SetClipboardText(path);
 							}
 							
@@ -3457,7 +3787,7 @@ namespace IDE.ui
 					AddOpenContainingFolder();
 
 					menu.AddItem();
-                }
+			    }
 
 				if (!isFailedLoad)
 				{
@@ -3479,7 +3809,7 @@ namespace IDE.ui
 									NewFolder(projectFolder);
 							}
 					    });
-	
+
 					item = menu.AddItem("Generate File...");
 					item.mOnMenuItemSelected.Add(new (item) =>
 					    {
@@ -3493,7 +3823,7 @@ namespace IDE.ui
 
 					item = menu.AddItem("Import File...");
 					item.mOnMenuItemSelected.Add(new (item) => { mImportFileDeferred = true; /* ImportFile();*/ });
-	
+
 					item = menu.AddItem("Import Folder...");
 					item.mOnMenuItemSelected.Add(new (item) => { mImportFolderDeferred = true; /* ImportFile();*/ });
 
@@ -3509,13 +3839,24 @@ namespace IDE.ui
 						    });
 					}
 				}
-            }
-            /*else if (!handled)
-            {
-                Menu anItem = menu.AddItem("Import Project");
-                anItem.mMenuItemSelectedHandler .Add(new (item) => { mImportProjectDeferred = true; };
-            }*/
+			}
+			/*else if (!handled)
+			{
+			    Menu anItem = menu.AddItem("Import Project");
+			    anItem.mMenuItemSelectedHandler .Add(new (item) => { mImportProjectDeferred = true; };
+			}*/
+		}
 
+        protected override void ShowRightClickMenu(Widget relWidget, float x, float y)
+        {
+     		ProjectItem projectItem = null;
+            mSelectedParentItem = (DarkListViewItem)GetSelectedParentItem();
+			var focusedItem = mListView.GetRoot().FindFocusedItem();
+			if (focusedItem != null)
+				mListViewToProjectMap.TryGetValue(focusedItem, out projectItem);
+            
+            Menu menu = new Menu();
+            PopulateRightClickMenu(menu, projectItem, focusedItem);
 			if (menu.mItems.IsEmpty)
 			{
 				delete menu;

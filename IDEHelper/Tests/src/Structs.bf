@@ -28,6 +28,8 @@ namespace Tests
 				mA = a;
 				mB = b;
 			}
+
+			public int GetA() => mA;
 		}
 
 		struct StructC
@@ -153,6 +155,29 @@ namespace Tests
 			return sn;
 		}
 
+		public struct StructS
+		{
+			public int mA = 123;
+			public static StructS* sPtr;
+
+			public this()
+			{
+				sPtr = &this;
+			}
+		}
+
+		public struct StructT
+		{
+			public int mA = 234;
+			public int mB = ?;
+			public StructS mS = .();
+
+			public this()
+			{
+				mB++;
+			}
+		}
+
 		[Test]
 		static void TestBasics()
 		{
@@ -171,6 +196,10 @@ namespace Tests
 			sb0 = .{ mA = 3, mB = 4 };
 			Test.Assert(sb0.mA == 3);
 			Test.Assert(sb0.mB == 4);
+
+			StructB sb2;
+			sb2.this(100, 200);
+			Test.Assert(sb2.GetA() == 100);
 
 			StructL sl = .(12, 23);
 			Test.Assert(sl.a == 12);
@@ -203,6 +232,14 @@ namespace Tests
 			count = ptr9B - ptr0;
 			Test.Assert(ptr9 == ptr9B);
 			Test.Assert(count == 9);
+
+			StructT st = .();
+			Test.Assert(&st.mS == StructS.sPtr);
+
+			st.mB = 300;
+			st.this();
+			Test.Assert(&st.mS == StructS.sPtr);
+			Test.Assert(st.mB == 301);
 		}
 
 		[Align(16)]
@@ -227,6 +264,19 @@ namespace Tests
 			int8 mA;
 			int32 mB;
 		}
+
+		[Align(alignof(T))]
+		struct StructG<T>
+		{
+			int8 mA;
+		}
+
+		[Align(CVal)]
+		struct StructV<CVal> where CVal : const int
+		{
+			int8 mA;
+		}
+		
 
 		[Test]
 		static void TestLayouts()
@@ -274,6 +324,15 @@ namespace Tests
 			Test.Assert(sizeof(StructR) == 6);
 			Test.Assert(alignof(StructR) == 2);
 			Test.Assert(strideof(StructR) == 6);
+
+			Test.Assert(sizeof(StructG<int32>) == 1);
+			Test.Assert(alignof(StructG<int32>) == 4);
+			Test.Assert(strideof(StructG<int32>) == 4);
+
+			Test.Assert(sizeof(StructV<const 16>) == 1);
+			Test.Assert(alignof(StructV<const 16>) == 16);
+			Test.Assert(strideof(StructV<const 16>) == 16);
+
 		}
 
 		public int Test<T>(T val)
@@ -345,6 +404,135 @@ namespace Tests
 			{
 				Test.Assert(entry.mA == @entry.Index * 2 + 1);
 			}
+		}
+
+		// Four floats lower to two registers, but a CRepr 'this' is always passed by pointer. Calls used to
+		//  count 'this' as two arguments when placing attributes, shifting every later one by one argument
+		[CRepr]
+		struct CReprQuad
+		{
+			public float mX, mY, mZ, mW;
+
+			public this(float x, float y, float z, float w)
+			{
+				mX = x;
+				mY = y;
+				mZ = z;
+				mW = w;
+			}
+
+			[NoInline]
+			public CReprQuad Lerp(in CReprQuad target, float t)
+			{
+				return .(mX + (target.mX - mX) * t, mY + (target.mY - mY) * t, mZ + (target.mZ - mZ) * t, mW + (target.mW - mW) * t);
+			}
+
+			[NoInline]
+			public float Dot3(in CReprQuad a, in CReprQuad b)
+			{
+				return mX * a.mX * b.mX + mY * a.mY * b.mY + mZ * a.mZ * b.mZ + mW * a.mW * b.mW;
+			}
+
+			[NoInline]
+			public float Scale(float t, bool negate)
+			{
+				return negate ? -mX * t : mX * t;
+			}
+
+			[NoInline]
+			public void LerpTo(in CReprQuad target, float t) mut
+			{
+				this = Lerp(target, t);
+			}
+		}
+
+		[Test]
+		static void TestCReprThisCalls()
+		{
+			CReprQuad a = .(0, 0, 0, 1);
+			CReprQuad b = .(1, 0, 0, 0);
+			CReprQuad c = a.Lerp(b, 0.25f);
+			Test.Assert((c.mX == 0.25f) && (c.mW == 0.75f));
+
+			CReprQuad d = .(2, 3, 5, 7);
+			Test.Assert(d.Dot3(.(1, 2, 3, 4), .(4, 3, 2, 1)) == 2*1*4 + 3*2*3 + 5*3*2 + 7*4*1);
+			Test.Assert(d.Scale(1.5f, false) == 3);
+			Test.Assert(d.Scale(1.5f, true) == -3);
+
+			a.LerpTo(b, 0.5f);
+			Test.Assert((a.mX == 0.5f) && (a.mW == 0.5f));
+		}
+
+		// A NoSplat method's 'this' has reference semantics, so calls pass it by pointer. The definition used to lower
+		//  it anyway when the type lowers to a register, so calls failed to compile (or crashed the compiler with no params)
+		interface INoSplatSum
+		{
+			int Sum();
+		}
+
+		// Too many fields to splat, but 8 bytes, so it lowers to a register
+		struct NoSplatQuad : INoSplatSum
+		{
+			public int16 mA, mB, mC, mD;
+
+			[NoInline, NoSplat]
+			public int Sum() => mA + mB * 10 + mC * 100 + mD * 1000;
+
+			[NoInline, NoSplat]
+			public int SumScaled(int scale, NoSplatQuad other) => Sum() * scale + other.mA;
+
+			[NoInline, NoSplat, UseLLVM]
+			public int SumLLVM() => mA + mB * 10 + mC * 100 + mD * 1000;
+
+			[NoInline, NoSplat, UseLLVM]
+			public int SumScaledLLVM(int scale, NoSplatQuad other) => SumLLVM() * scale + other.mA;
+		}
+
+		// Two int64s lower to two registers on SysV
+		struct NoSplatPair
+		{
+			public int64 mA, mB;
+
+			[NoInline, NoSplat]
+			public int64 Sum(int64 x) => mA + mB * 10 + x;
+
+			[NoInline, NoSplat, UseLLVM]
+			public int64 SumLLVM(int64 x) => mA + mB * 10 + x;
+		}
+
+		struct NoSplatMeters : int32
+		{
+			[NoInline, NoSplat]
+			public int32 Doubled() => (int32)this * 2;
+
+			[NoInline, NoSplat, UseLLVM]
+			public int32 DoubledLLVM() => (int32)this * 2;
+		}
+
+		static int16 sNoSplatZero = 0;
+
+		[Test]
+		static void TestNoSplatThis()
+		{
+			NoSplatQuad q = .() { mA = 1, mB = 2, mC = 3, mD = 4 + sNoSplatZero };
+			Test.Assert(q.Sum() == 4321);
+			Test.Assert(q.SumScaled(2, q) == 8643);
+			Test.Assert(q.SumLLVM() == 4321);
+			Test.Assert(q.SumScaledLLVM(2, q) == 8643);
+
+			INoSplatSum boxed = scope box q;
+			Test.Assert(boxed.Sum() == 4321);
+
+			delegate int() dlg = scope => q.Sum;
+			Test.Assert(dlg() == 4321);
+
+			NoSplatPair p = .() { mA = 1, mB = 2 + sNoSplatZero };
+			Test.Assert(p.Sum(100) == 121);
+			Test.Assert(p.SumLLVM(100) == 121);
+
+			NoSplatMeters m = (NoSplatMeters)(21 + sNoSplatZero);
+			Test.Assert(m.Doubled() == 42);
+			Test.Assert(m.DoubledLLVM() == 42);
 		}
 	}
 }

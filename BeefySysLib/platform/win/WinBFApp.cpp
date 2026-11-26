@@ -1,6 +1,15 @@
 #include <dsound.h>
 #include "WinBFApp.h"
+
+#ifdef BF_FORCE_SDL
+
+#include "..\sdl\SdlBFApp.cpp"
+#include "..\sdl\GLRenderDevice.cpp"
+
+#else
+
 #include "DXRenderDevice.h"
+#include <hidusage.h>
 #include <signal.h>
 #include "../../util/BeefPerf.h"
 #include "DSoundManager.h"
@@ -92,7 +101,7 @@ static BOOL KeyboardLayoutHasAltGr(HKL layout)
 	return hasAltGr;
 }
 
-WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int windowFlags)
+WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int64 windowFlags)
 {
 	//OutputDebugStrF("Wnd %p Create\n", this);
 
@@ -143,8 +152,10 @@ WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 		mHMenuMap[aMenu->mMenu] = aMenu;
 		mMenu = aMenu;
 	}
+		
+	// Window alpha and click-through need WS_EX_LAYERED, and a native menu bar stops drawing without it
+	int windowFlagsEx = (windowFlags & BFWINDOW_NO_LAYERED) ? 0 : WS_EX_LAYERED;
 
-	int windowFlagsEx = /*WS_EX_COMPOSITED |*/ WS_EX_LAYERED;
 	if (windowFlags & BFWINDOW_TOOLWINDOW)
 		windowFlagsEx |= WS_EX_TOOLWINDOW;
 	if (windowFlags & BFWINDOW_BORDER)
@@ -196,6 +207,8 @@ WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 
 	mFlags = windowFlags;
 	mMouseVisible = true;
+	mRelativeMouseMode = false;
+	mRelativeMouseModeWanted = false;
 
 	mParent = parent;
 	HWND parentHWnd = NULL;
@@ -218,7 +231,7 @@ WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 		hInstance,
 		0);
 
-	if ((windowFlags & BFWINDOW_ALPHA_MASK) == 0)
+	if (((windowFlagsEx & WS_EX_LAYERED) != 0) && ((windowFlags & BFWINDOW_ALPHA_MASK) == 0))
 		SetLayeredWindowAttributes(mHWnd, 0, 255, 0);
 
 	HWND relativeWindow = NULL;
@@ -253,8 +266,9 @@ WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 		WINDOWPLACEMENT wndPlacement = { sizeof(WINDOWPLACEMENT), 0 };
 		::GetWindowPlacement(mHWnd, &wndPlacement);
 
+		// SW_SHOWMINIMIZED activates, which would make a minimized window the foreground one
 		if (windowFlags & BFWINDOW_SHOWMINIMIZED)
-			wndPlacement.showCmd = SW_SHOWMINIMIZED;
+			wndPlacement.showCmd = (windowFlags & BFWINDOW_NO_ACTIVATE) ? SW_SHOWMINNOACTIVE : SW_SHOWMINIMIZED;
 		else if (windowFlags & BFWINDOW_SHOWMAXIMIZED)
 			wndPlacement.showCmd = SW_SHOWMAXIMIZED;
 		else
@@ -291,6 +305,9 @@ WinBFWindow::WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y
 	mAwaitKeyReleasesEventTick = 0;
 	mAwaitKeyReleasesCheckIdx = 0;
 	mFocusLostTick = ::GetTickCount();
+	mBorderlessFullscreen = false;
+	mWindowedStyle = 0;
+	mWindowedPlacement = { sizeof(WINDOWPLACEMENT), 0 };
 
 	if (windowFlags & BFWINDOW_DEST_ALPHA)
 	{
@@ -329,6 +346,9 @@ void* WinBFWindow::GetUnderlying()
 
 void WinBFWindow::Destroy()
 {
+	if (mRelativeMouseMode)
+		EndRelativeMouseMode();
+
 	if (mAlphaMaskDC != NULL)
 		DeleteDC(mAlphaMaskDC);
 	mAlphaMaskDC = NULL;
@@ -382,6 +402,17 @@ void WinBFWindow::Show(ShowKind showKind)
 void WinBFWindow::LostFocus(BFWindow* newFocus)
 {
 	///OutputDebugStrF("Lost focus\n");
+	// A hidden, clipped cursor left behind on an unfocused window would strand the user -- the OS
+	// taking control away (alt-tab, a modal dialog, clicking another app) always aborts relative
+	// mode. A full End, not a Suspend: whether to re-establish on refocus is the app's decision,
+	// made in response to this callback (re-calling StartRelativeMouseMode here is safe -- it
+	// defers via mRelativeMouseModeWanted until real focus is back).
+	if (mRelativeMouseMode)
+	{
+		EndRelativeMouseMode();
+		mRelativeMouseModeAbortedFunc(this);
+	}
+
 	mFocusLostTick = ::GetTickCount();
 	WinBFWindow* bfNewFocus = (WinBFWindow*)newFocus;
 	mSoftHasFocus = false;
@@ -415,6 +446,8 @@ void WinBFWindow::GotFocus()
 		mAwaitKeyReleasesCheckIdx = 0;
 		mAwaitKeyReleasesEventTick = ::GetTickCount();
 	}
+
+	TryStartRelativeMouseModeIfWanted();
 }
 
 void WinBFWindow::SetForeground()
@@ -422,7 +455,9 @@ void WinBFWindow::SetForeground()
 	bool hadFocus = mHasFocus;
 	DWORD prevFocusLostTick = mFocusLostTick;
 
-	if (mFlags & BFWINDOW_FAKEFOCUS)
+	// Virtual focus (automation) already holds the logical focus; taking the OS foreground would
+	// only yank the window out from under whatever the user is doing.
+	if ((mFlags & BFWINDOW_FAKEFOCUS) || (gBFApp->mVirtualFocus))
 	{
 		mHasFocus = true;
 		mSoftHasFocus = true;
@@ -630,8 +665,8 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 			((DXRenderWindow*)mRenderWindow)->mRefreshRate = 0;
 			break;
 		case WM_SIZE:
-			mRenderWindow->Resized();
-			if (mMovedFunc != NULL)
+			mRenderWindow->Resized();			
+			if ((mMovedFunc != NULL) && (wParam != SIZE_MINIMIZED))
 				mMovedFunc(this);
 			break;
 		case WM_PAINT:
@@ -821,7 +856,11 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 				case WM_MOUSEMOVE:
 					{
 						//OutputDebugStrF("WM_MOUSEMOVE %d\n", hWnd);
-						mMouseMoveFunc(this, x, y);
+						// While in relative mode, movement comes from WM_INPUT (see below) instead --
+						// there's no meaningful "mouse position" to report here (the cursor is clipped
+						// to this window and hidden, not actually where x/y implies it visually is).
+						if (!mRelativeMouseMode)
+							mMouseMoveFunc(this, x, y);
 
 						// If we are dragging a transparent window then check for mouse positions under cursor
 						HWND captureWindow = GetCapture();
@@ -900,6 +939,28 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 			}
 			break;
 
+		case WM_INPUT:
+			{
+				if (mRelativeMouseMode)
+				{
+					BYTE lpb[sizeof(RAWINPUT)];
+					UINT dwSize = sizeof(lpb);
+					UINT bytesRead = ::GetRawInputData((HRAWINPUT)lParam, RID_INPUT, lpb, &dwSize, sizeof(RAWINPUTHEADER));
+					if ((bytesRead != (UINT)-1) && (bytesRead >= sizeof(RAWINPUTHEADER)))
+					{
+						RAWINPUT* raw = (RAWINPUT*)lpb;
+						if ((raw->header.dwType == RIM_TYPEMOUSE) && ((raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0))
+						{
+							int dx = raw->data.mouse.lLastX;
+							int dy = raw->data.mouse.lLastY;
+							if ((dx != 0) || (dy != 0))
+								mMouseDeltaFunc(this, dx, dy);
+						}
+					}
+				}
+			}
+			break;
+
 		case WM_COMMAND:
 			{
 				WinBFMenu* aMenu = (*menuIDMap)[(uint32)wParam];
@@ -954,6 +1015,8 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 			break;
 		case WM_KILLFOCUS:
 			//OutputDebugStrF("WM_KILLFOCUS %p\n", hWnd);
+			if (gBFApp->mVirtualFocus)
+				break; // Logical focus is kept while automating, see BFApp::mVirtualFocus
 			mHasFocus = false;
 			mSoftHasFocus = false;
 			LostFocus(NULL);
@@ -1047,7 +1110,7 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 
 				if (!mIsMenuKeyHandled)
 				{
-					if ((CheckKeyReleases(true)) && (mKeyDownFunc(this, keyCode, (lParam & 0x7FFF) != 0)))
+					if ((CheckKeyReleases(true)) && (mKeyDownFunc(this, keyCode, (lParam & 0x40000000) != 0)))
 					{
 						mIsMenuKeyHandled = true;
 						doResult = true;
@@ -1116,6 +1179,8 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 			}
 			break;
 		case WM_TIMER:
+			if (mRelativeMouseMode)
+				PinCursorToCenter();
 			if (gBFApp->mSysDialogCnt == 0)
 			{
 				auto checkNonFake = this;
@@ -1125,7 +1190,7 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 				}
 				bool isFocused = GetForegroundWindow() == checkNonFake->mHWnd;
 
-				if ((!isFocused) && (mHasFocus))
+				if ((!isFocused) && (mHasFocus) && (!gBFApp->mVirtualFocus))
 				{
 					mSoftHasFocus = false;
 					mHasFocus = false;
@@ -1143,7 +1208,14 @@ LRESULT WinBFWindow::WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPar
 				}
 
 				mSoftHasFocus = mHasFocus;
-				gBFApp->Process();
+				// Frames normally come from the main loop, which reads input after its wait; this only keeps them
+				// coming while a modal loop (move/size, menus) holds the main loop up.
+				if ((int)(BFTickCount() - app->mLastLoopProcessTick) >= 30)
+				{
+					app->mInTimerProcess = true;
+					gBFApp->Process();
+					app->mInTimerProcess = false;
+				}
 				// Don't do anything with 'this' after Process, we may be deleted now
 				doResult = true;
 				result = 0;
@@ -1306,12 +1378,15 @@ WinBFApp::WinBFApp()
 
 	mDataDir = mInstallDir;
 	mInMsgProc = false;
+	mLastLoopProcessTick = 0;
+	mInTimerProcess = false;
 	mDSoundManager = NULL;
 	mDInputManager = NULL;
 
 	mVSyncThreadId = 0;
 	mClosing = false;
 	mVSyncActive = false;
+	mExternalPacingEvent = NULL;
 	mVSyncThread = BfpThread_Create(VSyncThreadProcThunk, (void*)this, 128 * 1024, BfpThreadCreateFlag_StackSizeReserve, &mVSyncThreadId);
 	BfpThread_SetPriority(mVSyncThread, BfpThreadPriority_High, NULL);
 }
@@ -1333,21 +1408,30 @@ void WinBFApp::VSyncThreadProc()
 
 		IDXGIOutput* output = NULL;
 
+		// A frame pacer replaces the vblank wait.
+		if ((mFramePacer != NULL) || (mWindowFramePacer != NULL))
+		{
+			mVSyncActive = false;
+			BfpThread_Sleep(20);
+			continue;
+		}
+
 		//
 		{
 			AutoCrit autoCrit(mCritSect);
 			if ((mRenderDevice != NULL) && (!mRenderDevice->mRenderWindowList.IsEmpty()))
 			{
 				auto renderWindow = (DXRenderWindow*)mRenderDevice->mRenderWindowList[0];
-				renderWindow->mDXSwapChain->GetContainingOutput(&output);
+				if (renderWindow->mDXSwapChain != NULL)
+					renderWindow->mDXSwapChain->GetContainingOutput(&output);
 			}
 		}
 
 		if (output != NULL)
 		{
-			DWORD startTick = GetTickCount();
+			DWORD startTick = timeGetTime();
 			bool success = output->WaitForVBlank() == 0;
-			DWORD endTick = GetTickCount();
+			DWORD endTick = timeGetTime();
 
 			if (success)
 			{
@@ -1393,9 +1477,36 @@ WinBFApp::~WinBFApp()
 	BfpThread_WaitFor(mVSyncThread, -1);
 	BfpThread_Release(mVSyncThread);
 
+	SetExternalPacing(NULL);
+
 	delete mRenderDevice;
 	delete mDSoundManager;
 	delete mDInputManager;
+}
+
+void WinBFApp::SetExternalPacing(const char* eventName)
+{
+	mExternalPacingActive = false;
+	if (mExternalPacingEvent != NULL)
+	{
+		::CloseHandle(mExternalPacingEvent);
+		mExternalPacingEvent = NULL;
+	}
+
+	if ((eventName == NULL) || (eventName[0] == 0))
+		return;
+
+	// Auto-reset; creation-order-independent (opens if the pacer already created it)
+	mExternalPacingEvent = ::CreateEventA(NULL, FALSE, FALSE, eventName);
+	if (mExternalPacingEvent != NULL)
+		mExternalPacingActive = true;
+}
+
+bool WinBFApp::WaitForExternalPacing(int timeoutMS)
+{
+	if (mExternalPacingEvent == NULL)
+		return false;
+	return ::WaitForSingleObject(mExternalPacingEvent, (DWORD)timeoutMS) == WAIT_OBJECT_0;
 }
 
 void WinBFApp::Init()
@@ -1413,17 +1524,26 @@ void WinBFApp::Init()
 
 void WinBFApp::Run()
 {
-	MSG msg;
 	while (mRunning)
 	{
-		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
-		{
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
-		}
-
+		PumpMessages();
 		if (mRunning)
 			Process();
+		mLastLoopProcessTick = BFTickCount();
+	}
+}
+
+void WinBFApp::PumpMessages()
+{
+	// Inside a window procedure nested messages would be dropped as re-entrant
+	if ((mInMsgProc) || (mInTimerProcess))
+		return;
+
+	MSG msg;
+	while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
 	}
 }
 
@@ -1519,7 +1639,7 @@ void WinBFApp::GetWorkspaceRectFrom(int fromX, int fromY, int fromWidth, int fro
 	outHeight = inflateRect.mHeight;
 }
 
-BFWindow* WinBFApp::CreateNewWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int windowFlags)
+BFWindow* WinBFApp::CreateNewWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int64 windowFlags)
 {
 	AutoCrit autoCrit(mCritSect);
 
@@ -1625,7 +1745,11 @@ void WinBFWindow::GetPosition(int* x, int* y, int* width, int* height, int* clie
 void WinBFWindow::GetPlacement(int* normX, int* normY, int* normWidth, int* normHeight, int* showKind)
 {
 	WINDOWPLACEMENT wndPlacement = { sizeof(WINDOWPLACEMENT), 0 };
-	::GetWindowPlacement(mHWnd, &wndPlacement);
+	// The live "normal" rect is the monitor's while borderless fullscreen
+	if (mBorderlessFullscreen)
+		wndPlacement = mWindowedPlacement;
+	else
+		::GetWindowPlacement(mHWnd, &wndPlacement);
 	*normX = wndPlacement.rcNormalPosition.left;
 	*normY = wndPlacement.rcNormalPosition.top;
 	*normWidth = wndPlacement.rcNormalPosition.right - wndPlacement.rcNormalPosition.left;
@@ -1712,6 +1836,7 @@ void WinBFWindow::SetMouseVisible(bool isMouseVisible)
 {
 	mMouseVisible = isMouseVisible;
 	LONG aStyle = ::GetWindowLong(mHWnd, GWL_EXSTYLE);
+	BF_ASSERT((isMouseVisible) || ((aStyle & WS_EX_LAYERED) != 0));
 	if (!isMouseVisible)
 		aStyle |= WS_EX_TRANSPARENT;
 	else
@@ -1721,6 +1846,7 @@ void WinBFWindow::SetMouseVisible(bool isMouseVisible)
 
 void WinBFWindow::SetAlpha(float alpha, uint32 destAlphaSrcMask, bool isMouseVisible)
 {
+	BF_ASSERT((::GetWindowLong(mHWnd, GWL_EXSTYLE) & WS_EX_LAYERED) != 0);
 	if (destAlphaSrcMask != 0)
 	{
 		if (mAlphaMaskBitmap == NULL)
@@ -1780,7 +1906,7 @@ void WinBFWindow::SetAlpha(float alpha, uint32 destAlphaSrcMask, bool isMouseVis
 		}
 	}
 	else
-	{
+	{		
 		::SetLayeredWindowAttributes(mHWnd, 0, (int) (alpha * 255), LWA_ALPHA);
 	}
 	SetMouseVisible(isMouseVisible);
@@ -1811,6 +1937,128 @@ void WinBFWindow::CaptureMouse()
 bool WinBFWindow::IsMouseCaptured()
 {
 	return (mHWnd != NULL) && (GetCapture() == mHWnd);
+}
+
+// Registers for raw mouse input (delivered as WM_INPUT, see WindowProc), which reports genuine
+// hardware deltas independent of cursor position -- unlike diffing WM_MOUSEMOVE coordinates, this
+// isn't affected by the cursor hitting the clip/screen edge. Falls through to a no-op if
+// RegisterRawInputDevices fails, leaving the window in its normal (non-relative) mouse mode.
+void WinBFWindow::StartRelativeMouseMode()
+{
+	mRelativeMouseModeWanted = true;
+
+	if (mRelativeMouseMode)
+		return;
+
+	// WM_INPUT delivery (and keyboard input, eg for Escape to release capture) requires this window to
+	// genuinely be the OS foreground window. Calling this before that's true -- eg the very first
+	// game-loop tick, right after window creation, racing ahead of the OS handing over real focus --
+	// would leave ClipCursor/ShowCursor below "succeeding" (they aren't focus-gated) while nothing is
+	// actually captured: cursor hidden, but no relative motion and no key events. Defer in that case;
+	// GotFocus retries via TryStartRelativeMouseModeIfWanted once we're genuinely foreground.
+	if (::GetForegroundWindow() != mHWnd)
+		return;
+
+	RAWINPUTDEVICE rid;
+	rid.usUsagePage = HID_USAGE_PAGE_GENERIC;
+	rid.usUsage = HID_USAGE_GENERIC_MOUSE;
+	rid.dwFlags = 0;
+	rid.hwndTarget = mHWnd;
+	if (!::RegisterRawInputDevices(&rid, 1, sizeof(rid)))
+		return;
+
+	mRelativeMouseMode = true;
+	::GetCursorPos(&mSavedCursorPos);
+
+	PinCursorToCenter();
+
+	::ShowCursor(FALSE);
+}
+
+// Movement comes from raw input, so where the hidden cursor sits only matters for what it can reach. Held at
+// the centre it never touches a screen edge (where an input-sharing tool hands it to another machine) and a
+// click can't land on another window. The clip is shared, system-wide state that anything can clear, hence
+// the re-check from WM_TIMER.
+void WinBFWindow::PinCursorToCenter()
+{
+	RECT clientRect;
+	::GetClientRect(mHWnd, &clientRect);
+	POINT center = { (clientRect.left + clientRect.right) / 2, (clientRect.top + clientRect.bottom) / 2 };
+	::ClientToScreen(mHWnd, &center);
+	RECT wantRect = { center.x - 1, center.y - 1, center.x + 1, center.y + 1 };
+	RECT curRect;
+	if ((!::GetClipCursor(&curRect)) || (!::EqualRect(&curRect, &wantRect)))
+		::ClipCursor(&wantRect);
+}
+
+void WinBFWindow::EndRelativeMouseMode()
+{
+	mRelativeMouseModeWanted = false;
+	if (!mRelativeMouseMode)
+		return;
+	mRelativeMouseMode = false;
+
+	RAWINPUTDEVICE rid;
+	rid.usUsagePage = HID_USAGE_PAGE_GENERIC;
+	rid.usUsage = HID_USAGE_GENERIC_MOUSE;
+	rid.dwFlags = RIDEV_REMOVE;
+	rid.hwndTarget = NULL;
+	::RegisterRawInputDevices(&rid, 1, sizeof(rid));
+
+	::ClipCursor(NULL);
+	::ShowCursor(TRUE);
+	::SetCursorPos(mSavedCursorPos.x, mSavedCursorPos.y);
+}
+
+bool WinBFWindow::IsInRelativeMouseMode()
+{
+	return mRelativeMouseMode;
+}
+
+void WinBFWindow::SetBorderlessFullscreen(bool fullscreen)
+{
+	if (fullscreen == mBorderlessFullscreen)
+		return;
+
+	if (fullscreen)
+	{
+		MONITORINFO monitorInfo = { sizeof(MONITORINFO) };
+		if ((!::GetWindowPlacement(mHWnd, &mWindowedPlacement)) ||
+			(!::GetMonitorInfo(::MonitorFromWindow(mHWnd, MONITOR_DEFAULTTONEAREST), &monitorInfo)))
+			return;
+		mWindowedStyle = ::GetWindowLong(mHWnd, GWL_STYLE);
+		mBorderlessFullscreen = true;
+
+		::SetWindowLong(mHWnd, GWL_STYLE, (mWindowedStyle & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+		RECT& rect = monitorInfo.rcMonitor;
+		::SetWindowPos(mHWnd, HWND_TOP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+			SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+	}
+	else
+	{
+		mBorderlessFullscreen = false;
+		::SetWindowLong(mHWnd, GWL_STYLE, mWindowedStyle);
+		::SetWindowPlacement(mHWnd, &mWindowedPlacement);
+		::SetWindowPos(mHWnd, NULL, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+	}
+
+	// WindowProc drops the WM_SIZE from above when this is reached from inside a message handler
+	mRenderWindow->Resized();
+	if (mMovedFunc != NULL)
+		mMovedFunc(this);
+
+	if (mRelativeMouseMode)
+		PinCursorToCenter();
+}
+
+// Called on genuine focus-gain (WM_SETFOCUS or the WM_TIMER-based foreground poller, see WindowProc) --
+// retries StartRelativeMouseMode if something still wants relative mode but couldn't fully establish it
+// yet (see StartRelativeMouseMode's own foreground check).
+void WinBFWindow::TryStartRelativeMouseModeIfWanted()
+{
+	if ((mRelativeMouseModeWanted) && (!mRelativeMouseMode))
+		StartRelativeMouseMode();
 }
 
 int WinBFWindow::GetDPI()
@@ -2179,3 +2427,70 @@ DrawLayer* WinBFApp::CreateDrawLayer(BFWindow* window)
 	return drawLayer;
 }
 
+// Captures what DWM has actually composited for this window's client area -- as distinct from a
+// CopyResource off our own backbuffer (see DXRenderWindow::CopyBitsTo), which reads the source of
+// the swapchain's Present copy, not the result. PW_RENDERFULLCONTENT asks the compositor for a
+// GPU-window's real content instead of the WM_PRINT fallback most apps register (irrelevant here --
+// we own this window -- but it also skirts any DWM-level caching of an unchanged frame).
+bool WinBFWindow::CaptureClientBits(uint32* outBits, int width, int height)
+{
+	HWND hwnd = mHWnd;
+	if (hwnd == NULL)
+		return false;
+
+	RECT clientRect;
+	if (!::GetClientRect(hwnd, &clientRect))
+		return false;
+	int cw = clientRect.right - clientRect.left;
+	int ch = clientRect.bottom - clientRect.top;
+	if ((cw <= 0) || (ch <= 0) || (width != cw) || (height != ch))
+		return false;
+
+	// GetDC(hwnd) (client-area-relative, unlike GetWindowDC) reads DWM's own redirection surface for
+	// this window -- the same bits the compositor last received from us -- which BitBlt copies out
+	// directly. Tried PrintWindow(PW_RENDERFULLCONTENT) first; it returned a blank white capture for
+	// this D3D swapchain window (a known-flaky path for hardware-accelerated content). BitBlt from
+	// the window's own DC is the older, simpler, and for this case more reliable mechanism.
+	HDC hdcWindow = ::GetDC(hwnd);
+	if (hdcWindow == NULL)
+		return false;
+	HDC hdcMem = ::CreateCompatibleDC(hdcWindow);
+
+	BITMAPINFO bmi = {};
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = width;
+	bmi.bmiHeader.biHeight = -height; // top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+
+	void* bits = NULL;
+	HBITMAP hBitmap = ::CreateDIBSection(hdcMem, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+	HGDIOBJ oldBitmap = ::SelectObject(hdcMem, hBitmap);
+
+	BOOL ok = ::BitBlt(hdcMem, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY);
+	if (ok)
+	{
+		// GDI DIB pixels are BGRA in memory; every other capture path in this codebase (D3D texture
+		// GetBits -> Res_WritePNG) is RGBA. Swap here so callers never need to know which capture
+		// mechanism produced a given buffer.
+		uint8* src = (uint8*)bits;
+		uint8* dst = (uint8*)outBits;
+		int64 pixelCount = (int64)width * height;
+		for (int64 i = 0; i < pixelCount; i++)
+		{
+			dst[i * 4 + 0] = src[i * 4 + 2];
+			dst[i * 4 + 1] = src[i * 4 + 1];
+			dst[i * 4 + 2] = src[i * 4 + 0];
+			dst[i * 4 + 3] = src[i * 4 + 3];
+		}
+	}
+
+	::SelectObject(hdcMem, oldBitmap);
+	::DeleteObject(hBitmap);
+	::DeleteDC(hdcMem);
+	::ReleaseDC(hwnd, hdcWindow);
+	return ok != 0;
+}
+
+#endif

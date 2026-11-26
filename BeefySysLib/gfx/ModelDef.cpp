@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <vector>
 #include "ModelDef.h"
 #include "BFApp.h"
 #include "gfx/RenderDevice.h"
@@ -10,6 +12,7 @@
 #include "util/Sphere.h"
 #include "util/HashSet.h"
 #include "util/BeefPerf.h"
+#include <cfloat>
 
 #pragma warning(disable:4190)
 
@@ -23,6 +26,69 @@ public:
 
 ModelManager sModelManager;
 static TLSingleton<String> gModelDef_TLStrReturn;
+static TLSingleton<Array<Vector3>> gModelDef_TLPositionsReturn;
+
+static Vector3 SkinPosition(const ModelVertex& vtx, const Array<Matrix4>& jointMatrices)
+{
+	Vector3 pos(0, 0, 0);
+	for (int w = 0; w < vtx.mNumBoneWeights; w++)
+		pos = pos + Vector3::Transform(vtx.mPosition, jointMatrices[vtx.mBoneIndices[w]]) * vtx.mBoneWeights[w];
+	return pos;
+}
+
+// Triangle-expanded (non-indexed) positions for the whole model, local space, matching MeshData's
+// TrianglesRecord layout exactly -- no per-primitive material split needed for physics. If
+// modelInstance is non-null, skinned vertices are baked using its CURRENT skinning palette (a
+// one-time snapshot, not continuous tracking -- see PhysicsComponent.RefreshShape for re-baking a pose
+// that's moved on). Unskinned vertices always use their already-baked mPosition regardless (matches
+// FBXReader.cpp's own geomToWorld bake for non-skinned meshes). *outPositions points at modelDef's own
+// persistent scratch buffer, valid until the next call on this thread.
+BF_EXPORT int32 BF_CALLTYPE ModelDef_GetCollisionTriangles(ModelDef* modelDef, ModelInstance* modelInstance, Vector3** outPositions)
+{
+	Array<Vector3>& out = *gModelDef_TLPositionsReturn.Get();
+	out.Clear();
+
+	bool canSkin = (modelInstance != NULL) && (!modelDef->mJoints.IsEmpty()) &&
+		(modelInstance->mJointMatrices.mSize == modelDef->mJoints.mSize);
+
+	for (int32 meshIdx = 0; meshIdx < modelDef->mMeshes.mSize; meshIdx++)
+	{
+		if ((modelInstance != NULL) && (!modelInstance->mMeshesVisible[meshIdx]))
+			continue;
+		for (auto& prims : modelDef->mMeshes[meshIdx].mPrimitives)
+			for (int i = 0; i + 2 < (int)prims.mIndices.mSize; i += 3)
+				for (int k = 0; k < 3; k++)
+				{
+					ModelVertex& vtx = prims.mVertices[prims.mIndices[i + k]];
+					out.Add((canSkin && (vtx.mNumBoneWeights > 0)) ? SkinPosition(vtx, modelInstance->mJointMatrices) : vtx.mPosition);
+				}
+
+	}
+
+	*outPositions = out.IsEmpty() ? NULL : out.mVals;
+	return (int32)out.mSize;
+}
+
+// The same for one mesh (meshIdx < 0: all of them), unposed and without an instance, so any thread may read a def that
+// isn't being modified.
+BF_EXPORT int32 BF_CALLTYPE ModelDef_GetMeshCollisionTriangles(ModelDef* modelDef, int32 meshIdx, Vector3** outPositions)
+{
+	Array<Vector3>& out = *gModelDef_TLPositionsReturn.Get();
+	out.Clear();
+
+	for (int32 idx = 0; idx < modelDef->mMeshes.mSize; idx++)
+	{
+		if ((meshIdx >= 0) && (idx != meshIdx))
+			continue;
+		for (auto& prims : modelDef->mMeshes[idx].mPrimitives)
+			for (int i = 0; i + 2 < (int)prims.mIndices.mSize; i += 3)
+				for (int k = 0; k < 3; k++)
+					out.Add(prims.mVertices[prims.mIndices[i + k]].mPosition);
+	}
+
+	*outPositions = out.IsEmpty() ? NULL : out.mVals;
+	return (int32)out.mSize;
+}
 
 void Beefy::ModelAnimation::GetJointTranslation(int jointIdx, float frameNum, ModelJointTranslation* outJointTranslation)
 {
@@ -69,9 +135,14 @@ BF_EXPORT void ModelDef_GetBounds(ModelDef* modelDef, Vector3& min, Vector3& max
 	modelDef->GetBounds(min, max);
 }
 
-BF_EXPORT void ModelDef_SetBaseDir(ModelDef* modelDef, char* baseDIr)
+BF_EXPORT void ModelDef_GetPosedBounds(ModelDef* modelDef, Matrix4* jointMatrices, int32 jointCount, Vector3& min, Vector3& max)
 {
-	modelDef->mLoadDir = baseDIr;
+	modelDef->GetPosedBounds(jointMatrices, jointCount, min, max);
+}
+
+BF_EXPORT void ModelDef_SetBaseDir(ModelDef* modelDef, char* baseDir)
+{
+	modelDef->mLoadDir = baseDir;
 }
 
 BF_EXPORT const char* BF_CALLTYPE ModelDef_GetInfo(ModelDef* modelDef)
@@ -94,6 +165,46 @@ BF_EXPORT const char* BF_CALLTYPE ModelDef_GetInfo(ModelDef* modelDef)
 			outString += "\n";
 		}
 	}
+	return outString.c_str();
+}
+
+// What the def keeps resident after upload, tab-separated: vertex bytes, index bytes, animation
+// bytes, collision BVH bytes, embedded image bytes, then vertex, index and animation frame counts.
+BF_EXPORT const char* BF_CALLTYPE ModelDef_GetMemoryStats(ModelDef* modelDef)
+{
+	int64 vertexBytes = 0;
+	int64 indexBytes = 0;
+	int64 animBytes = 0;
+	int64 embeddedBytes = 0;
+	int64 verts = 0;
+	int64 indices = 0;
+	int64 frames = 0;
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			verts += prims.mVertices.mSize;
+			indices += prims.mIndices.mSize;
+			vertexBytes += (int64)prims.mVertices.mSize * sizeof(ModelVertex);
+			indexBytes += (int64)prims.mIndices.mSize * sizeof(uint16);
+		}
+	}
+	for (auto& anim : modelDef->mAnims)
+	{
+		for (auto& frame : anim.mFrames)
+		{
+			frames++;
+			animBytes += (int64)frame.mJointTranslations.mSize * sizeof(ModelJointTranslation);
+		}
+	}
+	int64 bvhBytes = (int64)modelDef->mBVNodes.mSize * sizeof(ModelBVNode) + (int64)modelDef->mBVIndices.mSize * sizeof(uint16) +
+		(int64)modelDef->mBVVertices.mSize * sizeof(Vector3) + (int64)modelDef->mBVTris.mSize * sizeof(int32);
+	for (auto& image : modelDef->mEmbeddedImages)
+		embeddedBytes += image.mSize;
+
+	String& outString = *gModelDef_TLStrReturn.Get();
+	outString = StrFormat("%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld\t%lld", vertexBytes, indexBytes, animBytes, bvhBytes,
+		embeddedBytes, verts, indices, frames);
 	return outString.c_str();
 }
 
@@ -121,6 +232,7 @@ BF_EXPORT void BF_CALLTYPE ModelDef_SetTextures(ModelDef* modelDef, int32 meshId
 {
 	auto& prims = modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx];
 	prims.mTexPaths.Clear();
+	prims.mTexRoles.Clear();
 	for (int i = 0; i < pathCount; i++)
 		prims.mTexPaths.Add(paths[i]);
 }
@@ -145,6 +257,722 @@ BF_EXPORT const char* BF_CALLTYPE ModelDefAnimation_GetName(ModelAnimation* mode
 	return modelAnimation->mName.c_str();
 }
 
+BF_EXPORT const char* BF_CALLTYPE ModelDef_GetMeshName(ModelDef* modelDef, int32 meshIdx)
+{
+	if ((meshIdx < 0) || (meshIdx >= modelDef->mMeshes.mSize))
+		return "";
+	return modelDef->mMeshes[meshIdx].mName.c_str();
+}
+
+BF_EXPORT int BF_CALLTYPE ModelDef_GetMeshCount(ModelDef* modelDef)
+{
+	return (int)modelDef->mMeshes.mSize;
+}
+
+BF_EXPORT int BF_CALLTYPE ModelDef_GetPrimitivesCount(ModelDef* modelDef, int meshIdx)
+{
+	return (int)modelDef->mMeshes[meshIdx].mPrimitives.mSize;
+}
+
+// The effective texture list a render instance would resolve: explicit mTexPaths, else the first
+// material-def texture parameter (mirrors the load in DXRenderDevice::CreateModelInstance).
+// '\n'-separated.
+BF_EXPORT const char* BF_CALLTYPE ModelDef_GetTexPaths(ModelDef* modelDef, int meshIdx, int primitivesIdx)
+{
+	String& outString = *gModelDef_TLStrReturn.Get();
+	outString.Clear();
+
+	auto& prims = modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx];
+	Array<String> texPaths = prims.mTexPaths;
+	if ((prims.mMaterial != NULL) && (prims.mMaterial->mDef != NULL))
+	{
+		for (auto& texParamVal : prims.mMaterial->mDef->mTextureParameterValues)
+		{
+			if (texPaths.IsEmpty())
+				texPaths.Add(texParamVal->mTexturePath);
+		}
+	}
+
+	for (int i = 0; i < texPaths.mSize; i++)
+	{
+		if (i > 0)
+			outString += "\n";
+		outString += texPaths[i];
+	}
+	return outString.c_str();
+}
+
+// The material's own name for each texture ModelDef_GetTexPaths returns, in the same order and
+// '\n'-separated (empty where the source file named none). What the engine binds a texture BY: a
+// path list alone says nothing about which slot a texture belongs in.
+BF_EXPORT const char* BF_CALLTYPE ModelDef_GetTexRoles(ModelDef* modelDef, int meshIdx, int primitivesIdx)
+{
+	String& outString = *gModelDef_TLStrReturn.Get();
+	outString.Clear();
+
+	auto& prims = modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx];
+	int count = (int)prims.mTexPaths.mSize;
+	if ((count == 0) && (prims.mMaterial != NULL) && (prims.mMaterial->mDef != NULL))
+	{
+		for (auto& texParamVal : prims.mMaterial->mDef->mTextureParameterValues)
+		{
+			if (!outString.IsEmpty())
+				outString += "\n";
+			outString += texParamVal->mName;
+		}
+		return outString.c_str();
+	}
+	for (int i = 0; i < count; i++)
+	{
+		if (i > 0)
+			outString += "\n";
+		if (i < prims.mTexRoles.mSize)
+			outString += prims.mTexRoles[i];
+	}
+	return outString.c_str();
+}
+
+// An image the model file carries itself -- what a "*N" texture path names -- still encoded. The bytes
+// belong to the def and live as long as it does.
+BF_EXPORT const uint8* BF_CALLTYPE ModelDef_GetEmbeddedImage(ModelDef* modelDef, int index, int* outSize)
+{
+	if ((index < 0) || (index >= modelDef->mEmbeddedImages.mSize))
+	{
+		*outSize = 0;
+		return NULL;
+	}
+	auto& data = modelDef->mEmbeddedImages[index];
+	*outSize = (int)data.mSize;
+	return data.mVals;
+}
+
+BF_EXPORT const char* BF_CALLTYPE ModelDef_GetMaterialName(ModelDef* modelDef, int meshIdx, int primitivesIdx)
+{
+	String& outString = *gModelDef_TLStrReturn.Get();
+	outString = modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx].mMaterialName;
+	return outString.c_str();
+}
+
+BF_EXPORT void BF_CALLTYPE ModelDef_SetExternalTextures(ModelDef* modelDef, int externalTextures)
+{
+	modelDef->mExternalTextures = externalTextures != 0;
+}
+
+BF_EXPORT int BF_CALLTYPE ModelDef_IsMaterialTwoSided(ModelDef* modelDef, int meshIdx, int primitivesIdx)
+{
+	return modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx].mTwoSided ? 1 : 0;
+}
+
+// Nonzero for an alpha-blended material. A positive *outCutoff is an alpha test instead; a file
+// asks for one or the other, never both.
+BF_EXPORT int BF_CALLTYPE ModelDef_GetMaterialAlpha(ModelDef* modelDef, int meshIdx, int primitivesIdx, float* outCutoff)
+{
+	auto& prims = modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx];
+	*outCutoff = prims.mAlphaCutoff;
+	return prims.mTransparent ? 1 : 0;
+}
+
+BF_EXPORT int BF_CALLTYPE ModelDef_GetSurfaceMaterial(ModelDef* modelDef, int meshIdx, int primitivesIdx, float* values)
+{
+	auto& prims = modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx];
+	values[0] = prims.mRoughness;
+	values[1] = prims.mMetallic;
+	values[2] = prims.mEmissive.mX;
+	values[3] = prims.mEmissive.mY;
+	values[4] = prims.mEmissive.mZ;
+	return prims.mHasSurfaceMaterial ? 1 : 0;
+}
+
+// The texture is borrowed; instances retain their own references.
+BF_EXPORT void BF_CALLTYPE ModelDef_SetTexture(ModelDef* modelDef, int meshIdx, int primitivesIdx, int texIdx, TextureSegment* textureSegment)
+{
+	auto& prims = modelDef->mMeshes[meshIdx].mPrimitives[primitivesIdx];
+	while ((int)prims.mExtTextures.mSize <= texIdx)
+		prims.mExtTextures.Add(NULL);
+	prims.mExtTextures[texIdx] = textureSegment != NULL ? textureSegment->mTexture : NULL;
+}
+
+BF_EXPORT void BF_CALLTYPE ModelDef_GetJointBindPose(ModelDef* modelDef, int jointIdx, ModelJointTranslation* outJointTranslation)
+{
+	*outJointTranslation = modelDef->mJoints[jointIdx].mBindPoseLocal;
+}
+
+BF_EXPORT void BF_CALLTYPE ModelDef_GetJointPoseInv(ModelDef* modelDef, int jointIdx, Matrix4* outMatrix)
+{
+	*outMatrix = modelDef->mJoints[jointIdx].mPoseInvMatrix;
+}
+
+BF_EXPORT void BF_CALLTYPE ModelDef_GetArmatureToWorld(ModelDef* modelDef, Matrix4* outMatrix)
+{
+	*outMatrix = modelDef->mArmatureToWorld;
+}
+
+// Conservative animated-culling data: per-joint max distance (in joint space, via mPoseInvMatrix)
+// of any vertex weighted to that joint, plus the model-space bounds of unweighted vertices (rigid
+// parts of a skinned model). outRadii must hold GetJointCount() floats. Returns 1 when unweighted
+// vertices exist.
+BF_EXPORT int BF_CALLTYPE ModelDef_GetSkinBounds(ModelDef* modelDef, float* outRadii, Vector3* outUnweightedMin, Vector3* outUnweightedMax)
+{
+	int jointCount = (int)modelDef->mJoints.size();
+	for (int i = 0; i < jointCount; i++)
+		outRadii[i] = 0;
+
+	bool hasUnweighted = false;
+	Vector3 uMin(FLT_MAX, FLT_MAX, FLT_MAX);
+	Vector3 uMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				if (vtx.mNumBoneWeights == 0)
+				{
+					hasUnweighted = true;
+					uMin.mX = BF_MIN(uMin.mX, vtx.mPosition.mX);
+					uMin.mY = BF_MIN(uMin.mY, vtx.mPosition.mY);
+					uMin.mZ = BF_MIN(uMin.mZ, vtx.mPosition.mZ);
+					uMax.mX = BF_MAX(uMax.mX, vtx.mPosition.mX);
+					uMax.mY = BF_MAX(uMax.mY, vtx.mPosition.mY);
+					uMax.mZ = BF_MAX(uMax.mZ, vtx.mPosition.mZ);
+					continue;
+				}
+				for (int w = 0; w < vtx.mNumBoneWeights; w++)
+				{
+					if (vtx.mBoneWeights[w] < 0.01f)
+						continue;
+					int jointIdx = vtx.mBoneIndices[w];
+					Vector3 jointSpace = Vector3::Transform(vtx.mPosition, modelDef->mJoints[jointIdx].mPoseInvMatrix);
+					float distSq = jointSpace.mX * jointSpace.mX + jointSpace.mY * jointSpace.mY + jointSpace.mZ * jointSpace.mZ;
+					if (distSq > outRadii[jointIdx])
+						outRadii[jointIdx] = distSq;
+				}
+			}
+		}
+	}
+
+	for (int i = 0; i < jointCount; i++)
+		outRadii[i] = sqrtf(outRadii[i]);
+
+	if (!hasUnweighted)
+	{
+		uMin = Vector3(0, 0, 0);
+		uMax = Vector3(0, 0, 0);
+	}
+	*outUnweightedMin = uMin;
+	*outUnweightedMax = uMax;
+	return hasUnweighted ? 1 : 0;
+}
+
+// Skin extent around an axis through a joint, in the space jointMatrices (a palette) skin the
+// vertices into: the max perpendicular distance of vertices weighted to the joint (weight >=
+// minWeight) whose projection falls inside
+// [-0.25, 1.25] x length (every such vertex when length <= 0), its 90th percentile (props skinned
+// to a bone would otherwise set the radius), plus the projection range of all of them. Returns the
+// number of vertices considered.
+BF_EXPORT int BF_CALLTYPE ModelDef_GetJointAxisFit(ModelDef* modelDef, const Matrix4* jointMatrices, int32 jointCount, int32 jointIdx, float ox, float oy, float oz, float ax, float ay, float az,
+	float length, float minWeight, float* outMaxPerp, float* outPerpP90, float* outMinProj, float* outMaxProj)
+{
+	std::vector<float> perps;
+	float maxPerp = 0;
+	float minProj = FLT_MAX;
+	float maxProj = -FLT_MAX;
+	int count = 0;
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				for (int w = 0; w < vtx.mNumBoneWeights; w++)
+				{
+					if ((vtx.mBoneIndices[w] != jointIdx) || (vtx.mBoneWeights[w] < minWeight))
+						continue;
+					Vector3 skinned(0, 0, 0);
+					for (int k = 0; k < vtx.mNumBoneWeights; k++)
+					{
+						int kj = vtx.mBoneIndices[k];
+						if (kj >= jointCount)
+							continue;
+						skinned = skinned + Vector3::Transform(vtx.mPosition, jointMatrices[kj]) * vtx.mBoneWeights[k];
+					}
+					float dx = skinned.mX - ox;
+					float dy = skinned.mY - oy;
+					float dz = skinned.mZ - oz;
+					float t = dx * ax + dy * ay + dz * az;
+					float px = dx - ax * t;
+					float py = dy - ay * t;
+					float pz = dz - az * t;
+					float perp = sqrtf(px * px + py * py + pz * pz);
+					count++;
+					minProj = BF_MIN(minProj, t);
+					maxProj = BF_MAX(maxProj, t);
+					if ((length <= 0) || ((t >= -0.25f * length) && (t <= 1.25f * length)))
+					{
+						maxPerp = BF_MAX(maxPerp, perp);
+						perps.push_back(perp);
+					}
+					break;
+				}
+			}
+		}
+	}
+	if (count == 0)
+	{
+		minProj = 0;
+		maxProj = 0;
+	}
+	float p90 = maxPerp;
+	if (!perps.empty())
+	{
+		size_t idx = (size_t)((perps.size() - 1) * 0.9f);
+		std::nth_element(perps.begin(), perps.begin() + idx, perps.end());
+		p90 = perps[idx];
+	}
+	*outMaxPerp = maxPerp;
+	*outPerpP90 = p90;
+	*outMinProj = minProj;
+	*outMaxProj = maxProj;
+	return count;
+}
+
+// Accumulates skinned-vertex radial profiles around body axes. A vertex weighted to joint j at or
+// above minWeight goes to owner = jointOwner[j] (a joint index, or -1 to skip): sliceCount slices
+// along that owner's [0, length] x sectorCount sectors around it (angle from refPerp, positive
+// toward axis x refPerp), summing squared perpendicular distance and counts, and the owner's min/max
+// axial coordinate over every such vertex, windowed or not. axes: per joint origin xyz, axis xyz,
+// refPerp xyz, length (length <= 0 skips). sumSq/counts hold jointCount * sliceCount * sectorCount,
+// minT/maxT jointCount; all accumulate across calls.
+BF_EXPORT void BF_CALLTYPE ModelDef_AccumRadialProfiles(ModelDef* modelDef, const Matrix4* jointMatrices, int32 jointCount, const float* axes, const int32* jointOwner, float minWeight, int32 sliceCount, int32 sectorCount, float* sumSq, int32* counts, float* minT, float* maxT)
+{
+	const float pi = 3.14159265f;
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				Vector3 skinned(0, 0, 0);
+				bool any = false;
+				for (int k = 0; k < vtx.mNumBoneWeights; k++)
+				{
+					int kj = vtx.mBoneIndices[k];
+					if (kj >= jointCount)
+						continue;
+					skinned = skinned + Vector3::Transform(vtx.mPosition, jointMatrices[kj]) * vtx.mBoneWeights[k];
+					any = true;
+				}
+				if (!any)
+					continue;
+				for (int w = 0; w < vtx.mNumBoneWeights; w++)
+				{
+					int vj = vtx.mBoneIndices[w];
+					if ((vj >= jointCount) || (vtx.mBoneWeights[w] < minWeight))
+						continue;
+					int j = jointOwner[vj];
+					if (j < 0)
+						continue;
+					const float* ax = axes + j * 10;
+					float length = ax[9];
+					if (length <= 0)
+						continue;
+					float dx = skinned.mX - ax[0];
+					float dy = skinned.mY - ax[1];
+					float dz = skinned.mZ - ax[2];
+					float t = dx * ax[3] + dy * ax[4] + dz * ax[5];
+					if (t < minT[j])
+						minT[j] = t;
+					if (t > maxT[j])
+						maxT[j] = t;
+					if ((t < 0) || (t > length))
+						continue;
+					float px = dx - ax[3] * t;
+					float py = dy - ax[4] * t;
+					float pz = dz - ax[5] * t;
+					float vx = ax[4] * ax[8] - ax[5] * ax[7];
+					float vy = ax[5] * ax[6] - ax[3] * ax[8];
+					float vz = ax[3] * ax[7] - ax[4] * ax[6];
+					float cu = px * ax[6] + py * ax[7] + pz * ax[8];
+					float cv = px * vx + py * vy + pz * vz;
+					float ang = atan2f(cv, cu);
+					int sector = (int)floorf((ang + pi) / (2 * pi) * sectorCount);
+					if (sector < 0)
+						sector = 0;
+					if (sector >= sectorCount)
+						sector = sectorCount - 1;
+					int slice = (int)(t / length * sliceCount);
+					if (slice >= sliceCount)
+						slice = sliceCount - 1;
+					int bin = (j * sliceCount + slice) * sectorCount + sector;
+					sumSq[bin] += px * px + py * py + pz * pz;
+					counts[bin]++;
+				}
+			}
+		}
+	}
+}
+
+// Signed distance to one fit shape: 16 floats, center + kind (0 sphere, 1 capsule, 2 cylinder,
+// 3 box), then the X/Y/Z axis rows with an extent in [3] (radius, half height / half extents);
+// capsules and cylinders run along Y.
+static float FitSignedDistance(const Vector3& p, const float* s)
+{
+	float dx = p.mX - s[0];
+	float dy = p.mY - s[1];
+	float dz = p.mZ - s[2];
+	float lx = dx * s[4] + dy * s[5] + dz * s[6];
+	float ly = dx * s[8] + dy * s[9] + dz * s[10];
+	float lz = dx * s[12] + dy * s[13] + dz * s[14];
+	float kind = s[3];
+	if (kind < 0.5f)
+		return sqrtf(dx * dx + dy * dy + dz * dz) - s[7];
+	if (kind < 1.5f)
+	{
+		float t = ly;
+		if (t < -s[11])
+			t = -s[11];
+		if (t > s[11])
+			t = s[11];
+		float qy = ly - t;
+		return sqrtf(lx * lx + qy * qy + lz * lz) - s[7];
+	}
+	if (kind < 2.5f)
+	{
+		float radial = sqrtf(lx * lx + lz * lz) - s[7];
+		float axial = fabsf(ly) - s[11];
+		float ox = BF_MAX(radial, 0.0f);
+		float oy = BF_MAX(axial, 0.0f);
+		return BF_MIN(BF_MAX(radial, axial), 0.0f) + sqrtf(ox * ox + oy * oy);
+	}
+	float qx = fabsf(lx) - s[7];
+	float qy = fabsf(ly) - s[11];
+	float qz = fabsf(lz) - s[15];
+	float ox = BF_MAX(qx, 0.0f);
+	float oy = BF_MAX(qy, 0.0f);
+	float oz = BF_MAX(qz, 0.0f);
+	return BF_MIN(BF_MAX(qx, BF_MAX(qy, qz)), 0.0f) + sqrtf(ox * ox + oy * oy + oz * oz);
+}
+
+static int DominantJoint(const ModelVertex& vtx, int32 jointCount)
+{
+	int best = -1;
+	float bestWeight = 0;
+	for (int k = 0; k < vtx.mNumBoneWeights; k++)
+	{
+		if ((vtx.mBoneIndices[k] < jointCount) && (vtx.mBoneWeights[k] > bestWeight))
+		{
+			bestWeight = vtx.mBoneWeights[k];
+			best = vtx.mBoneIndices[k];
+		}
+	}
+	return best;
+}
+
+// Vertex color alpha 255 where the vertex's heaviest joint is flagged (or it has no joint), else 0.
+BF_EXPORT void BF_CALLTYPE ModelDef_SetVertexAlphaByJoint(ModelDef* modelDef, const uint8* jointFlags, int32 jointCount)
+{
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				int joint = DominantJoint(vtx, jointCount);
+				bool on = (joint < 0) || (jointFlags[joint] != 0);
+				vtx.mColor = (vtx.mColor & 0x00FFFFFF) | (on ? 0xFF000000 : 0);
+			}
+		}
+	}
+}
+
+// Fit statistics: skins every vertex whose heaviest joint is flagged, scales it into the shapes'
+// space, takes the signed distance to the nearest shape (FitSignedDistance layout) and buckets it
+// against range: outFractions = {inside past range, within range, outside past range}; outMeanAbs
+// is the mean |distance| (capped at 10 ranges). Returns the vertex count measured.
+BF_EXPORT int BF_CALLTYPE ModelDef_MeasureFit(ModelDef* modelDef, const Matrix4* jointMatrices, int32 jointCount, float sx, float sy, float sz,
+	const float* shapes, int32 shapeCount, float range, const uint8* jointFlags, float* outFractions, float* outMeanAbs)
+{
+	int counts[3] = { 0, 0, 0 };
+	double sumAbs = 0;
+	int total = 0;
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				int joint = DominantJoint(vtx, jointCount);
+				if ((joint >= 0) && (jointFlags != NULL) && (jointFlags[joint] == 0))
+					continue;
+				Vector3 skinned(0, 0, 0);
+				bool any = false;
+				for (int k = 0; k < vtx.mNumBoneWeights; k++)
+				{
+					int kj = vtx.mBoneIndices[k];
+					if (kj >= jointCount)
+						continue;
+					skinned = skinned + Vector3::Transform(vtx.mPosition, jointMatrices[kj]) * vtx.mBoneWeights[k];
+					any = true;
+				}
+				if (!any)
+					skinned = vtx.mPosition;
+				Vector3 p(skinned.mX * sx, skinned.mY * sy, skinned.mZ * sz);
+				float d = FLT_MAX;
+				for (int i = 0; i < shapeCount; i++)
+					d = BF_MIN(d, FitSignedDistance(p, shapes + i * 16));
+				if (d < -range)
+					counts[0]++;
+				else if (d <= range)
+					counts[1]++;
+				else
+					counts[2]++;
+				sumAbs += BF_MIN(fabsf(d), range * 10);
+				total++;
+			}
+		}
+	}
+	for (int i = 0; i < 3; i++)
+		outFractions[i] = (total > 0) ? (float)counts[i] / total : 0;
+	*outMeanAbs = (total > 0) ? (float)(sumAbs / total) : 0;
+	return total;
+}
+
+void Beefy::ModelPrimitives::GenerateTangents()
+{
+	for (auto& v : mVertices) v.mTangent = Vector3(0, 0, 0);
+	for (int i = 0; i + 2 < mIndices.mSize; i += 3)
+	{
+		auto& a = mVertices[mIndices[i]];
+		auto& b = mVertices[mIndices[i + 1]];
+		auto& c = mVertices[mIndices[i + 2]];
+		float du1 = b.mTexCoords.mU - a.mTexCoords.mU, dv1 = b.mTexCoords.mV - a.mTexCoords.mV;
+		float du2 = c.mTexCoords.mU - a.mTexCoords.mU, dv2 = c.mTexCoords.mV - a.mTexCoords.mV;
+		float det = du1 * dv2 - du2 * dv1;
+		if (fabs(det) < 1e-12f) continue;
+		auto tangent = ((b.mPosition - a.mPosition) * dv2 - (c.mPosition - a.mPosition) * dv1) * (1.0f / det);
+		a.mTangent += tangent; b.mTangent += tangent; c.mTangent += tangent;
+	}
+	for (auto& v : mVertices)
+	{
+		float normalLen = v.mNormal.GetMagnitude();
+		auto normal = (normalLen > 1e-8f) ? v.mNormal * (1.0f / normalLen) : Vector3(0, 0, 0);
+		auto tangent = v.mTangent - normal * Vector3::Dot(normal, v.mTangent);
+		float len = tangent.GetMagnitude();
+		v.mTangent = (len > 1e-8f) ? tangent * (1.0f / len) : Vector3(0, 0, 0);
+	}
+}
+
+// A primitive's vertices and indices as stored (bind-pose local for skinned meshes) -- the engine
+// uploads unskinned ones once as shared static meshes and instances them.
+float Beefy::ModelPackBoneData(const ModelVertex& vtx, uint32* outIdx, uint64* outWeights)
+{
+	*outIdx = 0;
+	*outWeights = 0;
+	int count = vtx.mNumBoneWeights;
+	if (count <= 0)
+		return 0;
+
+	// Selection sort over at most 8 entries: the top four by weight, heaviest first.
+	int order[MODEL_MAX_BONE_WEIGHTS];
+	for (int i = 0; i < count; i++)
+		order[i] = i;
+	int keep = (count < 4) ? count : 4;
+	for (int i = 0; i < keep; i++)
+	{
+		int best = i;
+		for (int j = i + 1; j < count; j++)
+			if (vtx.mBoneWeights[order[j]] > vtx.mBoneWeights[order[best]])
+				best = j;
+		int tmp = order[i]; order[i] = order[best]; order[best] = tmp;
+	}
+
+	float total = 0;
+	float kept = 0;
+	for (int i = 0; i < count; i++)
+		total += vtx.mBoneWeights[i];
+	for (int i = 0; i < keep; i++)
+		kept += vtx.mBoneWeights[order[i]];
+	if (kept <= 0)
+		return 0;
+
+	uint32 idx = 0;
+	uint64 weights = 0;
+	int sum = 0;
+	for (int i = 0; i < keep; i++)
+	{
+		int joint = vtx.mBoneIndices[order[i]];
+		if ((joint < 0) || (joint > 255))
+			joint = 0;
+		idx |= ((uint32)joint) << (i * 8);
+		int w = (int)(vtx.mBoneWeights[order[i]] / kept * 65535.0f + 0.5f);
+		weights |= ((uint64)(uint16)w) << (i * 16);
+		sum += w;
+	}
+	// The rounding drift goes on the heaviest influence, which is the one it perturbs least.
+	int drift = 65535 - sum;
+	if (drift != 0)
+	{
+		int w0 = (int)(weights & 0xFFFF) + drift;
+		if (w0 < 0) w0 = 0;
+		if (w0 > 65535) w0 = 65535;
+		weights = (weights & ~(uint64)0xFFFF) | (uint64)(uint16)w0;
+	}
+	*outIdx = idx;
+	*outWeights = weights;
+	return (total > 0) ? ((total - kept) / total) : 0;
+}
+
+// One primitive's packed bone data, one entry per vertex. Returns 0 when the model has more joints
+// than a uint8 index can address -- the caller then keeps the native per-draw path. outMaxDropped
+// takes the worst truncation loss seen, for the caller's warning.
+BF_EXPORT int BF_CALLTYPE ModelDef_PackBoneData(ModelDef* modelDef, int meshIdx, int primitivesIdx,
+	uint32* outIdx, uint64* outWeights, float* outMaxDropped)
+{
+	if (outMaxDropped != NULL)
+		*outMaxDropped = 0;
+	if ((int)modelDef->mJoints.size() > 255)
+		return 0;
+	if ((meshIdx < 0) || (meshIdx >= (int)modelDef->mMeshes.size()))
+		return 0;
+	auto& mesh = modelDef->mMeshes[meshIdx];
+	if ((primitivesIdx < 0) || (primitivesIdx >= (int)mesh.mPrimitives.size()))
+		return 0;
+	auto& prims = mesh.mPrimitives[primitivesIdx];
+	float worst = 0;
+	for (int i = 0; i < (int)prims.mVertices.size(); i++)
+	{
+		float dropped = ModelPackBoneData(prims.mVertices[i], &outIdx[i], &outWeights[i]);
+		if (dropped > worst)
+			worst = dropped;
+	}
+	if (outMaxDropped != NULL)
+		*outMaxDropped = worst;
+	return 1;
+}
+
+BF_EXPORT int BF_CALLTYPE ModelDef_GetPrimitiveMesh(ModelDef* modelDef, int meshIdx, int primitivesIdx,
+	ModelVertex** outVertices, int* outVertexCount, uint16** outIndices, int* outIndexCount)
+{
+	if ((meshIdx < 0) || (meshIdx >= (int)modelDef->mMeshes.size()))
+		return 0;
+	auto& mesh = modelDef->mMeshes[meshIdx];
+	if ((primitivesIdx < 0) || (primitivesIdx >= (int)mesh.mPrimitives.size()))
+		return 0;
+	auto& prims = mesh.mPrimitives[primitivesIdx];
+	*outVertices = prims.mVertices.mVals;
+	*outVertexCount = (int)prims.mVertices.size();
+	*outIndices = prims.mIndices.mVals;
+	*outIndexCount = (int)prims.mIndices.size();
+	return 1;
+}
+
+BF_EXPORT int BF_CALLTYPE ModelDef_GetVertexCount(ModelDef* modelDef)
+{
+	int count = 0;
+	for (auto& mesh : modelDef->mMeshes)
+		for (auto& prims : mesh.mPrimitives)
+			count += (int)prims.mVertices.size();
+	return count;
+}
+
+// Per-vertex extremes of the signed fit distance across calls (poses), one entry per vertex in
+// mesh/primitive/vertex order; the caller seeds outMax/outMin.
+BF_EXPORT void BF_CALLTYPE ModelDef_AccumFitExtremes(ModelDef* modelDef, const Matrix4* jointMatrices, int32 jointCount, float sx, float sy, float sz,
+	const float* shapes, int32 shapeCount, float* outMax, float* outMin)
+{
+	int idx = 0;
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				Vector3 skinned(0, 0, 0);
+				bool any = false;
+				for (int k = 0; k < vtx.mNumBoneWeights; k++)
+				{
+					int kj = vtx.mBoneIndices[k];
+					if (kj >= jointCount)
+						continue;
+					skinned = skinned + Vector3::Transform(vtx.mPosition, jointMatrices[kj]) * vtx.mBoneWeights[k];
+					any = true;
+				}
+				if (!any)
+					skinned = vtx.mPosition;
+				Vector3 p(skinned.mX * sx, skinned.mY * sy, skinned.mZ * sz);
+				float d = FLT_MAX;
+				for (int i = 0; i < shapeCount; i++)
+					d = BF_MIN(d, FitSignedDistance(p, shapes + i * 16));
+				outMax[idx] = BF_MAX(outMax[idx], d);
+				outMin[idx] = BF_MIN(outMin[idx], d);
+				idx++;
+			}
+		}
+	}
+}
+
+// Vertex alpha from a per-vertex signed distance: 0 where the heaviest joint isn't flagged, else
+// 2..255 spanning -range..range with 128 at the surface -- the shader's baked fit input. Buckets
+// the flagged vertices like ModelDef_MeasureFit and returns their count.
+BF_EXPORT int BF_CALLTYPE ModelDef_SetVertexAlphaFromFit(ModelDef* modelDef, const float* distances, float range, const uint8* jointFlags, int32 jointCount, int32* outCounts, float* outMeanAbs)
+{
+	int idx = 0;
+	int counts[3] = { 0, 0, 0 };
+	double sumAbs = 0;
+	int total = 0;
+	for (auto& mesh : modelDef->mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				float d = distances[idx++];
+				int joint = DominantJoint(vtx, jointCount);
+				bool on = (joint < 0) || (jointFlags[joint] != 0);
+				uint32 alpha = 0;
+				if (on)
+				{
+					float t = d / range;
+					if (t < -1)
+						t = -1;
+					if (t > 1)
+						t = 1;
+					int a = 128 + (int)floorf(t * 126 + 0.5f);
+					if (a < 2)
+						a = 2;
+					if (a > 255)
+						a = 255;
+					alpha = (uint32)a;
+					if (d < -range)
+						counts[0]++;
+					else if (d <= range)
+						counts[1]++;
+					else
+						counts[2]++;
+					sumAbs += BF_MIN(fabsf(d), range * 10);
+					total++;
+				}
+				vtx.mColor = (vtx.mColor & 0x00FFFFFF) | (alpha << 24);
+			}
+		}
+	}
+	for (int i = 0; i < 3; i++)
+		outCounts[i] = counts[i];
+	*outMeanAbs = (total > 0) ? (float)(sumAbs / total) : 0;
+	return total;
+}
+
+BF_EXPORT const char* BF_CALLTYPE ModelDef_GetJointName(ModelDef* modelDef, int jointIdx)
+{
+	return modelDef->mJoints[jointIdx].mName.c_str();
+}
+
+BF_EXPORT int BF_CALLTYPE ModelDef_GetJointParent(ModelDef* modelDef, int jointIdx)
+{
+	return modelDef->mJoints[jointIdx].mParentIdx;
+}
+
 BF_EXPORT void BF_CALLTYPE ModelDefAnimation_Clip(ModelAnimation* modelAnimation, int startFrame, int numFrames)
 {	
 	modelAnimation->mFrames.RemoveRange(0, startFrame);
@@ -154,6 +982,8 @@ BF_EXPORT void BF_CALLTYPE ModelDefAnimation_Clip(ModelAnimation* modelAnimation
 ModelDef::ModelDef()
 {
 	mFlags = Flags_None;
+	mExternalTextures = false;
+	mArmatureToWorld = Matrix4::sIdentity;
 }
 
 ModelDef::~ModelDef()
@@ -238,7 +1068,58 @@ void ModelDef::GetBounds(Vector3& min, Vector3& max)
 		CalcBounds();
 
 	min = mBounds.mMin;
-	max = mBounds.mMax;	
+	max = mBounds.mMax;
+}
+
+void ModelDef::GetPosedBounds(const Matrix4* jointMatrices, int jointCount, Vector3& min, Vector3& max)
+{
+	int vtxCount = 0;
+	for (auto& mesh : mMeshes)
+	{
+		for (auto& prims : mesh.mPrimitives)
+		{
+			for (auto& vtx : prims.mVertices)
+			{
+				Vector3 pos;
+				if ((vtx.mNumBoneWeights > 0) && (jointCount > 0))
+				{
+					// Same accumulation the CPU skin path uses (DXModelInstance::CommandQueued).
+					pos = Vector3(0, 0, 0);
+					for (int weightIdx = 0; weightIdx < vtx.mNumBoneWeights; weightIdx++)
+					{
+						int jointIdx = vtx.mBoneIndices[weightIdx];
+						if (jointIdx >= jointCount)
+							continue;
+						pos = pos + Vector3::Transform(vtx.mPosition, jointMatrices[jointIdx]) * vtx.mBoneWeights[weightIdx];
+					}
+				}
+				else
+					pos = vtx.mPosition;
+
+				if (vtxCount == 0)
+				{
+					min = pos;
+					max = pos;
+				}
+				else
+				{
+					min.mX = BF_MIN(min.mX, pos.mX);
+					min.mY = BF_MIN(min.mY, pos.mY);
+					min.mZ = BF_MIN(min.mZ, pos.mZ);
+					max.mX = BF_MAX(max.mX, pos.mX);
+					max.mY = BF_MAX(max.mY, pos.mY);
+					max.mZ = BF_MAX(max.mZ, pos.mZ);
+				}
+				vtxCount++;
+			}
+		}
+	}
+
+	if (vtxCount == 0)
+	{
+		min = Vector3(0, 0, 0);
+		max = Vector3(0, 0, 0);
+	}
 }
 
 #define SWAP(x, y) { auto temp = x; x = y; y = temp; }
@@ -276,9 +1157,9 @@ static int partition(float a[], int left, int right, int pIndex)
 	return pIndex;
 }
 
-// Returns the k'th smallest element in the list within `left…right`
+// Returns the k'th smallest element in the list within `leftï¿½right`
 // (i.e., `left <= k <= right`). The search space within the array is
-// changing for each round – but the list is still the same size.
+// changing for each round ï¿½ but the list is still the same size.
 // Thus, `k` does not need to be updated with each round.
 static float quickselect(float A[], int left, int right, int k)
 {
@@ -328,13 +1209,13 @@ void ModelDef::GenerateCollisionData()
 
 	Array<int32> triWorkList;
 	
-	int triCount = 0;
 	for (auto& mesh : mMeshes)
 	{
 		for (auto& prims : mesh.mPrimitives)
 		{
 			int startIdx = mBVIndices.mSize;
-			triCount += prims.mIndices.mSize / 3;
+			int startVertex = mBVVertices.mSize;
+			int triCount = prims.mIndices.mSize / 3;
 			triWorkList.Reserve(triWorkList.mSize + triCount);
 			mBVIndices.Reserve(mBVIndices.mSize + prims.mIndices.mSize);
 			mBVVertices.Reserve(mBVVertices.mSize + prims.mVertices.mSize);
@@ -344,7 +1225,7 @@ void ModelDef::GenerateCollisionData()
 
 			for (auto idx : prims.mIndices)
 			{
-				mBVIndices.Add(idx + startIdx);
+				mBVIndices.Add(idx + startVertex);
 			}
 
 			for (auto& vtx : prims.mVertices)

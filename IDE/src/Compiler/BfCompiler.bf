@@ -106,6 +106,9 @@ namespace IDE.Compiler
 		static extern void BfCompiler_SetBuildValue(void* bfCompiler, char8* cacheDir, char8* key, char8* value);
 
 		[CallingConvention(.Stdcall), CLink]
+		static extern void BfCompiler_SetCompilerInfo(void* bfCompiler, char8* compilerPath, char8* compilerVersion, int64 compilerBuildDate);
+
+		[CallingConvention(.Stdcall), CLink]
 		static extern char8* BfCompiler_GetBuildValue(void* bfCompiler, char8* cacheDir, char8* key);
 
 		[CallingConvention(.Stdcall), CLink]
@@ -145,6 +148,9 @@ namespace IDE.Compiler
         static extern void BfCompiler_SetOptions(void* bfCompiler,
             void* hotProject, int32 hotIdx, char8* targetTriple, char8* targetCPU, int32 toolsetType, int32 simdSetting, int32 allocStackCount, int32 maxWorkerThreads,
             OptionFlags optionsFlags, char8* mallocName, char8* freeName);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BfCompiler_SetMathOptions(void* bfCompiler, int32 floatingPointMode, int32 fmaSetting);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void BfCompiler_ForceRebuild(void* bfCompiler);
@@ -336,11 +342,13 @@ namespace IDE.Compiler
 
         public void SetOptions(BfProject hotProject, int32 hotIdx,
             String targetTriple, String targetCPU, int32 toolsetType, int32 simdSetting, int32 allocStackCount, int32 maxWorkerThreads,
-			OptionFlags optionFlags, String mallocFuncName, String freeFuncName)
+			OptionFlags optionFlags, String mallocFuncName, String freeFuncName,
+			BuildOptions.FloatingPointMode floatingPointMode = .Precise, BuildOptions.FMASetting fmaSetting = .TargetDefault)
         {
             BfCompiler_SetOptions(mNativeBfCompiler,
                 (hotProject != null) ? hotProject.mNativeBfProject : null, hotIdx,
                 targetTriple, targetCPU, toolsetType, simdSetting, allocStackCount, maxWorkerThreads, optionFlags, mallocFuncName, freeFuncName);
+			BfCompiler_SetMathOptions(mNativeBfCompiler, (int32)floatingPointMode, (int32)fmaSetting);
         }
 
 		public void ForceRebuild()
@@ -692,11 +700,12 @@ namespace IDE.Compiler
 			//Debug.WriteLine("HandleOptions");
 
 			var options = IDEApp.sApp.GetCurWorkspaceOptions();
+			let toolset = gApp.GetBuildToolset(options);
 			String targetTriple = scope .();
 			if (TargetTriple.IsTargetTriple(gApp.mPlatformName))
 				targetTriple.Set(gApp.mPlatformName);
 			else
-				Workspace.PlatformType.GetTargetTripleByName(gApp.mPlatformName, options.mToolsetType, targetTriple);
+				Workspace.PlatformType.GetTargetTripleByName(gApp.mPlatformName, toolset, targetTriple);
 
 			bool enableObjectDebugFlags = options.mEnableObjectDebugFlags;
 			bool emitObjectAccessCheck = options.mEmitObjectAccessCheck && enableObjectDebugFlags;
@@ -774,8 +783,9 @@ namespace IDE.Compiler
 				targetTriple.Set(options.mTargetTriple);
 
 			SetOptions(hotBfProject, hotIdx,
-			    targetTriple, options.mTargetCPU, (int32)options.mToolsetType, (int32)options.mBfSIMDSetting, (int32)options.mAllocStackTraceDepth,
-				(int32)gApp.mSettings.mCompilerSettings.mWorkerThreads, optionFlags, mallocLinkName, freeLinkName);
+			    targetTriple, options.mTargetCPU, (int32)toolset, (int32)options.mBfSIMDSetting, (int32)options.mAllocStackTraceDepth,
+				(int32)gApp.mSettings.mCompilerSettings.mWorkerThreads, optionFlags, mallocLinkName, freeLinkName,
+				options.mBfFloatingPointMode, options.mBfFMASetting);
 
 			if (!mIsResolveOnly)
 			{
@@ -889,6 +899,12 @@ namespace IDE.Compiler
 		public void SetBuildValue(String cacheDir, String key, String value)
 		{
 			BfCompiler_SetBuildValue(mNativeBfCompiler, cacheDir, key, value);
+		}
+
+		/// Backs Compiler.CompilerPath / CompilerVersion / CompilerBuildDate
+		public void SetCompilerInfo(StringView compilerPath, StringView compilerVersion, int64 compilerBuildDate)
+		{
+			BfCompiler_SetCompilerInfo(mNativeBfCompiler, compilerPath.ToScopeCStr!(), compilerVersion.ToScopeCStr!(), compilerBuildDate);
 		}
 
 		public void GetBuildValue(String cacheDir, String key, String outValue)

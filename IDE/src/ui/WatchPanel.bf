@@ -44,6 +44,7 @@ namespace IDE.ui
 		public String mStackFrameId ~ delete _;
 		public bool mWantsStackFrameId;
         public String mEvalStr ~ delete _;
+		public String mResultStr ~ delete _;
 		public String mAddrValueExpr ~ delete _;
 		public String mPointeeExpr ~ delete _;
         public bool mCanEdit;
@@ -53,6 +54,7 @@ namespace IDE.ui
         public bool mHasValue;
         public bool mIsNewExpression;
 		public bool mIsPending;
+		public bool mIsFakeChild;
 		public bool mUsedLock;
 		public bool? mAutoRefresh;
 		public int32 mDebuggerStateIdx;
@@ -271,6 +273,7 @@ namespace IDE.ui
 			mIconX = GS!(4);
 			mOpenButtonX = GS!(4);
 			mLabelX = GS!(44);
+			mLabelY = GS!(-1);
 			mChildIndent = GS!(16);
 			mHiliteOffset = GS!(-2);
 		}
@@ -3679,8 +3682,16 @@ namespace IDE.ui
 					pi.Dispose();
 			}
 
+			bool hasDeferredChildren = false;
             bool wasNewExpression = watch.mIsNewExpression;
             String val = scope String();
+			if (watch.mIsFakeChild)
+			{
+				watch.mHasValue = true; // Fake having a value so we don't retrigger
+				var parentItem = (WatchListViewItem)listViewItem.mParentItem;
+				((IWatchOwner)this).UpdateWatch(parentItem);
+				return;
+			}
 			if (watch.mIsPending)
 			{
 				IDEApp.sApp.mDebugger.EvaluateContinue(val);
@@ -3709,7 +3720,33 @@ namespace IDE.ui
 				if (watch.mIsNewExpression)
 					flags |= .AllowSideEffects | .AllowCalls;
 
-				gApp.DebugEvaluate(null, evalStr, val, -1, watch.mLanguage, flags);
+				if ((watch.mResultStr != null) && (!listViewItem.IsOpen))
+				{
+					if (watch.mEvalStr.StartsWith("!children "))
+						hasDeferredChildren = true;
+				}
+				else
+				{
+					gApp.DebugEvaluate(null, evalStr, val, -1, watch.mLanguage, flags);
+				}
+
+				if (watch.mResultStr != null)
+				{
+					int crCount = watch.mResultStr.Count('\n') + 1;
+					int crPos = -1;
+					for (int i < crCount)
+					{
+						crPos = (.)val.IndexOf('\n', crPos + 1);
+						if (crPos == -1)
+							break;
+					}
+					if (crPos == -1)
+						crPos = val.Length;
+
+					val.Remove(0, crPos);
+					val.Insert(0, watch.mResultStr);
+				}
+
                 watch.mIsNewExpression = false;                
             }
 			watch.mIsPending = false;
@@ -4035,6 +4072,7 @@ namespace IDE.ui
                     else
                         memberItem = (WatchListViewItem)listViewItem.GetChildAtIndex(memberCount);
                     var memberWatch = ((WatchListViewItem)memberItem).mWatchEntry;
+					memberWatch.mIsFakeChild = false;
 					memberWatch.mLanguage = watch.mLanguage;
 
                     memberItem.mBottomPadding = 0;
@@ -4055,10 +4093,40 @@ namespace IDE.ui
 						evalStr.Append("Format Error: {0}", scope String(memberVals[1]));
 					}
                     String.NewOrSet!(memberWatch.mEvalStr, evalStr);
+
+					if (memberVals.Count > 3)
+					{
+						// Note: this only occurs on GDB/LLDB debuggers
+						String.NewOrSet!(memberWatch.mResultStr, memberVals[2]);
+						memberWatch.mResultStr.Append("\n");
+						memberWatch.mResultStr.Append(memberVals[3]);
+
+						// Make this refresh
+						memberWatch.mHasValue = false; 
+						memberWatch.mIsNewExpression = true;
+					}
+
                     memberItem.Label = memberWatch.mName;
                     memberCount++;
                 }
             }
+
+			if (hasDeferredChildren)
+			{
+				// Make a fake item that will populate the children by re-evaluating after opening
+				WatchListViewItem memberItem;
+				if (!listViewItem.IsParent)
+				{
+					memberItem = (WatchListViewItem)AddWatch("", "", listViewItem);
+				}
+				else
+					memberItem = (WatchListViewItem)listViewItem.GetChildAtIndex(memberCount);
+				memberItem.mBottomPadding = 0;
+				var memberWatch = memberItem.mWatchEntry;
+				memberWatch.mIsFakeChild = true;
+
+				memberCount++;
+			}
 
 			if (watch.mWantsStackFrameId)
 			{
@@ -4077,7 +4145,15 @@ namespace IDE.ui
             }
 
             while (listViewItem.GetChildCount() > memberCount)
+			{
+				var memberItem = (WatchListViewItem)listViewItem.GetChildAtIndex(memberCount);
+				if (memberItem.mWatchEntry.mIsFakeChild)
+				{
+					// Leave it
+					break;
+				}
                 listViewItem.RemoveChildItem(listViewItem.GetChildAtIndex(memberCount));
+			}
 
             if ((listViewItem.GetChildCount() == 0) && (listViewItem.mOpenButton != null))
             {
@@ -4504,7 +4580,7 @@ namespace IDE.ui
 						});
 				}
 
-				if (!watchEntry.IsConstant)
+				if ((gApp.mDebugger.IsRunning) && (!watchEntry.IsConstant))
 				{
 					anItem = menu.AddItem("Break When Value Changes");
 					if (watchEntry.mMemoryBreakpointAddr == 0)
@@ -4571,8 +4647,9 @@ namespace IDE.ui
 				{
 					if (int.Parse(watchEntry.mPointer ?? watchEntry.mEditInitialize, .AllowHexSpecifier) case .Ok(let addr))
 					{
-						int threadId;
-						gApp.mDebugger.GetStackAllocInfo(addr, out threadId, null);
+						int threadId = 0;
+						if (gApp.mDebugger.IsRunning)
+							gApp.mDebugger.GetStackAllocInfo(addr, out threadId, null);
 						if (threadId != 0)
 						{
 							anItem = menu.AddItem("Find on Stack");
@@ -4717,7 +4794,7 @@ namespace IDE.ui
 			}
 		}
 
-		public void TryRenameItem()
+		public override void TryRenameItem()
 		{
 			if (mEditWidget != null)
 			{

@@ -41,6 +41,10 @@ namespace Beefy.widgets
         public int32 mUpdateCnt;
 		public double mUpdateCntF;
         public String mIdStr ~ delete _;
+        // Unique for the life of the process, so external tools (Beefy.mcp) can name a widget
+        // across calls and detect when it has gone away
+        static int32 sWidgetIdCounter;
+        public int32 mWidgetId = ++sWidgetIdCounter;
         public List<Widget> mChildWidgets;
         public MouseFlag mMouseFlags;
         public int32 mMouseCaptureCount;
@@ -171,6 +175,14 @@ namespace Beefy.widgets
             mHeight = 32;
         }
 
+        // Adds what this widget shows or holds -- a label, text, a checked state -- for tools that read
+        // the UI tree (see Beefy.mcp.UIToolSet). Type, id, position, size, visibility and focus are
+        // reported by the caller; overrides add only their own state, under keys that do not clash
+        // with those ("id", "type", "name", "x", "y", "w", "h", "hidden", "focus", "hover", "children").
+        public virtual void Describe(StructuredData data)
+        {
+        }
+
         public virtual void Serialize(StructuredData data)
         {            
             //data.Add("X", mX);
@@ -197,6 +209,8 @@ namespace Beefy.widgets
 			if (mWidgetWindow != null)
 			    widget.InitChildren();
 			widget.AddedToParent();
+			if (mWidgetWindow != null)
+				widget.AddedToWindow();
 		}
 
         public virtual void AddWidgetAtIndex(int idx, Widget widget)
@@ -211,8 +225,9 @@ namespace Beefy.widgets
             mChildWidgets.Insert(idx, widget);
             if (mWidgetWindow != null)
                 widget.InitChildren();
-
             widget.AddedToParent();
+			if (mWidgetWindow != null)
+				widget.AddedToWindow();
         }
 
 		public bool HasParent(Widget wantParent)
@@ -245,6 +260,11 @@ namespace Beefy.widgets
             AddWidgetAtIndex(pos, widget);
         }        
 
+		public virtual void AddedToWindow()
+		{
+
+		}
+
         public virtual void InitChildren()
         {
             if (mChildWidgets != null)
@@ -258,6 +278,7 @@ namespace Beefy.widgets
                     }
                 }
             }
+			AddedToWindow();
         }
 
         protected virtual void RemovedFromWindow()
@@ -372,7 +393,11 @@ namespace Beefy.widgets
 
         public virtual void SetVisible(bool visible)
         {
-            mVisible = visible;
+			if (visible != mVisible)
+			{
+	            mVisible = visible;
+				MarkDirty();
+			}
         }
 
         public virtual void AddedToParent()
@@ -571,7 +596,14 @@ namespace Beefy.widgets
                 mOnMouseMove(e);
             }
         }
-        
+
+        // Fired instead of MouseMove while the window is in relative mouse mode (see
+        // BFWindow.StartRelativeMouseMode) -- dx/dy are raw movement, not a position. Always delivered
+        // to the window's mFocusWidget, since relative mode has no cursor position to hit-test with.
+        public virtual void MouseDelta(float dx, float dy)
+        {
+        }
+
         public virtual Widget FindWidgetByCoords(float x, float y)
         {
             if (!mVisible || !mMouseVisible)

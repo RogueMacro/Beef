@@ -539,7 +539,12 @@ int BfIRConstHolder::GetSize(BfTypeCode typeCode, int ptrSize)
 	case BfTypeCode_Char32: return 4;
 	case BfTypeCode_Float: return 4;
 	case BfTypeCode_Double: return 8;
-	case BfTypeCode_Float2: return 8;
+	case BfTypeCode_Float2: return 4 * 2;
+	case BfTypeCode_Float4: return 4 * 4;
+	case BfTypeCode_Int32_4: return 4 * 4;
+	case BfTypeCode_Bool2: return 2;
+	case BfTypeCode_Bool4: return 4;
+	case BfTypeCode_V128: return 16;
 	case BfTypeCode_Object: return ptrSize;
 	case BfTypeCode_Interface: return ptrSize;
 	case BfTypeCode_Struct: return 0;
@@ -842,7 +847,8 @@ BfIRValue BfIRConstHolder::CreateConst(BfTypeCode typeCode, double val)
 {
 	BfConstant* constant = mTempAlloc.Alloc<BfConstant>();
 	constant->mTypeCode = typeCode;
-	constant->mDouble = val;
+	// Round each folded float op as runtime code does
+	constant->mDouble = (typeCode == BfTypeCode_Float) ? (double)(float)val : val;
 	auto irValue = BfIRValue(BfIRValueFlags_Const, mTempAlloc.GetChunkedId(constant));
 #ifdef CHECK_CONSTHOLDER
 	irValue.mHolder = this;
@@ -1322,14 +1328,14 @@ bool BfIRConstHolder::WriteConstant(BfIRValue val, void* ptr, BfType* type)
 		const char* strDataPrefix = "__bfStrData";
 		if (strncmp(constGV->mName, strDataPrefix, strlen(strDataPrefix)) == 0)
 		{
-			*(int32*)ptr = atoi(constGV->mName + strlen(strDataPrefix));
+			*(int32*)ptr = mModule->mContext->GetStringIdByStableId(atoi(constGV->mName + strlen(strDataPrefix)));
 			return true;
 		}
 
 		const char* strObjPrefix = "__bfStrObj";
 		if (strncmp(constGV->mName, strObjPrefix, strlen(strObjPrefix)) == 0)
 		{
-			*(int32*)ptr = atoi(constGV->mName + strlen(strObjPrefix));
+			*(int32*)ptr = mModule->mContext->GetStringIdByStableId(atoi(constGV->mName + strlen(strObjPrefix)));
 			return true;
 		}
 	}
@@ -1655,52 +1661,11 @@ uint32 BfIRBuilder::CheckedMul(uint32 a, uint32 b)
 
 uint64 BfIRBuilder::CheckedMul(uint64 a, uint64 b)
 {
-	uint32 aHigh;
-	uint32 aLow;
-	uint32 bHigh;
-	uint32 bLow;
-
-	// a*b can be decomposed to
-	//	(aHigh * bHigh * 2^64) + (aLow * bHigh * 2^32) + (aHigh * bLow * 2^32) + (aLow * bLow)
-
-	aHigh = (uint32)(a >> 32);
-	aLow  = (uint32)(a);
-	bHigh = (uint32)(b >> 32);
-	bLow  = (uint32)(b);
-
-	uint64 ret = 0;
-
-	if (aHigh == 0)
-	{
-		if (bHigh != 0)
-			ret = (uint64)aLow * (uint64)bHigh;
-	}
-	else if (bHigh == 0)
-	{
-		if (aHigh != 0)
-			ret = (uint64)aHigh * (uint64)bLow;
-	}
-	else
+	// The wrapped product, as the other checked ops return: a wrapping multiply (&*) folds to it
+	uint64 result = a * b;
+	if ((a != 0) && (result / a != b))
 		OpFailed();
-
-	if (ret != 0)
-	{
-		uint64 tmp;
-
-		if((uint32)(ret >> 32) != 0)
-			OpFailed();
-
-		ret <<= 32;
-		tmp = (uint64)aLow * (uint64)bLow;
-		ret += tmp;
-
-		if (ret < tmp)
-			OpFailed();
-
-		return ret;
-	}
-
-	return (uint64)aLow * (uint64)bLow;
+	return result;
 }
 
 int8 BfIRBuilder::CheckedMul(int8 a, int8 b)
@@ -2688,7 +2653,7 @@ void BfIRBuilder::NewCmdInserted()
 	// This is for debug only - for checking the stream after each command. Useful when debugging IR generation errors
 	BF_ASSERT(mStream.GetReadPos() < mStream.GetSize());
 	mIRCodeGen->HandleNextCmd();
-	BF_ASSERT(mStream.GetReadPos() == mStream.GetSize());
+	BF_ASSERT((mStream.GetReadPos() == mStream.GetSize()) || (mIRCodeGen->mFailed));
 }
 
 BfIRMDNode BfIRBuilder::CreateNamespaceScope(BfType* type, BfIRMDNode fileDIScope)
@@ -2805,10 +2770,14 @@ void BfIRBuilder::CreateTypeDeclaration(BfType* type, bool forceDbgDefine)
 	bool wantsDIPartialDef = false;
 	if (wantsDIForwardDecl)
 	{
-		if ((!mIsBeefBackend) && (type->IsValueType()))
-		{
-			wantsDIPartialDef = true;
-			wantsDIForwardDecl = false;
+		if (mModule->mCompiler->mOptions.mPlatformType == BfPlatformType_Windows)
+		{	
+			// Hack required for LLVM COFF? Don't remember exactly why.
+			if ((!mIsBeefBackend) && (type->IsValueType()))
+			{				
+				wantsDIPartialDef = true;
+				wantsDIForwardDecl = false;
+			}
 		}
 	}
 	if (mModule->mExtensionCount != 0)
@@ -3045,7 +3014,8 @@ void BfIRBuilder::CreateTypeDeclaration(BfType* type, bool forceDbgDefine)
 				case BfTypeCode_Char8:
 				case BfTypeCode_Char16:
 				case BfTypeCode_Char32:
-					dwarfType = llvm::dwarf::DW_ATE_unsigned_char;
+					// LLDB reads DW_ATE_unsigned_char as a 1-byte number and only knows wider characters as DW_ATE_UTF
+					dwarfType = (mModule->mCompiler->mOptions.mPlatformType == BfPlatformType_Windows) ? llvm::dwarf::DW_ATE_unsigned_char : llvm::dwarf::DW_ATE_UTF;
 					break;
 				case BfTypeCode_Float:
 				case BfTypeCode_Double:
@@ -3696,11 +3666,32 @@ void BfIRBuilder::CreateDbgTypeDefinition(BfType* type)
 // 			auto inheritanceType = DbgCreateInheritance(diForwardDecl, DbgGetType(underlyingType), 0, llvm::DINode::FlagPublic);
 // 			diFieldTypes.push_back(inheritanceType);
 
+			BfIRMDNode primDIType = DbgGetType(underlyingType);
+			// DWARF debuggers name an enum's value from an enumeration type; the Windows debugger reads the cases
+			// from the struct's constants instead
+			if ((typeInstance->IsEnum()) && (mModule->mCompiler->mOptions.mPlatformType != BfPlatformType_Windows))
+			{
+				SizedArray<BfIRMDNode, 32> diEnumValues;
+				for (auto& fieldInst : typeInstance->mFieldInstances)
+				{
+					if (!fieldInst.mFieldIncluded)
+						continue;
+					auto fieldDef = fieldInst.GetFieldDef();
+					if ((fieldInst.mConstIdx != -1) && (fieldDef->IsEnumCaseEntry()))
+					{
+						auto constant = typeInstance->mConstHolder->GetConstantById(fieldInst.mConstIdx);
+						diEnumValues.push_back(DbgCreateEnumerator(fieldDef->mName, constant->mInt64));
+					}
+				}
+				if (!diEnumValues.IsEmpty())
+					primDIType = DbgCreateEnumerationType(diForwardDecl, "$enum", fileDIScope, 0, underlyingType->mSize * 8, underlyingType->mAlign * 8, diEnumValues, DbgGetType(underlyingType));
+			}
+
 			int lineNum = 0;
 			int flags = llvm::DINode::FlagPublic;
 			auto memberType = DbgCreateMemberType(fileDIScope, "$prim", fileDIScope, lineNum,
 				underlyingType->mSize * 8, underlyingType->mAlign * 8, 0,
-				flags, DbgGetType(underlyingType));
+				flags, primDIType);
 			diFieldTypes.push_back(memberType);
 		}
 	}
@@ -3863,6 +3854,8 @@ void BfIRBuilder::CreateTypeDefinition_Data(BfModule* populateModule, BfTypeInst
 			bool useForUnion = false;
 
 			BF_ASSERT(!fieldInstance->mIsEnumPayloadCase);
+			if (resolvedFieldType->mDefineState < BfTypeDefineState_Defined)
+				mModule->PopulateType(resolvedFieldType, BfPopulateType_Data);
 
 			if ((!fieldDef->mIsStatic) && (!resolvedFieldType->IsValuelessType()))
 			{
@@ -4239,7 +4232,7 @@ BfIRType BfIRBuilder::MapType(BfType* type, BfIRPopulateType populateType)
 {
 	if (!mIgnoreWrites)
 	{
-		PopulateType(type, populateType);
+		PopulateType(type, mHasStarted ? populateType : BfIRPopulateType_Identity);
 	}
 	BF_ASSERT(type->mTypeId > 0);
 	BfIRType retType;
@@ -4461,6 +4454,9 @@ BfIRValue BfIRBuilder::CreateNumericCast(BfIRValue val, bool valIsSigned, BfType
 			// Int -> Float
 			if (IsInt(constVal->mTypeCode))
 			{
+				if (typeCode == BfTypeCode_Float)
+					return CreateConst(typeCode, IsSigned(constVal->mTypeCode) ? (float)constVal->mInt64 : (float)constVal->mUInt64);
+
 				double val = 0;
 				if (IsSigned(constVal->mTypeCode))
 					val = (double)constVal->mInt64;
@@ -4775,6 +4771,10 @@ BfIRValue BfIRBuilder::CreateNot(BfIRValue val)
 	if (val.IsConst())
 	{
 		auto constVal = GetConstantById(val.mId);
+		// An undef stays undef, as the other folds have it: its mTypeCode is the union tag
+		//  and its payload is the type, so folding it makes a constant that is neither
+		if (constVal->mConstType == BfConstType_Undef)
+			return val;
 		uint64 newVal = 0;
 		if (constVal->mTypeCode == BfTypeCode_Boolean)
 			newVal = constVal->mBool ? 0 : 1;

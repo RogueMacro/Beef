@@ -21,7 +21,10 @@ namespace Beefy.gfx
             public Vector3 mTrans;
         }
 
-        //[StructLayout(LayoutKind.Sequential)]
+        // CRepr, not for interop alone: without it Beef reorders mBoneWeights to offset 0 for its
+        // alignment, which moves every other field and silently breaks cInstanceIdxOffset and the
+        // GPU layout built from declaration order.
+        [CRepr]
         public struct VertexDef
         {
             [VertexMember(VertexElementUsage.Position3D)]
@@ -36,12 +39,26 @@ namespace Beefy.gfx
             public TexCoords mBumpTexCoords;
             [VertexMember(VertexElementUsage.Tangent)]
             public Vector3 mTangent;
+			// Per-draw record index + 1 stamped by Graphics.DrawIndexedVerticesInst (or fed per instance
+			// by DrawStaticMeshInstanced); 0 = the shader's per-draw constants. Byte offset = cInstanceIdxOffset.
+			[VertexMember(VertexElementUsage.TextureCoordinate, 2, true)]
+			public float mInstanceIdx;
+			// Four bone influences, zero on unskinned geometry. Weights are 16-bit because 8 bits
+			// quantise a two-bone blend to 1/255 of the delta, which shows on a silhouette.
+			// Order matters: the uint32 fills the gap the uint64's alignment would otherwise pad.
+			[VertexMember(VertexElementUsage.BlendIndices, 0, false, .Byte4)]
+			public uint32 mBoneIndices;
+			[VertexMember(VertexElementUsage.BlendWeight, 0, false, .NormalizedShort4)]
+			public uint64 mBoneWeights;
+
+			public const int32 cInstanceIdxOffset = 56;
 
             public static VertexDefinition sVertexDefinition ~ delete _;
 
 			public static void Init()
 			{
 				sVertexDefinition = new VertexDefinition(typeof(VertexDef));
+				Runtime.Assert(sVertexDefinition.mInstanceElementOffset == cInstanceIdxOffset, "VertexDef layout moved");
 			}
         }
     }
@@ -93,14 +110,16 @@ namespace Beefy.gfx
             }
         }        
 
-        public void* mNativeModelDef;        
+        public void* mNativeModelDef;
         public float mFrameRate;
         public int32 mJointCount;
+        // Applied at render time (combined with ModelInstance.mScale), not baked into the mesh data.
+        public Vector3 mScale = .One;
         public Animation[] mAnims ~ DeleteContainerAndItems!(_);
         public Dictionary<String, Animation> mAnimMap = new Dictionary<String, Animation>() ~ DeleteDictionaryAndKeys!(_);
 
         [CallingConvention(.Stdcall), CLink]
-        extern static void* Res_OpenFBX(char8* fileName, void* nativeVertexDef);
+        extern static void* Res_OpenFBX(char8* fileName, char8* baseDir, void* nativeVertexDef);
 
 		[CallingConvention(.Stdcall), CLink]
 		extern static void* Res_OpenGLTF(char8* fileName, char8* baseDir, void* nativeVertexDef);
@@ -123,11 +142,75 @@ namespace Beefy.gfx
 		[CallingConvention(.Stdcall), CLink]
 		extern static void ModelDef_GetBounds(void* nativeModel, out Vector3 min, out Vector3 max);
 
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelDef_GetPosedBounds(void* nativeModel, Matrix4* jointMatrices, int32 jointCount, out Vector3 min, out Vector3 max);
+
         [CallingConvention(.Stdcall), CLink]
         extern static float ModelDef_GetFrameRate(void* nativeModel);
 
         [CallingConvention(.Stdcall), CLink]
         extern static int32 ModelDef_GetJointCount(void* nativeModel);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static int32 ModelDef_GetJointParent(void* nativeModel, int32 jointIdx);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static char8* ModelDef_GetJointName(void* nativeModel, int32 jointIdx);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static int32 ModelDef_GetMeshCount(void* nativeModel);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static char8* ModelDef_GetMeshName(void* nativeModel, int32 meshIdx);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static int32 ModelDef_GetPrimitivesCount(void* nativeModel, int32 meshIdx);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static char8* ModelDef_GetTexPaths(void* nativeModel, int32 meshIdx, int32 primitivesIdx);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static char8* ModelDef_GetTexRoles(void* nativeModel, int32 meshIdx, int32 primitivesIdx);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static uint8* ModelDef_GetEmbeddedImage(void* nativeModel, int32 index, out int32 size);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static char8* ModelDef_GetMaterialName(void* nativeModel, int32 meshIdx, int32 primitivesIdx);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_GetSurfaceMaterial(void* nativeModel, int32 meshIdx, int32 primitivesIdx, float* values);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_IsMaterialTwoSided(void* nativeModel, int32 meshIdx, int32 primitivesIdx);
+
+		public bool IsMaterialTwoSided(int32 meshIdx, int32 primitivesIdx)
+		{
+			return ModelDef_IsMaterialTwoSided(mNativeModelDef, meshIdx, primitivesIdx) != 0;
+		}
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_GetMaterialAlpha(void* nativeModel, int32 meshIdx, int32 primitivesIdx, out float cutoff);
+
+		// Alpha-blended when true; a cutoff above 0 is an alpha test instead, never both.
+		public bool GetMaterialAlpha(int32 meshIdx, int32 primitivesIdx, out float cutoff)
+		{
+			return ModelDef_GetMaterialAlpha(mNativeModelDef, meshIdx, primitivesIdx, out cutoff) != 0;
+		}
+
+		public bool GetSurfaceMaterial(int32 meshIdx, int32 primitivesIdx, out Vector2 parameters, out Vector3 emissive)
+		{
+			float[5] values = default;
+			let found = ModelDef_GetSurfaceMaterial(mNativeModelDef, meshIdx, primitivesIdx, &values[0]);
+			parameters = .(values[0], values[1]); emissive = .(values[2], values[3], values[4]);
+			return found != 0;
+		}
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static void ModelDef_SetExternalTextures(void* nativeModel, int32 externalTextures);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static void ModelDef_SetTexture(void* nativeModel, int32 meshIdx, int32 primitivesIdx, int32 texIdx, void* nativeTextureSegment);
 
         [CallingConvention(.Stdcall), CLink]
         extern static int32 ModelDef_GetAnimCount(void* nativeModel);
@@ -162,19 +245,23 @@ namespace Beefy.gfx
             }
         }
 
-        public static ModelDef LoadModel(String fileName, String baseDir)
-        {
+		public static ModelDef LoadModel(String fileName, String baseDir)
+		{
+			// Geometry import is CPU-only, including command-line asset inspection.
+			void* nativeVertexDef = null;
+			if (VertexDef.sVertexDefinition != null)
+				nativeVertexDef = VertexDef.sVertexDefinition.mNativeVertexDefinition;
 			void* nativeModelDef = null;
-			if (fileName.EndsWith(".gltf", .OrdinalIgnoreCase))
-				nativeModelDef = Res_OpenGLTF(fileName, baseDir, VertexDef.sVertexDefinition.mNativeVertexDefinition);
+			if ((fileName.EndsWith(".gltf", .OrdinalIgnoreCase)) || (fileName.EndsWith(".glb", .OrdinalIgnoreCase)))
+				nativeModelDef = Res_OpenGLTF(fileName, baseDir, nativeVertexDef);
 			else if (fileName.EndsWith(".fbx", .OrdinalIgnoreCase))
-            	nativeModelDef = Res_OpenFBX(fileName, VertexDef.sVertexDefinition.mNativeVertexDefinition);
+				nativeModelDef = Res_OpenFBX(fileName, baseDir, nativeVertexDef);
 			else
-				nativeModelDef = Res_OpenModel(fileName, baseDir, VertexDef.sVertexDefinition.mNativeVertexDefinition);
-            if (nativeModelDef == null)
-                return null;
-            return new ModelDef(nativeModelDef);            
-        }
+				nativeModelDef = Res_OpenModel(fileName, baseDir, nativeVertexDef);
+			if (nativeModelDef == null)
+				return null;
+			return new ModelDef(nativeModelDef);
+		}
 
         public ModelInstance CreateInstance(ModelCreateFlags flags = .None)
         {
@@ -185,9 +272,11 @@ namespace Beefy.gfx
             return modelInstance;
         }
 
-        public Animation GetAnimation(String name)
+        public Animation GetAnimation(StringView name)
         {
-            return mAnimMap[name];
+			if (mAnimMap.GetValueAlt(name) case .Ok(let val))
+				return val;
+            return null;
         }
 
 		public void GetInfo(String str)
@@ -200,6 +289,186 @@ namespace Beefy.gfx
 			ModelDef_GetBounds(mNativeModelDef, out min, out max);
 		}
 
+		// Exact AABB of the verts skinned through the given palette (the SetJointMatrices
+		// matrices); the raw-vert GetBounds is meaningless for skinned models.
+		public void GetPosedBounds(Span<Matrix4> jointMatrices, out Vector3 min, out Vector3 max)
+		{
+			ModelDef_GetPosedBounds(mNativeModelDef, jointMatrices.Ptr, (.)jointMatrices.Length, out min, out max);
+		}
+
+		public int32 GetJointParent(int32 jointIdx)
+		{
+			return ModelDef_GetJointParent(mNativeModelDef, jointIdx);
+		}
+
+		public void GetJointName(int32 jointIdx, String outName)
+		{
+			outName.Append(ModelDef_GetJointName(mNativeModelDef, jointIdx));
+		}
+
+		public int32 GetMeshCount()
+		{
+			return ModelDef_GetMeshCount(mNativeModelDef);
+		}
+
+		public void GetMeshName(int32 meshIdx, String outName)
+		{
+			outName.Append(ModelDef_GetMeshName(mNativeModelDef, meshIdx));
+		}
+
+		// Duplicate names are ambiguous, just like missing names.
+		public int32 FindMeshIndex(StringView name)
+		{
+			int32 found = -1;
+			String candidate = scope .();
+			for (int32 i < GetMeshCount())
+			{
+				candidate.Clear();
+				GetMeshName(i, candidate);
+				if (candidate != name)
+					continue;
+				if (found >= 0)
+					return -1;
+				found = i;
+			}
+			return found;
+		}
+
+		public int32 GetPrimitivesCount(int32 meshIdx)
+		{
+			return ModelDef_GetPrimitivesCount(mNativeModelDef, meshIdx);
+		}
+
+		// The effective texture list a render instance would use, '\n'-separated (may be empty).
+		public void GetTexPaths(int32 meshIdx, int32 primitivesIdx, String outPaths)
+		{
+			outPaths.Append(ModelDef_GetTexPaths(mNativeModelDef, meshIdx, primitivesIdx));
+		}
+
+		// The material's own name for each of GetTexPaths' textures, same order, '\n'-separated
+		// (an entry is empty when the source file named none).
+		public void GetTexRoles(int32 meshIdx, int32 primitivesIdx, String outRoles)
+		{
+			outRoles.Append(ModelDef_GetTexRoles(mNativeModelDef, meshIdx, primitivesIdx));
+		}
+
+		// The still-encoded bytes a "*N" texture path names: an image stored inside the model file.
+		// Empty for an index the file doesn't have; valid while this def lives.
+		public Span<uint8> GetEmbeddedImage(int32 index)
+		{
+			let data = ModelDef_GetEmbeddedImage(mNativeModelDef, index, var size);
+			return .(data, size);
+		}
+
+		// The source file's material name for the primitive (may be empty).
+		public void GetMaterialName(int32 meshIdx, int32 primitivesIdx, String outName)
+		{
+			outName.Append(ModelDef_GetMaterialName(mNativeModelDef, meshIdx, primitivesIdx));
+		}
+
+		// With external textures on, instances use only textures injected via SetTexture -- the
+		// caller owns keeping those images alive while instances can still be created.
+		public void SetExternalTextures(bool externalTextures)
+		{
+			ModelDef_SetExternalTextures(mNativeModelDef, externalTextures ? 1 : 0);
+		}
+
+		public void SetTexture(int32 meshIdx, int32 primitivesIdx, int32 texIdx, Image image)
+		{
+			ModelDef_SetTexture(mNativeModelDef, meshIdx, primitivesIdx, texIdx, image?.mNativeTextureSegment);
+		}
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelDef_GetJointBindPose(void* nativeModel, int32 jointIdx, out JointTranslation outJointTranslation);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelDef_GetJointPoseInv(void* nativeModel, int32 jointIdx, out Matrix4 outMatrix);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelDef_GetArmatureToWorld(void* nativeModel, out Matrix4 outMatrix);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_GetSkinBounds(void* nativeModel, float* outRadii, out Vector3 outUnweightedMin, out Vector3 outUnweightedMax);
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_GetJointAxisFit(void* nativeModel, Matrix4* jointMatrices, int32 jointCount, int32 jointIdx, float ox, float oy, float oz, float ax, float ay, float az, float length, float minWeight, out float outMaxPerp, out float outPerpP90, out float outMinProj, out float outMaxProj);
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelDef_AccumRadialProfiles(void* nativeModel, Matrix4* jointMatrices, int32 jointCount, float* axes, int32* jointOwner, float minWeight, int32 sliceCount, int32 sectorCount, float* sumSq, int32* counts, float* minT, float* maxT);
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelDef_SetVertexAlphaByJoint(void* nativeModel, uint8* jointFlags, int32 jointCount);
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_MeasureFit(void* nativeModel, Matrix4* jointMatrices, int32 jointCount, float sx, float sy, float sz, float* shapes, int32 shapeCount, float range, uint8* jointFlags, float* outFractions, out float outMeanAbs);
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_GetVertexCount(void* nativeModel);
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelDef_AccumFitExtremes(void* nativeModel, Matrix4* jointMatrices, int32 jointCount, float sx, float sy, float sz, float* shapes, int32 shapeCount, float* outMax, float* outMin);
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_SetVertexAlphaFromFit(void* nativeModel, float* distances, float range, uint8* jointFlags, int32 jointCount, int32* outCounts, out float outMeanAbs);
+
+		public void GetJointBindPose(int32 jointIdx, out JointTranslation jointTranslation)
+		{
+			ModelDef_GetJointBindPose(mNativeModelDef, jointIdx, out jointTranslation);
+		}
+
+		public void GetJointPoseInv(int32 jointIdx, out Matrix4 matrix)
+		{
+			ModelDef_GetJointPoseInv(mNativeModelDef, jointIdx, out matrix);
+		}
+
+		public void GetArmatureToWorld(out Matrix4 matrix)
+		{
+			ModelDef_GetArmatureToWorld(mNativeModelDef, out matrix);
+		}
+
+		// Per-joint max vertex distance in joint space (conservative culling radii) plus the
+		// model-space bounds of unweighted vertices; returns true when any unweighted exist.
+		// outRadii must hold mJointCount floats.
+		public bool GetSkinBounds(Span<float> outRadii, out Vector3 unweightedMin, out Vector3 unweightedMax)
+		{
+			return ModelDef_GetSkinBounds(mNativeModelDef, outRadii.Ptr, out unweightedMin, out unweightedMax) != 0;
+		}
+
+		// Skin extent around an axis through a joint, measured in the space the palette skins into
+		// (see ModelDef_GetJointAxisFit).
+		public int32 GetJointAxisFit(Span<Matrix4> palette, int32 jointIdx, Vector3 origin, Vector3 axis, float length, float minWeight, out float maxPerp, out float perpP90, out float minProj, out float maxProj)
+		{
+			return ModelDef_GetJointAxisFit(mNativeModelDef, palette.Ptr, (.)palette.Length, jointIdx, origin.mX, origin.mY, origin.mZ, axis.mX, axis.mY, axis.mZ, length, minWeight, out maxPerp, out perpP90, out minProj, out maxProj);
+		}
+
+		// Adds this pose's skinned vertices to per-joint radial profiles (see
+		// ModelDef_AccumRadialProfiles for the layouts).
+		public void AccumRadialProfiles(Span<Matrix4> palette, Span<float> axes, Span<int32> jointOwner, float minWeight, int32 sliceCount, int32 sectorCount, Span<float> sumSq, Span<int32> counts, Span<float> minT, Span<float> maxT)
+		{
+			ModelDef_AccumRadialProfiles(mNativeModelDef, palette.Ptr, (.)palette.Length, axes.Ptr, jointOwner.Ptr, minWeight, sliceCount, sectorCount, sumSq.Ptr, counts.Ptr, minT.Ptr, maxT.Ptr);
+		}
+
+		// Vertex color alpha from each vertex's heaviest joint's flag (see ModelDef_SetVertexAlphaByJoint).
+		public void SetVertexAlphaByJoint(Span<uint8> jointFlags)
+		{
+			ModelDef_SetVertexAlphaByJoint(mNativeModelDef, jointFlags.Ptr, (.)jointFlags.Length);
+		}
+
+		// Signed-distance fit of the skinned surface against a shape list (see ModelDef_MeasureFit);
+		// outFractions holds three entries.
+		public int32 MeasureFit(Span<Matrix4> palette, Vector3 scale, Span<float> shapes, int32 shapeCount, float range, Span<uint8> jointFlags, Span<float> outFractions, out float meanAbs)
+		{
+			return ModelDef_MeasureFit(mNativeModelDef, palette.Ptr, (.)palette.Length, scale.mX, scale.mY, scale.mZ, shapes.Ptr, shapeCount, range, jointFlags.Ptr, outFractions.Ptr, out meanAbs);
+		}
+
+		public int32 GetVertexCount() => ModelDef_GetVertexCount(mNativeModelDef);
+
+		// Per-vertex signed-distance extremes across poses (see ModelDef_AccumFitExtremes).
+		public void AccumFitExtremes(Span<Matrix4> palette, Vector3 scale, Span<float> shapes, int32 shapeCount, Span<float> outMax, Span<float> outMin)
+		{
+			ModelDef_AccumFitExtremes(mNativeModelDef, palette.Ptr, (.)palette.Length, scale.mX, scale.mY, scale.mZ, shapes.Ptr, shapeCount, outMax.Ptr, outMin.Ptr);
+		}
+
+		// Bakes a per-vertex signed distance into the vertex alpha (see ModelDef_SetVertexAlphaFromFit);
+		// outCounts holds three entries.
+		public int32 SetVertexAlphaFromFit(Span<float> distances, float range, Span<uint8> jointFlags, Span<int32> outCounts, out float meanAbs)
+		{
+			return ModelDef_SetVertexAlphaFromFit(mNativeModelDef, distances.Ptr, range, jointFlags.Ptr, (.)jointFlags.Length, outCounts.Ptr, out meanAbs);
+		}
+
 		public void Compact()
 		{
 			ModelDef_Compact(mNativeModelDef);
@@ -208,6 +477,11 @@ namespace Beefy.gfx
 		public void SetBaseDir(StringView baseDir)
 		{
 			ModelDef_SetBaseDir(mNativeModelDef, baseDir.ToScopeCStr!());
+		}
+
+		public void Scale(Vector3 scale)
+		{
+			mScale = scale;
 		}
 
 		public void SetTextures(int meshIdx, int primitivesIdx, Span<char8*> paths)
@@ -224,93 +498,132 @@ namespace Beefy.gfx
 		public bool RayIntersect(Matrix4 worldMtx, Vector3 origin, Vector3 vec, out Vector3 outIntersect, out float outDistance)
 		{
 			return ModelDef_RayIntersect(mNativeModelDef, worldMtx, origin, vec, out outIntersect, out outDistance);
-		}	
+		}
     }
 
-    public class ModelInstance : RenderCmd
+    public class ModelInstance : Renderable
     {
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelInstance_QueuePrimitive(void* nativeModelInstance, int32 meshIdx, int32 primIdx);
+
+		public void DrawPrimitive(Graphics g, Matrix4 worldMatrix, int32 meshIdx, int32 primIdx, bool applyScale = true)
+		{
+			let scale = Vector3.Multiply(mModelDef.mScale, mScale);
+			let matrix = applyScale ? Matrix4.Multiply(Matrix4.CreateScale(scale), worldMatrix) : worldMatrix;
+			g.SetVertexShaderConstantData(0, matrix);
+			ModelInstance_QueuePrimitive(mNativeRenderable, meshIdx, primIdx);
+		}
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelInstance_SetUseSurfaceMaterials(void* nativeModelInstance, int32 enabled);
+		public void SetUseSurfaceMaterials(bool enabled) => ModelInstance_SetUseSurfaceMaterials(mNativeRenderable, enabled ? 1 : 0);
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelInstance_SetSurfaceOverride(void* nativeModelInstance, int32 meshIdx, int32 primIdx, float* values, uint32 color);
+		public void ClearSurfaceOverrides() => ModelInstance_SetSurfaceOverride(mNativeRenderable, -1, -1, null, 0);
+		public void SetSurfaceOverride(int32 meshIdx, int32 primIdx, float roughness, float metallic, Vector3 emissive, uint32 color)
+		{
+			float[5] values = .(roughness, metallic, emissive.mX, emissive.mY, emissive.mZ);
+			ModelInstance_SetSurfaceOverride(mNativeRenderable, meshIdx, primIdx, &values[0], color);
+		}
         [CallingConvention(.Stdcall), CLink]
-        extern static void ModelInstance_SetJointTranslation(void* nativeModelInstance, int32 jointIdx, ref ModelDef.JointTranslation jointTranslation);
+        extern static void ModelInstance_SetJointMatrices(void* nativeModelInstance, Matrix4* matrices, int32 count);
+
+        [CallingConvention(.Stdcall), CLink]
+        extern static void ModelInstance_InvalidateVertices(void* nativeModelInstance);
+
+        // The def's vertex data changed underneath this instance; the GPU copy has to be rewritten.
+        public void InvalidateVertices() => ModelInstance_InvalidateVertices(mNativeRenderable);
 
         [CallingConvention(.Stdcall), CLink]
         extern static void ModelInstance_SetMeshVisibility(void* nativeModelInstance, int32 jointIdx, int32 visibility);
 
+        [CallingConvention(.Stdcall), CLink]
+        extern static void ModelInstance_SetTexture(void* nativeModelInstance, int32 meshIdx, int32 primIdx, int32 texIdx, void* nativeTextureSegment);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static void ModelInstance_Delete(void* nativeModelInstance);
+
+		[CallingConvention(.Stdcall), CLink]
+		extern static int32 ModelDef_GetCollisionTriangles(void* nativeModel, void* nativeModelInstance, Vector3** outPositions);
+
         public ModelDef mModelDef;
-        public ModelDef.Animation mAnim;
-        public float mFrame;
-        public float mAnimSpeed = 1.0f;
-        public bool mLoop;
+        public Vector3 mScale = .One;
 
         public this(void* nativeModelInstance, ModelDef modelDef)
         {
-            mNativeRenderCmd = nativeModelInstance;
+            mNativeRenderable = nativeModelInstance;
             mModelDef = modelDef;
         }
 
-        public void RehupAnimState()
+        // The native side is freed at the frame's end, once no queued command can still reference it.
+        public ~this()
         {
-            for (int32 jointIdx = 0; jointIdx < mModelDef.mJointCount; jointIdx++)
+            if (mNativeRenderable != null)
+                ModelInstance_Delete(mNativeRenderable);
+        }
+
+        // Combines this instance's scale with its ModelDef's scale into worldMatrix, since neither
+        // is baked into the mesh data (see ModelDef.mScale).
+        // paletteBase = this draw's first row in the scene's skinning palette (-1 = unskinned); the
+        // vertex stage's b4 carries it for a draw that has no instance record.
+        public void Draw(Graphics g, Matrix4 worldMatrix, int32 paletteBase = -1, bool tangentIsEmissive = false)
+        {
+            Vector3 combinedScale = Vector3.Multiply(mModelDef.mScale, mScale);
+            Matrix4 scaledMatrix = Matrix4.Multiply(Matrix4.CreateScale(combinedScale), worldMatrix);
+            g.SetVertexShaderConstantData(0, scaledMatrix);
+            SetSkinInfo(g, paletteBase, tangentIsEmissive);
+            g.Draw(this);
+        }
+
+        // A palette as the shader reads it: three float4 rows per joint, rows 0..2 of each matrix
+        // exactly as stored. Every writer of a palette buffer goes through this.
+        public static void PackPaletteRows(Span<Matrix4> palette, Vector4* outRows)
+        {
+            for (int j < palette.Length)
             {
-                ModelDef.JointTranslation jointTranslation;
-                mAnim.GetJointTranslation(jointIdx, mFrame, out jointTranslation);
-                SetJointTranslation(jointIdx, ref jointTranslation);
+                var m = palette[j];
+                outRows[j * 3 + 0] = .(m.m00, m.m01, m.m02, m.m03);
+                outRows[j * 3 + 1] = .(m.m10, m.m11, m.m12, m.m13);
+                outRows[j * 3 + 2] = .(m.m20, m.m21, m.m22, m.m23);
             }
         }
 
-        public void Update()
+        // The `Skin` cbuffer in include/Skinning.fxh.
+        public static void SetSkinInfo(Graphics g, int32 paletteBase, bool tangentIsEmissive)
         {
-            if (mAnim == null)
-                return;
-
-            mFrame += mModelDef.mFrameRate * BFApp.sApp.UpdateDelta * mAnimSpeed;
-
-            /*if ((mFrame >= 35.0f) || (mFrame < 1.0f))
-                mFrame = 34.0f;*/
-
-            if (mAnim.mFrameCount > 1)
-            {
-                float endFrameNum = mAnim.mFrameCount - 1.0f;
-                while (mFrame >= endFrameNum)
-                {
-                    if (mLoop)
-                        mFrame -= endFrameNum;
-                    else
-                        mFrame = endFrameNum - 0.00001f;
-                }
-                while (mFrame < 0)
-                    mFrame += endFrameNum;
-            }
-
-            RehupAnimState();
+            Vector4 skinInfo = .(paletteBase, tangentIsEmissive ? 1 : 0, 0, 0);
+            g.SetVertexShaderConstantData(4, &skinInfo, sizeof(Vector4));
         }
 
-        public void Play(ModelDef.Animation anim, bool loop = false)
+        // The final skinning palette (model-space joint pose * inverse bind), one matrix per
+        // joint. All sampling/blending/composition happens in the caller -- this instance only
+        // renders whatever palette it was last handed (bind pose until then).
+        public void SetJointMatrices(Span<Matrix4> matrices)
         {
-            mLoop = loop;
-            mAnim = anim;
-            mFrame = 0;
-            RehupAnimState();            
-        }
-
-        public void Play(String name, bool loop = false)
-        {            
-            Play(mModelDef.GetAnimation(name), loop);
-        }
-
-        public void Play(bool loop = false)
-        {
-            Play(mModelDef.mAnims[0], loop);
-        }
-
-        public void SetJointTranslation(int32 jointIdx, ref ModelDef.JointTranslation jointTranslation)
-        {
-            ModelInstance_SetJointTranslation(mNativeRenderCmd, jointIdx, ref jointTranslation);
+            ModelInstance_SetJointMatrices(mNativeRenderable, matrices.Ptr, (int32)matrices.Length);
         }
 
         public void SetMeshVisibility(int32 meshIdx, bool visible)
         {
-            ModelInstance_SetMeshVisibility(mNativeRenderCmd, meshIdx, visible ? 1 : 0);
+            ModelInstance_SetMeshVisibility(mNativeRenderable, meshIdx, visible ? 1 : 0);
         }
+
+		// One primitive's texture slot for THIS instance, in place of whatever the shared def has
+		// injected there (null clears the override). The caller keeps the image alive.
+		public void SetTexture(int32 meshIdx, int32 primIdx, int32 texIdx, Image image)
+		{
+			ModelInstance_SetTexture(mNativeRenderable, meshIdx, primIdx, texIdx, image?.mNativeTextureSegment);
+		}
+
+		// Triangle-expanded collision positions in local space (see ModelDef_GetCollisionTriangles's
+		// native comment) -- skinned meshes are baked using this instance's CURRENT joint pose. Valid
+		// until the next call to this on any ModelInstance (shared native scratch buffer).
+		public int32 GetCollisionPositions(out Vector3* outPositions)
+		{
+			Vector3* positions = null;
+			int32 count = ModelDef_GetCollisionTriangles(mModelDef.mNativeModelDef, mNativeRenderable, &positions);
+			outPositions = positions;
+			return count;
+		}
     }
 #else
     extension ModelDef
@@ -411,12 +724,15 @@ namespace Beefy.gfx
             mStudioModelInstance.Proxy.RehupAnimState(mAnim.mAnimIdx, mFrame);            
         }
 
-        public void Update()
+        // updatePct is this call's share of one fixed 60Hz tick (see Widget.UpdateF) -- scaling
+        // UpdateDelta (which is only ever recomputed once per real Update) by it is what keeps
+        // playback speed correct in real time when this is called more than once per tick.
+        public void UpdateF(float updatePct)
         {
             if (mAnim == null)
                 return;
 
-            mFrame += mModelDef.mFrameRate * BFApp.sApp.UpdateDelta * mAnimSpeed;
+            mFrame += mModelDef.mFrameRate * BFApp.sApp.UpdateDelta * updatePct * mAnimSpeed;
 
             /*if ((mFrame >= 35.0f) || (mFrame < 1.0f))
                 mFrame = 34.0f;*/

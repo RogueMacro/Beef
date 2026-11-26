@@ -390,6 +390,22 @@ BeType* BeIRCodeGen::GetBeType(BfTypeCode typeCode, bool& isSigned)
 		isSigned = true;
 		beTypeCode = BeTypeCode_Double;
 		break;
+	// Lowered vector types - element types must match how the vector struct types themselves get mapped
+	case BfTypeCode_Float2:
+		isSigned = true;
+		return mBeContext->CreateVectorType(mBeContext->GetPrimitiveType(BeTypeCode_Float), 2);
+	case BfTypeCode_Float4:
+		isSigned = true;
+		return mBeContext->CreateVectorType(mBeContext->GetPrimitiveType(BeTypeCode_Float), 4);
+	case BfTypeCode_Int32_4:
+		isSigned = true;
+		return mBeContext->CreateVectorType(mBeContext->GetPrimitiveType(BeTypeCode_Int32), 4);
+	case BfTypeCode_Bool2:
+		return mBeContext->CreateVectorType(mBeContext->GetPrimitiveType(BeTypeCode_Boolean), 2);
+	case BfTypeCode_Bool4:
+		return mBeContext->CreateVectorType(mBeContext->GetPrimitiveType(BeTypeCode_Boolean), 4);
+	case BfTypeCode_V128:
+		return mBeContext->CreateVectorType(mBeContext->GetPrimitiveType(BeTypeCode_Int8), 16);
 	}
 
 	return mBeContext->GetPrimitiveType(beTypeCode);
@@ -1132,6 +1148,228 @@ void BeIRCodeGen::Read(BeMDNode*& llvmMD)
 		llvmMD->mRefCount++;
 }
 
+// Expand operations without a native packed lowering into ordinary scalar IR.
+// This also gives the compile-time interpreter the same lane semantics as LLVM.
+BeValue* BeIRCodeGen::TryLowerVectorIntrinsic(BeIntrinsic* intrinsic, const SizedArrayImpl<BeValue*>& args)
+{
+	auto getVectorType = [](BeType* type) -> BeVectorType*
+		{
+			if (type->IsPointer())
+				type = ((BePointerType*)type)->mElementType;
+			return type->IsExplicitVectorType() ? (BeVectorType*)type : NULL;
+		};
+	if (args.IsEmpty())
+		return NULL;
+	auto vectorType = getVectorType(args[0]->GetType());
+	if ((vectorType == NULL) && (args.size() > 1))
+		vectorType = getVectorType(args[1]->GetType());
+	if (vectorType == NULL)
+		return NULL;
+
+	auto kind = intrinsic->mKind;
+	BeBinaryOpKind binaryOp = BeBinaryOpKind_None;
+	BeCmpKind cmp = BeCmpKind_None;
+	bool isFloat = vectorType->mElementType->IsFloat();
+	switch (kind)
+	{
+	case BfIRIntrinsic_Add: binaryOp = BeBinaryOpKind_Add; break;
+	case BfIRIntrinsic_Sub: binaryOp = BeBinaryOpKind_Subtract; break;
+	case BfIRIntrinsic_Mul: binaryOp = BeBinaryOpKind_Multiply; break;
+	case BfIRIntrinsic_Div: binaryOp = BeBinaryOpKind_SDivide; break;
+	case BfIRIntrinsic_Mod: binaryOp = BeBinaryOpKind_SModulus; break;
+	case BfIRIntrinsic_And: binaryOp = BeBinaryOpKind_BitwiseAnd; break;
+	case BfIRIntrinsic_Or: binaryOp = BeBinaryOpKind_BitwiseOr; break;
+	case BfIRIntrinsic_Xor: binaryOp = BeBinaryOpKind_ExclusiveOr; break;
+	case BfIRIntrinsic_Eq: cmp = BeCmpKind_EQ; break;
+	case BfIRIntrinsic_Neq: cmp = BeCmpKind_NE; break;
+	case BfIRIntrinsic_Lt: cmp = BeCmpKind_SLT; break;
+	case BfIRIntrinsic_LtE: cmp = BeCmpKind_SLE; break;
+	case BfIRIntrinsic_Gt: cmp = BeCmpKind_SGT; break;
+	case BfIRIntrinsic_GtE: cmp = BeCmpKind_SGE; break;
+	case BfIRIntrinsic_Shuffle:
+	case BfIRIntrinsic_Vector:
+		break;
+	default:
+		return NULL;
+	}
+
+	// Do not enable bool2 comparisons on Og+ until two-byte XMM memory
+	// moves are supported. Keep the existing unsupported-intrinsic diagnostic.
+	if ((mBeModule->mCeMachine == NULL) && (cmp != BeCmpKind_None) &&
+		(intrinsic->mReturnType->mSize < 4))
+		return NULL;
+
+	// Keep the existing native packed arithmetic path for full-width operands.
+	// Scalar operands need broadcasting, and float2 must not read/write 16 bytes.
+	if ((mBeModule->mCeMachine == NULL) && (vectorType->mSize == 16) &&
+		(args.size() == 2) && (getVectorType(args[0]->GetType()) != NULL) &&
+		(getVectorType(args[1]->GetType()) != NULL) &&
+		((kind == BfIRIntrinsic_Add) || (kind == BfIRIntrinsic_Sub) ||
+			((isFloat) && ((kind == BfIRIntrinsic_Mul) || (kind == BfIRIntrinsic_Div)))))
+		return NULL;
+
+	int length = vectorType->mLength;
+	bool shuffleSetter = (kind == BfIRIntrinsic_Shuffle) && (intrinsic->mName != "shuffle") && (args.size() == 2);
+	SizedArray<int, 8> shuffleMask;
+	if (kind == BfIRIntrinsic_Shuffle)
+	{
+		if (intrinsic->mName == "shuffle")
+		{
+			int sourceCount = (int)args.size() - length;
+			if ((sourceCount != 1) && (sourceCount != 2))
+			{
+				Fail("Invalid shuffle argument count");
+				return mBeModule->CreateUndefValue(intrinsic->mReturnType);
+			}
+			for (int i = sourceCount; i < args.size(); i++)
+			{
+				auto index = BeValueDynCast<BeConstant>(args[i]);
+				if ((index == NULL) || (index->mInt64 < 0) || (index->mInt64 >= length * sourceCount))
+				{
+					Fail("Shuffle indices must be constant and within the input vectors");
+					return mBeModule->CreateUndefValue(intrinsic->mReturnType);
+				}
+				shuffleMask.Add((int)index->mInt64);
+			}
+		}
+		else
+		{
+			for (int i = 7; i < intrinsic->mName.length(); i++)
+				shuffleMask.Add(intrinsic->mName[i] - '0');
+			if (shuffleMask.size() != length)
+			{
+				Fail("Invalid shuffle mask length");
+				return mBeModule->CreateNop();
+			}
+			for (int i = 0; i < length; i++)
+			{
+				if ((shuffleMask[i] < 0) || (shuffleMask[i] >= length))
+				{
+					Fail("Invalid shuffle index");
+					return mBeModule->CreateNop();
+				}
+				for (int j = 0; j < i; j++)
+					if ((shuffleSetter) && (shuffleMask[i] == shuffleMask[j]))
+					{
+						Fail("Shuffle setter requires a permutation");
+						return mBeModule->CreateNop();
+					}
+			}
+		}
+	}
+
+	SizedArray<BeValue*, 8> operands;
+	for (auto arg : args)
+	{
+		if ((getVectorType(arg->GetType()) != NULL) && (!arg->GetType()->IsPointer()))
+		{
+			auto slot = mBeModule->CreateAlloca(arg->GetType());
+			mBeModule->CreateStore(arg, slot, false);
+			operands.Add(slot);
+		}
+		else
+			operands.Add(arg);
+	}
+	auto intType = mBeContext->GetPrimitiveType(BeTypeCode_Int32);
+	auto zero = mBeModule->GetConstant(intType, (int64)0);
+	auto lanePtr = [&](BeValue* ptr, int i) -> BeValue*
+		{
+			return mBeModule->CreateGEP(ptr, zero, mBeModule->GetConstant(intType, (int64)i));
+		};
+	auto lane = [&](int argIdx, int i) -> BeValue*
+		{
+			auto value = operands[argIdx];
+			if (getVectorType(value->GetType()) != NULL)
+				return mBeModule->CreateLoad(lanePtr(value, i), false);
+			return value;
+		};
+	auto resultType = shuffleSetter ? vectorType : getVectorType(intrinsic->mReturnType);
+	if (resultType == NULL)
+		return NULL;
+	auto result = mBeModule->CreateAlloca(resultType);
+	for (int i = 0; i < length; i++)
+	{
+		BeValue* value = NULL;
+		int destLane = i;
+		if (kind == BfIRIntrinsic_Shuffle)
+		{
+			if (shuffleSetter)
+			{
+				value = lane(1, i);
+				destLane = shuffleMask[i];
+			}
+			else
+				value = lane(shuffleMask[i] / length, shuffleMask[i] % length);
+		}
+		else if ((kind == BfIRIntrinsic_Vector) && (intrinsic->mName == "vector_select"))
+		{
+			// Bit selection preserves NaNs and signed zero without FP arithmetic.
+			auto mask = mBeModule->CreateNumericCast(lane(0, i), intType, false, true);
+			auto bits = mBeModule->CreateBinaryOp(BeBinaryOpKind_Subtract, zero, mask);
+			auto inverse = mBeModule->CreateBinaryOp(BeBinaryOpKind_ExclusiveOr, bits,
+				mBeModule->GetConstant(intType, (int64)-1));
+			auto intPtrType = mBeContext->GetPointerTo(intType);
+			auto lhs = mBeModule->CreateLoad(mBeModule->CreateBitCast(lanePtr(operands[1], i), intPtrType), false);
+			auto rhs = mBeModule->CreateLoad(mBeModule->CreateBitCast(lanePtr(operands[2], i), intPtrType), false);
+			auto selected = mBeModule->CreateBinaryOp(BeBinaryOpKind_BitwiseOr,
+				mBeModule->CreateBinaryOp(BeBinaryOpKind_BitwiseAnd, lhs, bits),
+				mBeModule->CreateBinaryOp(BeBinaryOpKind_BitwiseAnd, rhs, inverse));
+			mBeModule->CreateStore(selected, mBeModule->CreateBitCast(lanePtr(result, i), intPtrType), false);
+			continue;
+		}
+		else if (kind == BfIRIntrinsic_Vector)
+		{
+			auto scalar = mBeModule->mOwnedValues.Alloc<BeIntrinsic>();
+			scalar->mReturnType = vectorType->mElementType;
+			if (intrinsic->mName == "vector_abs")
+				scalar->mKind = BfIRIntrinsic_Abs;
+			else if ((intrinsic->mName == "vector_sqrt") || (intrinsic->mName == "vector_rsqrt_estimate"))
+				scalar->mKind = BfIRIntrinsic_Sqrt;
+			else if (intrinsic->mName == "vector_fma")
+				scalar->mKind = BfIRIntrinsic_Fma;
+			else
+			{
+				Fail("Unknown vector intrinsic");
+				return mBeModule->CreateUndefValue(resultType);
+			}
+			scalar->mName = BfIRCodeGen::GetIntrinsicName(scalar->mKind);
+			SizedArray<BeValue*, 4> scalarArgs;
+			for (int argIdx = 0; argIdx < args.size(); argIdx++)
+				scalarArgs.Add(lane(argIdx, i));
+			value = mBeModule->CreateCall(scalar, scalarArgs);
+			// The estimate API permits a more accurate portable fallback.
+			if (intrinsic->mName == "vector_rsqrt_estimate")
+				value = mBeModule->CreateBinaryOp(BeBinaryOpKind_SDivide,
+					mBeModule->GetConstant(vectorType->mElementType, 1.0), value);
+		}
+		else
+		{
+			auto lhs = lane(0, i);
+			BeValue* rhs;
+			if (args.size() > 1)
+				rhs = lane(1, i);
+			else if (isFloat)
+				rhs = mBeModule->GetConstant(vectorType->mElementType, 1.0);
+			else
+				rhs = mBeModule->GetConstant(vectorType->mElementType, (int64)1);
+			if (cmp != BeCmpKind_None)
+			{
+				value = mBeModule->CreateCmp(cmp, lhs, rhs);
+				// bool vectors store canonical 0/1 bytes, not all-ones masks.
+				if (value->GetType() != resultType->mElementType)
+					value = mBeModule->CreateNumericCast(value, resultType->mElementType, false, false);
+			}
+			else
+				value = mBeModule->CreateBinaryOp(binaryOp, lhs, rhs);
+		}
+		mBeModule->CreateStore(value, lanePtr(result, destLane), false);
+	}
+	auto value = mBeModule->CreateLoad(result, false);
+	if (shuffleSetter)
+		return mBeModule->CreateStore(value, args[0], false);
+	return value;
+}
+
 void BeIRCodeGen::HandleNextCmd()
 {	
 	if (mFailed)
@@ -1263,13 +1501,28 @@ void BeIRCodeGen::HandleNextCmd()
 				Fail("StructSetBody invalid type");
 				break;
 			}
-
+			
 			bool failed = false;
 			for (auto member : members)
 			{
 				if (member->mSize < 0)
 				{
 					Fail("StructSetBody invalid member type");
+					failed = true;
+				}
+			}			
+
+			if (type->mTypeCode != BeTypeCode_Struct)
+			{
+				Fail("StructSetBody invalid struct type");
+				failed = true;
+			}
+			else
+			{
+				auto structType = (BeStructType*)type;
+				if (!structType->mMembers.IsEmpty())
+				{
+					Fail("StructSetBody on non-empty struct type");
 					failed = true;
 				}
 			}
@@ -1352,7 +1605,11 @@ void BeIRCodeGen::HandleNextCmd()
 				for (int i = 0; i < (int)values.size(); i++)
 				{
 					auto val = values[i];
-					BF_ASSERT(mBeContext->AreTypesEqual(((BeStructType*)type)->mMembers[i].mType, val->GetType()));
+					if (!mBeContext->AreTypesEqual(((BeStructType*)type)->mMembers[i].mType, val->GetType()))
+					{
+						Fail("CreateConstAgg failed");
+						break;
+					}
 					constStruct->mMemberValues.push_back(BeValueDynCast<BeConstant>(val));
 				}
 			}
@@ -1698,7 +1955,41 @@ void BeIRCodeGen::HandleNextCmd()
 			CMD_PARAM(BeValue*, val);
 			CMD_PARAM(int, idx0);
 			CMD_PARAM(int, idx1);
-			BF_ASSERT(val->GetType()->IsPointer());
+
+			auto valType = val->GetType();
+			if (!val->GetType()->IsPointer())
+			{
+				Fail("GEP value not pointer");
+				break;
+			}
+
+			BePointerType* pointerType = (BePointerType*)valType;
+			if (!pointerType->mElementType->IsComposite())
+			{
+				Fail("GEP value not pointer to composite");
+				break;
+			}
+
+			if (pointerType->mElementType->IsStruct())
+			{
+				BeStructType* structType = (BeStructType*)pointerType->mElementType;
+				if (idx1 >= structType->mMembers.size())
+				{
+					Fail("GEP idx1 out of range");
+					break;
+				}
+			}
+
+			if (pointerType->mElementType->IsSizedArray())
+			{
+				BeSizedArrayType* arrayType = (BeSizedArrayType*)pointerType->mElementType;
+				if (idx1 >= arrayType->mLength)
+				{
+					Fail("GEP idx1 out of range");
+					break;
+				}
+			}
+			
 			BeType* int32Type = mBeContext->GetPrimitiveType(BeTypeCode_Int32);
 			SetResult(curId, mBeModule->CreateGEP(val, mBeModule->GetConstant(int32Type, (int64)idx0), mBeModule->GetConstant(int32Type, (int64)idx1)));
 		}
@@ -1739,6 +2030,19 @@ void BeIRCodeGen::HandleNextCmd()
 			CMD_PARAM(BeValue*, val);
 			CMD_PARAM(int, idx);
 
+			if (val->GetType()->IsExplicitVectorType())
+			{
+				// Materialize a vector before taking a lane address. This goes through
+				// the usual load/store lifetime handling, including for temporary results.
+				auto slot = mBeModule->CreateAlloca(val->GetType());
+				mBeModule->CreateStore(val, slot, false);
+				auto intType = mBeContext->GetPrimitiveType(BeTypeCode_Int32);
+				auto ptr = mBeModule->CreateGEP(slot, mBeModule->GetConstant(intType, (int64)0),
+					mBeModule->GetConstant(intType, (int64)idx));
+				SetResult(curId, mBeModule->CreateLoad(ptr, false));
+				break;
+			}
+
 			BF_ASSERT(val->GetType()->IsComposite());
 			if (val->GetType()->mTypeCode == BeTypeCode_Struct)
 			{ 
@@ -1760,6 +2064,18 @@ void BeIRCodeGen::HandleNextCmd()
 			CMD_PARAM(BeValue*, agg);
 			CMD_PARAM(BeValue*, val);
 			CMD_PARAM(int, idx);
+
+			if (agg->GetType()->IsExplicitVectorType())
+			{
+				auto slot = mBeModule->CreateAlloca(agg->GetType());
+				mBeModule->CreateStore(agg, slot, false);
+				auto intType = mBeContext->GetPrimitiveType(BeTypeCode_Int32);
+				auto ptr = mBeModule->CreateGEP(slot, mBeModule->GetConstant(intType, (int64)0),
+					mBeModule->GetConstant(intType, (int64)idx));
+				mBeModule->CreateStore(val, ptr, false);
+				SetResult(curId, mBeModule->CreateLoad(slot, false));
+				break;
+			}
 
 			auto insertValueInst = mBeModule->AllocInst<BeInsertValueInst>();
 			insertValueInst->mAggVal = agg;
@@ -2410,17 +2726,25 @@ void BeIRCodeGen::HandleNextCmd()
 			{
 				if (beFunc->mRemapBindVar == NULL)
 				{
-					auto globalVariable = mBeModule->mGlobalVariables.Alloc();
-					globalVariable->mModule = mBeModule;
-					globalVariable->mType = beFunc->mType;
-					globalVariable->mIsConstant = true;
-					globalVariable->mLinkageType = BfIRLinkageType_External;
-					globalVariable->mInitializer = beFunc;
-					globalVariable->mName = StrFormat("bf_hs_preserve@%s_%s", beFunc->mName.c_str(), mBeModule->mModuleName.c_str());
-					globalVariable->mIsTLS = false;
-					globalVariable->mAlign = 8;
-					globalVariable->mUnnamedAddr = false;
-					beFunc->mRemapBindVar = globalVariable;
+					// Extern declarations can share a link name (and so a symbol) with different signatures,
+					//  so they share the variable too, as with LLVM
+					String varName = StrFormat("bf_hs_preserve@%s_%s", beFunc->mName.c_str(), mBeModule->mModuleName.c_str());
+					BeGlobalVariable** globalVariablePtr = NULL;
+					if (mBeModule->mRemapBindVarMap.TryAdd(varName, NULL, &globalVariablePtr))
+					{
+						auto globalVariable = mBeModule->mGlobalVariables.Alloc();
+						globalVariable->mModule = mBeModule;
+						globalVariable->mType = beFunc->mType;
+						globalVariable->mIsConstant = true;
+						globalVariable->mLinkageType = BfIRLinkageType_External;
+						globalVariable->mInitializer = beFunc;
+						globalVariable->mName = varName;
+						globalVariable->mIsTLS = false;
+						globalVariable->mAlign = 8;
+						globalVariable->mUnnamedAddr = false;
+						*globalVariablePtr = globalVariable;
+					}
+					beFunc->mRemapBindVar = *globalVariablePtr;
 
 					/*if (mBeModule->mDbgModule != NULL)
 					{
@@ -2437,7 +2761,11 @@ void BeIRCodeGen::HandleNextCmd()
 					}*/
 				}
 
-				SetResult(curId, mBeModule->CreateLoad(beFunc->mRemapBindVar, false));
+				BeValue* result = mBeModule->CreateLoad(beFunc->mRemapBindVar, false);
+				// A shared variable has the type of the declaration that created it
+				if (beFunc->mRemapBindVar->mType != beFunc->mType)
+					result = mBeModule->CreateBitCast(result, beFunc->mType);
+				SetResult(curId, result);
 			}
 			else
 				SetResult(curId, func);
@@ -2498,7 +2826,7 @@ void BeIRCodeGen::HandleNextCmd()
 						dumpCtx.ToString(errStr, args[argIdx]);
 						errStr += "\n";
 					}
-					FatalError(errStr);
+					Fail(errStr);					
 				}
 			}
 			else
@@ -2506,14 +2834,18 @@ void BeIRCodeGen::HandleNextCmd()
 				BF_ASSERT(func->GetTypeId() == BeIntrinsic::TypeId);
 			}
 #endif
-			SetResult(curId, mBeModule->CreateCall(func, args));
+			BeValue* lowered = NULL;
+			if (auto intrinsic = BeValueDynCast<BeIntrinsic>(func))
+				lowered = TryLowerVectorIntrinsic(intrinsic, args);
+			SetResult(curId, lowered != NULL ? lowered : mBeModule->CreateCall(func, args));
 		}
 		break;
 	case BfIRCmd_SetCallCallingConv:
 		{
 			CMD_PARAM(BeValue*, callInst);
 			BfIRCallingConv callingConv = (BfIRCallingConv)mStream->Read();
-			((BeCallInst*)callInst)->mCallingConv = callingConv;
+			if (auto call = BeValueDynCast<BeCallInst>(callInst))
+				call->mCallingConv = callingConv;
 		}
 		break;
 	case BfIRCmd_SetFuncCallingConv:
@@ -2526,8 +2858,8 @@ void BeIRCodeGen::HandleNextCmd()
 	case BfIRCmd_SetTailCall:
 		{
 			CMD_PARAM(BeValue*, callInstVal);
-			BeCallInst* callInst = (BeCallInst*)callInstVal;
-			callInst->mTailCall = true;
+			if (auto callInst = BeValueDynCast<BeCallInst>(callInstVal))
+				callInst->mTailCall = true;
 		}
 		break;
 	case BfIRCmd_SetCallAttribute:
@@ -2535,8 +2867,8 @@ void BeIRCodeGen::HandleNextCmd()
 			CMD_PARAM(BeValue*, callInstVal);
 			CMD_PARAM(int, paramIdx);
 			BfIRAttribute attribute = (BfIRAttribute)mStream->Read();
-			BeCallInst* callInst = (BeCallInst*)callInstVal;
-			if (attribute == BfIRAttribute_NoReturn)
+			BeCallInst* callInst = BeValueDynCast<BeCallInst>(callInstVal);
+			if ((callInst != NULL) && (attribute == BfIRAttribute_NoReturn))
 				callInst->mNoReturn = true;
 		}
 		break;
@@ -2598,6 +2930,8 @@ void BeIRCodeGen::HandleNextCmd()
 			{
 				if (attribute == BfIRAttribute_NoReturn)
 					callInst->mNoReturn = true;
+				else if (attribute == BfIRAttribute_NoInline)
+					callInst->mNoInline = true;
 				else
 					BF_FATAL("Unhandled");
 			}
@@ -2664,7 +2998,9 @@ void BeIRCodeGen::HandleNextCmd()
 				if (attribute == BfIRAttribute_VarRet)
 					func->mIsVarReturn = true;
 				else if (attribute == BFIRAttribute_AlwaysInline)
-					func->mAlwaysInline = true;
+					func->mInlineKind = BfInlineKind_Always;
+				else if (attribute == BfIRAttribute_NoInline)
+					func->mInlineKind = BfInlineKind_Never;
 				else if (attribute == BFIRAttribute_NoUnwind)
 					func->mNoUnwind = true;
 				else if (attribute == BFIRAttribute_UWTable)
@@ -2699,7 +3035,13 @@ void BeIRCodeGen::HandleNextCmd()
 			CMD_PARAM(int, arg);
 			// This is for adding things like Dereferencable, which we don't use
 
-			if (argIdx > 0)
+			if ((argIdx == -1) && (attribute == BfIRAttribute_FloatingPointMode))
+				func->mFloatingPointMode = (BfFloatingPointMode)arg;
+			else if ((argIdx == -1) && (attribute == BfIRAttribute_SIMDSetting))
+				func->mSIMDSetting = (BfSIMDSetting)arg;
+			else if ((argIdx == -1) && (attribute == BfIRAttribute_FMASetting))
+				func->mFMASetting = (BfFMASetting)arg;
+			else if (argIdx > 0)
 			{
 				if (attribute == BfIRAttribute_Dereferencable)
 					func->mParams[argIdx - 1].mDereferenceableSize = arg;

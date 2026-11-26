@@ -874,8 +874,14 @@ namespace CURL
 		[CLink, CallingConvention(.Stdcall)]
 		static extern char8* curl_easy_unescape(void* curl, char8* input, int32 inlength, int32* outlength);
 
+#if BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+		// curl_easy_setopt is variadic, and the Apple arm64 ABI passes variadic arguments on the stack
+		[CLink, CallingConvention(.Stdcall)]
+		static extern int curl_easy_setopt(void* curl, int option, ...);
+#else
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int curl_easy_setopt(void* curl, int option, int optVal);
+#endif
 
 		[CLink, CallingConvention(.Stdcall)]
 		static extern void* curl_easy_duphandle(void* curl);
@@ -886,8 +892,14 @@ namespace CURL
 		[CLink, CallingConvention(.Stdcall)]
 		static extern int curl_easy_perform(void* curl);
 
+#if BF_PLATFORM_MACOS || BF_PLATFORM_IOS
+		// curl_easy_getinfo is variadic too
+		[CLink, CallingConvention(.Stdcall)]
+		static extern void* curl_easy_getinfo(void* curl, CurlInfo info, ...);
+#else
 		[CLink, CallingConvention(.Stdcall)]
 		static extern void* curl_easy_getinfo(void* curl, CurlInfo info, void* ptr);
+#endif
 
 		[CLink, CallingConvention(.Stdcall)]
 		static extern void* curl_easy_reset(void* curl);

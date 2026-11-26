@@ -110,22 +110,32 @@ namespace IDE
 			case iOS;
 			case Android;
 			case Wasm;
+			case None; //Bare-metal
+
+#if BF_PLATFORM_WINDOWS
+			public bool IsWSL => this == .Linux;
+#else
+			public bool IsWSL => false;
+#endif
 			
 			public static PlatformType GetFromName(StringView name, StringView targetTriple = default)
 			{
 				if (!targetTriple.IsWhiteSpace)
 					return TargetTriple.GetPlatformType(targetTriple);
 
-				switch (name)
-				{
-				case "Win32", "Win64": return .Windows;
-				case "Linux32", "Linux64": return .Linux;
-				case "macOS": return .macOS;
-				case "iOS": return .iOS;
-				case "wasm32", "wasm64": return .Wasm;
-				default:
-					return TargetTriple.GetPlatformType(name);
-				}
+				if ((name.Equals("Win32", true)) || (name.Equals("Win64", true)))
+					return .Windows;
+				if ((name.Equals("Linux32", true)) || (name.Equals("Linux64", true)))
+					return .Linux;
+				if (name.Equals("macOS", true))
+					return .macOS;
+				if (name.Equals("iOS", true))
+					return .iOS;
+				if ((name.Equals("wasm32", true)) || (name.Equals("wasm64", true)))
+					return .Wasm;
+				if (name.Equals("none", true))
+					return .None;
+				return TargetTriple.GetPlatformType(name);
 			}
 
 			public static PlatformType GetHostPlatform()
@@ -150,36 +160,43 @@ namespace IDE
 			{
 				if ((name.EndsWith("32")) && (!TargetTriple.IsTargetTriple(name)))
 					return 4;
-				if (name.StartsWith("armv"))
+				if (name.StartsWith("armv", .OrdinalIgnoreCase))
 					return 4;
-				if (name.StartsWith("i686-"))
+				if (name.StartsWith("i686-", .OrdinalIgnoreCase))
 					return 4;
 				return 8;
 			}
 
 			public static bool GetTargetTripleByName(String name, ToolsetType toolsetType, String outTriple)
 			{
-				switch (name)
-				{
-				case "Win32":
+				if (name.Equals("Win32", .OrdinalIgnoreCase))
 					outTriple.Append((toolsetType == .GNU) ? "i686-pc-windows-gnu" : "i686-pc-windows-msvc");
-				case "Win64":
+				else if (name.Equals("Win64", .OrdinalIgnoreCase))
 					outTriple.Append((toolsetType == .GNU) ? "x86_64-pc-windows-gnu" : "x86_64-pc-windows-msvc");
-				case "Linux32":
+				else if (name.Equals("Linux32", .OrdinalIgnoreCase))
 					outTriple.Append("i686-unknown-linux-gnu");
-				case "Linux64":
-					outTriple.Append("x86_64-unknown-linux-gnu");
-				case "macOS":
-					outTriple.Append("x86_64-apple-macosx10.8.0");
-				case "iOS":
-					outTriple.Append("arm64-apple-ios");
-				case "wasm32":
-					outTriple.Append("wasm32-unknown-emscripten");
-				case "wasm64":
-					outTriple.Append("wasm64-unknown-emscripten");
-				default:
-					return false;
+				else if (name.Equals("Linux64", .OrdinalIgnoreCase))
+				{
+					if (IDEApp.sArch64Name == "aarch64")
+						outTriple.Append("aarch64-unknown-linux-gnu");
+					else
+						outTriple.Append("x86_64-unknown-linux-gnu");
 				}
+				else if (name.Equals("macOS", .OrdinalIgnoreCase))
+				{
+					if (IDEApp.sArch64Name == "aarch64")
+						outTriple.Append("aarch64-apple-macosx11.0.0");
+					else
+						outTriple.Append("x86_64-apple-macosx10.8.0");
+				}
+				else if (name.Equals("iOS", .OrdinalIgnoreCase))
+					outTriple.Append("arm64-apple-ios");
+				else if (name.Equals("wasm32", .OrdinalIgnoreCase))
+					outTriple.Append("wasm32-unknown-emscripten");
+				else if (name.Equals("wasm64", .OrdinalIgnoreCase))
+					outTriple.Append("wasm64-unknown-emscripten");
+				else
+					return false;
 				return true;
 			}
 		}
@@ -192,12 +209,10 @@ namespace IDE
 
 			public static ToolsetType GetDefaultFor(PlatformType platformType, bool isRelease)
 			{
+				if (((platformType == .Windows) || (platformType == .Linux)) && (isRelease))
+					return .LLVM;
 				if (platformType == .Windows)
-				{
-					if (isRelease)
-						return .LLVM;
 					return .Microsoft;
-				}
 				
 				return .GNU;
 			}
@@ -308,6 +323,10 @@ namespace IDE
 			[Reflect]
 			public BuildOptions.BfOptimizationLevel mBfOptimizationLevel;
 			[Reflect]
+			public BuildOptions.FloatingPointMode mBfFloatingPointMode = .Precise;
+			[Reflect]
+			public BuildOptions.FMASetting mBfFMASetting = .TargetDefault;
+			[Reflect]
 			public BuildOptions.SIMDSetting mCSIMDSetting = .SSE2;
 			[Reflect]
 			public COptimizationLevel mCOptimizationLevel;
@@ -358,12 +377,10 @@ namespace IDE
 			[Reflect]
 			public List<DistinctBuildOptions> mDistinctBuildOptions = new List<DistinctBuildOptions>() ~ DeleteContainerAndItems!(_);
 
-            public Dictionary<Project, ConfigSelection> mConfigSelections = new Dictionary<Project, ConfigSelection>() ~ delete _;
+            public Dictionary<String, ConfigSelection> mConfigSelections = new Dictionary<String, ConfigSelection>() ~ DeleteDictionaryAndKeysAndValues!(_);
 
 			public ~this()
 			{
-				for (var configSel in mConfigSelections.Values)
-					delete configSel;
 			}
 
 			public bool LeakCheckingEnabled
@@ -389,6 +406,8 @@ namespace IDE
 				mTargetCPU.Set(prev.mTargetCPU);
 				mBfSIMDSetting = prev.mBfSIMDSetting;
 				mBfOptimizationLevel = prev.mBfOptimizationLevel;
+				mBfFloatingPointMode = prev.mBfFloatingPointMode;
+				mBfFMASetting = prev.mBfFMASetting;
 				mCSIMDSetting = prev.mCSIMDSetting;
 				mCOptimizationLevel = prev.mCOptimizationLevel;
 				mLTOType = prev.mLTOType;
@@ -420,7 +439,7 @@ namespace IDE
 				{
 					let prevConfig = typeOptionKV.value;
 					let newConfig = prevConfig.Duplicate();
-					mConfigSelections[typeOptionKV.key] = newConfig;
+					mConfigSelections[new .(typeOptionKV.key)] = newConfig;
 				}
 
 				for (var typeOption in prev.mDistinctBuildOptions)
@@ -587,6 +606,16 @@ namespace IDE
 			ClearAndDeleteItems(mPlatforms);
 		}
 
+		public virtual void GetBeefExtensions(List<String> extList)
+		{
+
+		}
+
+		public virtual bool CheckExtension(StringView extName)
+		{
+			return false;
+		}
+
 		public void SetLock(StringView projectName, Lock lock)
 		{
 			if (mProjectLockMap.TryAddAlt(projectName, var keyPtr, var valuePtr))
@@ -679,7 +708,7 @@ namespace IDE
 			Path.GetAbsolutePath(inRelPath, mDir, outAbsPath);
 		}
 
-        public void Serialize(StructuredData data)
+        public virtual void Serialize(StructuredData data)
         {
 			void WriteStrings(String name, List<String> strs)
 			{
@@ -713,6 +742,13 @@ namespace IDE
 
 			if (!IsSingleFileWorkspace)
 				data.Add("FileVersion", 1);
+
+			var extList = GetBeefExtensions(.. scope .());
+			defer extList.ClearAndDeleteItems();
+			if (!extList.IsEmpty)
+			{
+				WriteStrings("Extensions", extList);
+			}
 			
 			using (data.CreateObject("Workspace"))
 			{
@@ -726,7 +762,7 @@ namespace IDE
 
 			if (!mProjectSpecs.IsEmpty)
 			{
-				using (data.CreateObject("Projects", true))
+				using (data.CreateObject("Projects"))
 				{
 					for (var projSpec in mProjectSpecs)
 					{
@@ -771,7 +807,7 @@ namespace IDE
 
 			if (!mWorkspaceFolders.IsEmpty)
 			{
-			    using (data.CreateObject("WorkspaceFolders", true))
+			    using (data.CreateObject("WorkspaceFolders"))
 			    {
 					String fullPathBuffer = scope .();
 			        for (let folder in mWorkspaceFolders)
@@ -842,6 +878,8 @@ namespace IDE
 								data.ConditionalAdd("TargetTriple", options.mTargetTriple);
 								data.ConditionalAdd("TargetCPU", options.mTargetCPU);
                                 data.ConditionalAdd("BfSIMDSetting", options.mBfSIMDSetting, .SSE2);
+								data.ConditionalAdd("BfFloatingPointMode", options.mBfFloatingPointMode, .Precise);
+								data.ConditionalAdd("BfFMASetting", options.mBfFMASetting, .TargetDefault);
 								if (platformType == .Windows)
                                 	data.ConditionalAdd("BfOptimizationLevel", options.mBfOptimizationLevel, isRelease ? .O2 : (platformName == "Win64") ? .OgPlus : .O0);
 								else
@@ -878,7 +916,7 @@ namespace IDE
                                 {
                                     for (var configPair in options.mConfigSelections)
                                     {
-										let projectName = configPair.key.mProjectName;
+										let projectName = configPair.key;
                                         
 										var configSelection = configPair.value;
 										bool wantEntry = configSelection.mEnabled != true;
@@ -981,9 +1019,10 @@ namespace IDE
 
 				void Add(String name, Project project)
 				{
-					if (mProjectNameMap.TryAdd(name, var keyPtr, var valuePtr))
+					String nameUpper = scope .(name)..ToUpper();
+					if (mProjectNameMap.TryAdd(nameUpper, var keyPtr, var valuePtr))
 					{
-						*keyPtr = new String(name);
+						*keyPtr = new String(nameUpper);
 						*valuePtr = project;
 					}
 					else
@@ -1011,10 +1050,11 @@ namespace IDE
 				{
 					void Add(String name, Project project)
 					{
-						bool added = mProjectNameMap.TryAdd(name, var keyPtr, var valuePtr);
+						String nameUpper = scope .(name)..ToUpper();
+						bool added = mProjectNameMap.TryAdd(nameUpper, var keyPtr, var valuePtr);
 						if (!added)
 							return;
-						*keyPtr = new String(name);
+						*keyPtr = new String(nameUpper);
 						*valuePtr = project;
 					}
 
@@ -1032,7 +1072,8 @@ namespace IDE
 					}
 				}
 
-	            if (mProjectNameMap.TryGetAlt(projectName, var matchKey, var value))
+				String projectNameUpper = scope .(projectName)..ToUpper();
+	            if (mProjectNameMap.TryGet(projectNameUpper, var matchKey, var value))
 				{
 					return value;
 				}
@@ -1058,6 +1099,8 @@ namespace IDE
 
 			options.mBfOptimizationLevel = isRelease ? .O2 : .O0;
 			options.mBfSIMDSetting = .SSE2;
+			options.mBfFloatingPointMode = .Precise;
+			options.mBfFMASetting = .TargetDefault;
 			if (platformType == .Windows)
 				options.mBfOptimizationLevel = isRelease ? .O2 : (platformName == "Win64") ? .OgPlus : .O0;
 			
@@ -1111,10 +1154,22 @@ namespace IDE
 			//options.mIntermediateType = .ObjectAndIRCode;
 		}
 
-        public void Deserialize(StructuredData data)
+        public virtual void Deserialize(StructuredData data)
         {
 			DeleteDictionaryAndKeysAndValues!(mConfigs);
 			mConfigs = new Dictionary<String, Config>();
+
+			if (data.Contains("Extensions"))
+			{
+				for (data.Enumerate("Extensions"))
+				{
+					var extName = data.GetCurString(.. scope .());
+					if (!CheckExtension(extName))
+					{
+						gApp.Fail(scope $"This workspace requires extension '{extName}'");
+					}
+				}
+			}
 
 			using (data.Open("Workspace"))
 			{
@@ -1166,6 +1221,8 @@ namespace IDE
 					data.GetString("TargetTriple", options.mTargetTriple);
 					data.GetString("TargetCPU", options.mTargetCPU);
 					options.mBfSIMDSetting = data.GetEnum<BuildOptions.SIMDSetting>("BfSIMDSetting", .SSE2);
+					options.mBfFloatingPointMode = data.GetEnum<BuildOptions.FloatingPointMode>("BfFloatingPointMode", .Precise);
+					options.mBfFMASetting = data.GetEnum<BuildOptions.FMASetting>("BfFMASetting", .TargetDefault);
 					if (platformType == .Windows)
                     	options.mBfOptimizationLevel = data.GetEnum<BuildOptions.BfOptimizationLevel>("BfOptimizationLevel", isRelease ? .O2 : (platformName == "Win64") ? .OgPlus : .O0);
 					else
@@ -1201,24 +1258,22 @@ namespace IDE
 
                     for (var projectName in data.Enumerate("ConfigSelections"))
                     {
+						String expectConfig = configName;
+
 						Project project = FindProject(scope String(projectName));
-                        if (project != null)
-                        {
-							String expectConfig = configName;
-							if (isTest)
-							{
-								if (project != mProjects[0])
-									expectConfig = "Debug";
-							}
-                            
-                            var configSelection = new ConfigSelection();
-                            configSelection.mEnabled = data.GetBool("Enabled", true);
-                            configSelection.mConfig = new String();
-                            data.GetString("Config", configSelection.mConfig, expectConfig);
-                            configSelection.mPlatform = new String();
-                            data.GetString("Platform", configSelection.mPlatform, platformName);
-                            options.mConfigSelections[project] = configSelection;
-                        }
+						if (isTest)
+						{
+							if (project != mProjects[0])
+								expectConfig = "Debug";
+						}
+
+						var configSelection = new ConfigSelection();
+						configSelection.mEnabled = data.GetBool("Enabled", true);
+						configSelection.mConfig = new String();
+						data.GetString("Config", configSelection.mConfig, expectConfig);
+						configSelection.mPlatform = new String();
+						data.GetString("Platform", configSelection.mPlatform, platformName);
+						options.mConfigSelections[new .(projectName)] = configSelection;
                     }
 
 					for (data.Enumerate("DistinctOptions"))
@@ -1360,30 +1415,22 @@ namespace IDE
 				options = *optionsPtr;
 			}
 			
-			var removeList = scope List<Project>();
-            for (var project in options.mConfigSelections.Keys)
+            for (var kv in options.mConfigSelections)
             {
-                if (!mProjects.Contains(project))
-                {
-                    // This project is no longer in the workspace
-					removeList.Add(project);
+				var project = FindProject(kv.key);
+				if (project == null)
+				{
+					// Project no longer exists, remove
+					delete kv.key;
+					delete kv.value;
+                    @kv.Remove();
                 }
             }
-
-			for (var project in removeList)
-			{
-				var value = options.mConfigSelections.GetValue(project);
-				if (value case .Ok)
-				{
-					delete value.Get();
-					options.mConfigSelections.Remove(project);
-				}
-			}
 
             for (var project in mProjects)
             {
                 ConfigSelection configSelection;
-                options.mConfigSelections.TryGetValue(project, out configSelection);
+                options.mConfigSelections.TryGetValue(project.mProjectName, out configSelection);
 
                 String findConfig = configName;
                 String findPlatform = platformName;
@@ -1417,7 +1464,7 @@ namespace IDE
                         configSelection = new ConfigSelection();
 						configSelection.mConfig = new String(findConfig);
 						configSelection.mPlatform = new String(findPlatform);
-						options.mConfigSelections[project] = configSelection;
+						options.mConfigSelections[new .(project.mProjectName)] = configSelection;
 						configSelection.mEnabled = true;
 					}
 

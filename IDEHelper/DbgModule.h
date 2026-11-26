@@ -14,6 +14,7 @@
 #include "RadixMap.h"
 #include <unordered_map>
 #include <unordered_set>
+#include <list>
 #include <functional>
 #include "Debugger.h"
 #include "StrHashMap.h"
@@ -97,7 +98,7 @@ enum DbgTypeCode : uint8
 };
 
 class DebugTarget;
-class WinDebugger;
+class DbgTargetHost;
 class DbgType;
 class DbgBlock;
 
@@ -162,7 +163,7 @@ enum DbgLocationLenKind
 class DbgVariable : public DbgDebugData
 {
 public:
-	static const DbgClassType ClassType = DbgClassType_Variable;
+	static constexpr DbgClassType ClassType = DbgClassType_Variable;
 
 	const char* mName;
 	const char* mLinkName;
@@ -218,7 +219,7 @@ typedef std::map<int, Array<int> > DwAsmDebugLineMap;
 class DbgBlock : public DbgDebugData
 {
 public:
-	static const DbgClassType ClassType = DbgClassType_Block;
+	static constexpr DbgClassType ClassType = DbgClassType_Block;
 
 	addr_target mLowPC; // If LowPC is -1 then mHighPC is index into debugRanges
 	addr_target mHighPC;
@@ -339,13 +340,15 @@ public:
 	DbgLineData mFirstLineData;
 	DbgLineData mLastLineData;
 	uint32 mInlineeId;
+	int mCallFile;
+	int mCallLine;
 	int mInlineDepth;
 };
 
 class DbgSubprogram : public DbgDebugData
 {
 public:
-	static const DbgClassType ClassType = DbgClassType_Subprogram;
+	static constexpr DbgClassType ClassType = DbgClassType_Subprogram;
 
 #ifdef BF_DBG_32
 	enum LocalBaseRegKind : uint8
@@ -534,7 +537,7 @@ enum DbgExtType : int8
 class DbgType : public DbgDebugData
 {
 public:
-	static const DbgClassType ClassType = DbgClassType_Type;
+	static constexpr DbgClassType ClassType = DbgClassType_Type;
 	DbgType* mParent;
 	BumpList<DbgType*> mAlternates; // From other compile units
 	DbgType* mPrimaryType;
@@ -827,10 +830,20 @@ public:
 	int mSection;
 };
 
+class DbgInlineeRange
+{
+public:
+	addr_target mLowPC;
+	addr_target mHighPC;
+	addr_target mPrefixMaxHighPC; // Lets FindDwarfInlinee stop scanning back
+	DbgSubprogram* mInlinee;
+	int mDepth;
+};
+
 class DbgCompileUnit
 {
 public:
-	static const DbgClassType ClassType = DbgClassType_CompileUnit;
+	static constexpr DbgClassType ClassType = DbgClassType_CompileUnit;
 
 	DbgModule* mDbgModule;
 	DbgLanguage mLanguage;
@@ -842,11 +855,13 @@ public:
 	String mCompileDir;
 	addr_target mLowPC;
 	addr_target mHighPC;
+	int64 mStmtListOffset;
 	bool mNeedsLineDataFixup;
 	bool mWasHotReplaced;
 	bool mIsMaster;
 
 	SLIList<DbgSubprogram*> mOrphanMethods;
+	Array<DbgInlineeRange> mInlineeRanges;
 
 public:
 	DbgCompileUnit(DbgModule* dbgModule);
@@ -1112,7 +1127,7 @@ class DbgModule
 public:
 	static const int ImageBlockSize = 4096;
 
-	WinDebugger* mDebugger;
+	DbgTargetHost* mDebugger;
 	DebugTarget* mDebugTarget;
 	DbgModuleLoadState mLoadState;
 	MappedFile* mMappedImageFile;
@@ -1120,6 +1135,13 @@ public:
 
 	const uint8* mDebugLineData;
 	const uint8* mDebugInfoData;
+	int64 mDebugInfoSize;
+	int64 mDebugLineSize;
+	int64 mDebugFrameSize;
+	int64 mDebugLocationSize;
+	int64 mDebugRangesSize;
+	int64 mDebugAbbrevSize;
+	int64 mDebugStrSize;
 	const uint8* mDebugPubNames;
 	const uint8* mDebugFrameData;
 	const uint8* mDebugLocationData;
@@ -1129,8 +1151,17 @@ public:
 	const uint8* mDebugAbbrevData;
 	const uint8* mDebugStrData;
 	const uint8** mDebugAbbrevPtrData;
+	Array<int> mDebugAbbrevPtrUsed;
+	const uint8* mDwarfEnd;
+	int mDwarfUnitOfs;
+	int mDwarfRefStart;
+	int mDwarfRefEnd;
+	bool mDwarfFailed;
+	int mDwarfFailCount;
+	int mDwarfInlineeRangeCount;
 	Array<DbgSectionData> mExceptionDirectory;
 	const uint8* mEHFrameData;
+	int64 mEHFrameSize;
 	const char* mStringTable;
 	const uint8* mSymbolData;
 	addr_target mEHFrameAddress;
@@ -1230,6 +1261,7 @@ public:
 	virtual void PopulateStaticVariableMap();
 	virtual void ProcessDebugInfo();
 	virtual bool CanGetOldSource() { return false; }
+	virtual addr_target GetSectionAddr(uint16 section, uint32 offset) { return 0; }
 	virtual String GetOldSourceCommand(const StringImpl& path) { return ""; }
 	virtual bool GetEmitSource(const StringImpl& filePath, String& outText) { return false; }
 	virtual bool DbgIsStrMutable(const char* str) { return true; } // Always assume its a copy
@@ -1247,21 +1279,31 @@ public:
 	char* DbgDupString(const char* str, const char* allocName = NULL);
 	DbgModule* GetLinkedModule();
 	addr_target GetTargetImageBase();
-	addr_target RemapAddr(addr_target addr);
+	virtual addr_target RemapAddr(addr_target addr);
 	template <typename T>
 	T GetOrCreate(int idx, DbgDataMap& dataMap);
 	DbgType* GetOrCreateType(int typeIdx, DbgDataMap& typeMap);
 	//void SplitName(const char* inName, const char*& outBaseName, const char*& outTemplateParams, bool alwaysDup = false);
 	void MapSubprogram(DbgSubprogram* dbgSubprogram);
+	static void FixupLineDataForSubprogram(DbgSubprogram* subProgram);
 	bool ParseDWARF(const uint8*& dataPtr);
-	void ParseAbbrevData(const uint8* data);
+	void ParseDWARFUnits();
+	void ParseDWARFLines();
+	bool ParseAbbrevData(const uint8* data);
+	void DwarfFail(const char* reason);
+	bool IsDwarfRangeListValid(int64 offset);
+	bool IsDwarfLocationListValid(int64 offset);
 	void ParseExceptionData();
 	void ParseDebugFrameData();
 	void ParseEHFrameData();
 	void FlushLineData(DbgSubprogram* curSubprogram, std::list<DbgLineData>& queuedLineData);
 	DbgSrcFile* AddSrcFile(DbgCompileUnit* compileUnit, const String& srcFilePath);
 	void AddLineData(DbgCompileUnit* dwCompileUnit, DbgLineData& lineData, DbgSubprogram*& curSubProgram, std::list<DbgLineData>& queuedLineData);
-	bool ParseDebugLineInfo(const uint8*& data, int compileUnitIdx);
+	bool ParseDebugLineInfo(const uint8*& data, DbgCompileUnit* dwCompileUnit);
+	void PrepareDwarfInlineeRanges(DbgCompileUnit* dwCompileUnit);
+	DbgSubprogram* FindDwarfInlinee(DbgCompileUnit* dwCompileUnit, addr_target address);
+	void AddDwarfInlineCallRows(DbgLineDataBuilder& lineBuilder, DbgCompileUnit* dwCompileUnit, const DbgLineData& lineData, DbgSubprogram* prevInlinee, DbgSubprogram* inlinee);
+	addr_target FindDwarfInlineeRangeEnd(DbgCompileUnit* dwCompileUnit, DbgSubprogram* inlinee, addr_target address);
 	void FixupInnerTypes(int startingTypeIdx);
 	void MapTypes(int startingTypeIdx);
 	void CreateNamespaces();
@@ -1301,6 +1343,10 @@ public:
 	static bool CanRead(DataStream* stream, DebuggerResult* outResult);
 
 	bool ReadCOFF(DataStream* stream, DbgModuleKind dbgModuleKind);
+	virtual bool ReadImage(DataStream* stream, DbgModuleKind dbgModuleKind) { return ReadCOFF(stream, dbgModuleKind); }
+	// COFF images can also carry GNU DWARF, whose inline handling stays as it was
+	virtual bool WantsDwarfInlineContexts() { return false; }
+	virtual bool ResolveTLSAddress(addr_target operand, CPURegisters* registers, addr_target& outAddr);
 	void RemoveTargetData();
 	virtual void ReportMemory(MemReporter* memReporter);
 

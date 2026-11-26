@@ -363,6 +363,7 @@ BfCompiler::BfCompiler(BfSystem* bfSystem, bool isResolveOnly)
 	mPassInstance = NULL;
 	mRevision = 0;
 	mUniqueId = 0;
+	mCompilerBuildDate = 0;
 	mLastRevisionAborted = false;
 	gBfCompiler = this;
 	mSystem = bfSystem;
@@ -431,6 +432,7 @@ BfCompiler::BfCompiler(BfSystem* bfSystem, bool isResolveOnly)
 	mGenericIEnumeratorTypeDef = NULL;
 	mGenericIRefEnumeratorTypeDef = NULL;
 	mInlineAttributeTypeDef = NULL;
+	mNoInlineAttributeTypeDef = NULL;
 	mThreadTypeDef = NULL;
 	mInternalTypeDef = NULL;
 	mPlatformTypeDef = NULL;
@@ -449,6 +451,10 @@ BfCompiler::BfCompiler(BfSystem* bfSystem, bool isResolveOnly)
 	mIOnMethodInitTypeDef = NULL;
 	mLinkNameAttributeTypeDef = NULL;
 	mCallingConventionAttributeTypeDef = NULL;
+	mCompilerOptionsPlatformTypeTypeDef = NULL;
+	mCompilerOptionsMachineTypeTypeDef = NULL;
+	mCompilerOptionsToolsetTypeTypeDef = NULL;
+	mCompilerOptionsOptLevelTypeDef = NULL;
 	mMethodRefTypeDef = NULL;
 	mNullableTypeDef = NULL;
 	mOrderedAttributeTypeDef = NULL;
@@ -517,14 +523,19 @@ bool BfCompiler::IsTypeAccessible(BfType* checkType, BfProject* curProject)
 	BfTypeInstance* typeInst = checkType->ToTypeInstance();
 	if (typeInst != NULL)
 	{
-		if (checkType->IsTuple())
+		// A closure's type is its delegate's, from the delegate's project, so what it captures decides who can see it
+		if ((checkType->IsTuple()) || (checkType->IsClosure()))
 		{
 			for (auto&& fieldInst : typeInst->mFieldInstances)
 			{
-				if (!IsTypeAccessible(fieldInst.mResolvedType, curProject))
+				if ((fieldInst.mResolvedType != NULL) && (!IsTypeAccessible(fieldInst.mResolvedType, curProject)))
 					return false;
 			}
 		}
+
+		// Nor does a closure carry its delegate's signature: that is its source delegate's
+		if ((checkType->IsClosure()) && (((BfClosureType*)typeInst)->mSrcDelegate != NULL) && (!IsTypeAccessible(((BfClosureType*)typeInst)->mSrcDelegate, curProject)))
+			return false;
 
 		auto genericTypeInst = typeInst->ToGenericTypeInstance();
 		if (genericTypeInst != NULL)
@@ -534,13 +545,27 @@ bool BfCompiler::IsTypeAccessible(BfType* checkType, BfProject* curProject)
 					return false;
 		}
 
+		auto delegateInfo = checkType->GetDelegateInfo();
+		if (delegateInfo != NULL)
+		{
+			if (!IsTypeAccessible(delegateInfo->mReturnType, curProject))
+				return false;
+			for (auto param : delegateInfo->mParams)
+				if (!IsTypeAccessible(param, curProject))
+					return false;
+		}
+
 		return curProject->ContainsReference(typeInst->mTypeDef->mProject);
 	}
 
 	if (checkType->IsPointer())
 		return IsTypeAccessible(((BfPointerType*)checkType)->mElementType, curProject);
 	if (checkType->IsRef())
-		return IsTypeAccessible(((BfPointerType*)checkType)->mElementType, curProject);
+		return IsTypeAccessible(((BfRefType*)checkType)->mElementType, curProject);
+	if (checkType->IsSizedArray())
+		return IsTypeAccessible(((BfSizedArrayType*)checkType)->mElementType, curProject);
+	if (checkType->IsMethodRef())
+		return IsTypeAccessible(((BfMethodRefType*)checkType)->mOwner, curProject);
 
 	return true;
 }
@@ -567,20 +592,33 @@ bool BfCompiler::IsTypeUsed(BfType* checkType, BfProject* curProject, bool conse
 		if (checkType->IsUnspecializedType())
 			return typeInst->mIsReified || conservativeCheck;
 
-		if (checkType->IsTuple())
+		if ((checkType->IsTuple()) || (checkType->IsClosure()))
 		{
 			for (auto&& fieldInst : typeInst->mFieldInstances)
 			{
-				if (!IsTypeUsed(fieldInst.mResolvedType, curProject, true))
+				if ((fieldInst.mResolvedType != NULL) && (!IsTypeUsed(fieldInst.mResolvedType, curProject, true)))
 					return false;
 			}
 		}
+
+		if ((checkType->IsClosure()) && (((BfClosureType*)typeInst)->mSrcDelegate != NULL) && (!IsTypeUsed(((BfClosureType*)typeInst)->mSrcDelegate, curProject, true)))
+			return false;
 
 		auto genericTypeInst = typeInst->ToGenericTypeInstance();
 		if (genericTypeInst != NULL)
 		{
 			for (auto genericArg : genericTypeInst->mGenericTypeInfo->mTypeGenericArguments)
 				if (!IsTypeUsed(genericArg, curProject, true))
+					return false;
+		}
+
+		auto delegateInfo = checkType->GetDelegateInfo();
+		if (delegateInfo != NULL)
+		{
+			if (!IsTypeUsed(delegateInfo->mReturnType, curProject, true))
+				return false;
+			for (auto param : delegateInfo->mParams)
+				if (!IsTypeUsed(param, curProject, true))
 					return false;
 		}
 
@@ -601,6 +639,10 @@ bool BfCompiler::IsTypeUsed(BfType* checkType, BfProject* curProject, bool conse
 		return IsTypeUsed(((BfPointerType*)checkType)->mElementType, curProject);
 	if (checkType->IsRef())
 		return IsTypeUsed(((BfRefType*)checkType)->mElementType, curProject);
+	if (checkType->IsSizedArray())
+		return IsTypeUsed(((BfSizedArrayType*)checkType)->mElementType, curProject);
+	if (checkType->IsMethodRef())
+		return IsTypeUsed(((BfMethodRefType*)checkType)->mOwner, curProject);
 
 	return true;
 }
@@ -623,7 +665,8 @@ void BfCompiler::FixVDataHash(BfModule* bfModule)
 		HASH128_MIXIN(bfModule->mDataHash, bfModule->mHighestUsedStringId);*/
 }
 
-void BfCompiler::CheckModuleStringRefs(BfModule* module, BfVDataModule* vdataModule, int lastModuleRevision, HashSet<int>& foundStringIds, HashSet<int>& dllNameSet, Array<BfMethodInstance*>& dllMethods, Array<BfCompiler::StringValueEntry>& stringValueEntries)
+void BfCompiler::CheckModuleStringRefs(BfModule* module, BfVDataModule* vdataModule, int lastModuleRevision, HashSet<int>& foundStringIds, HashSet<int>& vdataStringIds,
+	HashSet<int>& dllNameSet, Array<BfMethodInstance*>& dllMethods, Array<BfCompiler::StringValueEntry>& stringValueEntries)
 {
 	for (int stringId : module->mStringPoolRefs)
 	{
@@ -641,7 +684,10 @@ void BfCompiler::CheckModuleStringRefs(BfModule* module, BfVDataModule* vdataMod
 			stringEntry.mId = stringId;
 
 			vdataModule->mDefinedStrings.Add(stringId);
-			stringEntry.mStringVal = vdataModule->CreateStringObjectValue(stringPoolEntry.mString, stringId, true);
+			if (vdataStringIds.Contains(stringId))
+				stringEntry.mStringVal = vdataModule->GetStringObjectValue(stringPoolEntry.mString, stringId, false);
+			else
+				stringEntry.mStringVal = vdataModule->CreateStringObjectValue(stringPoolEntry.mString, stringId, true);
 			stringValueEntries.Add(stringEntry);
 
 			CompileLog("String %d %s\n", stringId, stringPoolEntry.mString.c_str());
@@ -657,12 +703,12 @@ void BfCompiler::CheckModuleStringRefs(BfModule* module, BfVDataModule* vdataMod
 	auto altModule = module->mNextAltModule;
 	while (altModule != NULL)
 	{
-		CheckModuleStringRefs(altModule, vdataModule, lastModuleRevision, foundStringIds, dllNameSet, dllMethods, stringValueEntries);
+		CheckModuleStringRefs(altModule, vdataModule, lastModuleRevision, foundStringIds, vdataStringIds, dllNameSet, dllMethods, stringValueEntries);
 		altModule = altModule->mNextAltModule;
 	}
 
 	for (auto& specModulePair : module->mSpecializedMethodModules)
-		CheckModuleStringRefs(specModulePair.mValue, vdataModule, lastModuleRevision, foundStringIds, dllNameSet, dllMethods, stringValueEntries);
+		CheckModuleStringRefs(specModulePair.mValue, vdataModule, lastModuleRevision, foundStringIds, vdataStringIds, dllNameSet, dllMethods, stringValueEntries);
 }
 
 void BfCompiler::HashModuleVData(BfModule* module, HashContext& vdataHash)
@@ -1416,6 +1462,13 @@ void BfCompiler::CreateVData(BfVDataModule* bfModule)
 		return;
 	}
 
+	// mDefinedStrings mirrors the literals in the executable being debugged, and hot compiles skip emitting anything in it.
+	//  We're about to regenerate those from scratch below, so any literal that is no longer referenced won't be in the new
+	//  executable - keeping it here would make a later hot compile skip it and fail to resolve its __bfStrObj symbol.
+	//  Note this is after the "VData unchanged" return above, since then the executable keeps the literals it already had.
+	if (!isHotCompile)
+		bfModule->mDefinedStrings.Clear();
+
 	auto typeResolveModule = mContext->mUnreifiedModule;
 	BfTypeInstance* stringType = typeResolveModule->ResolveTypeDef(mStringTypeDef, BfPopulateType_Data)->ToTypeInstance();
 	BfTypeInstance* stringViewType = typeResolveModule->ResolveTypeDef(mStringViewTypeDef, BfPopulateType_Data)->ToTypeInstance();
@@ -1546,6 +1599,18 @@ void BfCompiler::CreateVData(BfVDataModule* bfModule)
 		}
 	}
 
+	// Devirtualized calls (ie: 'base.Method()') route through a thunk when a type extension may
+	//  supply a different override - each executable's vdata resolves that thunk for itself.
+	for (auto type : vdataTypeList)
+	{
+		if ((!type->IsReified()) || (type->IsUnspecializedType()) || (type->IsTypeAlias()))
+			continue;
+		auto typeInst = type->ToTypeInstance();
+		if (typeInst == NULL)
+			continue;
+		bfModule->CreateDevirtThunks(typeInst);
+	}
+
 	for (int typeId = 0; typeId < (int)typeDataVector.size(); typeId++)
 	{
 		if (!typeDataVector[typeId])
@@ -1567,12 +1632,8 @@ void BfCompiler::CreateVData(BfVDataModule* bfModule)
 		BfMangler::MangleStaticFieldName(typeCountVariableName, GetMangleKind(), typeDefType->ToTypeInstance(), "sTypeCount", bfModule->GetPrimitiveType(BfTypeCode_Int32));
 		bfModule->mBfIRBuilder->CreateGlobalVariable(bfModule->mBfIRBuilder->MapType(bfModule->GetPrimitiveType(BfTypeCode_Int32)), true, BfIRLinkageType_External,
 			bfModule->mBfIRBuilder->CreateConst(BfTypeCode_Int32, (int)typeDataVector.size()), typeCountVariableName);
-	}
-
-	HashSet<int> foundStringIds;
-	for (int stringId : bfModule->mStringPoolRefs)
-		foundStringIds.Add(stringId);
-
+	}	
+	
 	Array<BfModule*> orderedUsedModules;
 	for (auto module : usedModuleSet)
 		orderedUsedModules.push_back(module);
@@ -1584,18 +1645,23 @@ void BfCompiler::CreateVData(BfVDataModule* bfModule)
 	Array<BfMethodInstance*> dllMethods;
 
 	Array<BfIRValue> forceLinkValues;
+	
+	HashSet<int> vdataStringIds;
+	for (int stringId : bfModule->mStringPoolRefs)
+		vdataStringIds.Add(stringId);
 
+	HashSet<int> foundStringIds;
 	HashSet<int> dllNameSet;
 	Array<BfCompiler::StringValueEntry> stringValueEntries;
 	for (auto module : orderedUsedModules)
 	{
-		CheckModuleStringRefs(module, bfModule, lastModuleRevision, foundStringIds, dllNameSet, dllMethods, stringValueEntries);
+		CheckModuleStringRefs(module, bfModule, lastModuleRevision, foundStringIds, vdataStringIds, dllNameSet, dllMethods, stringValueEntries);
 
 		if ((module->mHasForceLinkMarker) &&
 			((!isHotCompile) || (module->mHadHotObjectWrites)) &&
 			(mOptions.mPlatformType != BfPlatformType_Wasm))
 			forceLinkValues.Add(bfModule->CreateForceLinkMarker(module, NULL));
-	}
+	}		
 
 	if (!forceLinkValues.IsEmpty())
 	{
@@ -1622,10 +1688,23 @@ void BfCompiler::CreateVData(BfVDataModule* bfModule)
 		auto stringPtrType = bfModule->CreatePointerType(stringType);
 		auto stringPtrIRType = bfModule->mBfIRBuilder->MapTypeInstPtr(stringType);
 
+		BfIRType int32Type = bfModule->mBfIRBuilder->MapType(bfModule->GetPrimitiveType(BfTypeCode_Int32));
+
+		//
+		StringT<128> stringsIdsVariableName;
+		BfMangler::MangleStaticFieldName(stringsIdsVariableName, GetMangleKind(), stringType->ToTypeInstance(), "sStringIds", stringPtrType);
+		Array<BfIRValue> stringIdList;
+		for (auto& stringValueEntry : stringValueEntries)
+			stringIdList.Add(bfModule->mBfIRBuilder->CreateConst(BfTypeCode_Int32, stringValueEntry.mId));		
+		BfIRType stringIdArrayType = bfModule->mBfIRBuilder->GetSizedArrayType(int32Type, (int)stringIdList.size());
+		auto stringIdArray = bfModule->mBfIRBuilder->CreateConstAgg_Value(stringIdArrayType, stringIdList);		
+		auto stringIdArrayVar = bfModule->mBfIRBuilder->CreateGlobalVariable(stringIdArrayType, true, BfIRLinkageType_Internal, stringIdArray, stringsIdsVariableName);
+		
 		StringT<128> stringsVariableName;
 		BfMangler::MangleStaticFieldName(stringsVariableName, GetMangleKind(), stringType->ToTypeInstance(), "sStringLiterals", stringPtrType);
 		Array<BfIRValue> stringList;
 		stringList.Add(bfModule->mBfIRBuilder->CreateConstNull(stringPtrIRType));
+		stringList.Add(bfModule->mBfIRBuilder->CreateBitCast(stringIdArrayVar, stringPtrIRType));
 		for (auto& stringValueEntry : stringValueEntries)
 			stringList.Add(stringValueEntry.mStringVal);
 		stringList.Add(bfModule->mBfIRBuilder->CreateConstNull(stringPtrIRType));
@@ -1639,7 +1718,7 @@ void BfCompiler::CreateVData(BfVDataModule* bfModule)
 		{
 			auto dbgArrayType = bfModule->mBfIRBuilder->DbgCreateArrayType(stringList.size() * mSystem->mPtrSize * 8, mSystem->mPtrSize * 8, bfModule->mBfIRBuilder->DbgGetType(stringPtrType), (int)stringList.size());
 			bfModule->mBfIRBuilder->DbgCreateGlobalVariable(bfModule->mDICompileUnit, stringsVariableName, stringsVariableName, BfIRMDNode(), 0, dbgArrayType, false, stringArrayVar);
-		}
+		}		
 	}
 
 	// Generate string ID array
@@ -1830,7 +1909,7 @@ void BfCompiler::CreateVData(BfVDataModule* bfModule)
 		(mOptions.mPlatformType != BfPlatformType_Windows);
 
 	bool mainHasArgs = (targetType != BfTargetType_BeefLib_DynamicLib) && (targetType != BfTargetType_BeefLib_StaticLib) &&
-		(mOptions.mPlatformType != BfPlatformType_Wasm);
+		((isConsoleApplication) || (mOptions.mPlatformType != BfPlatformType_Wasm));
 	bool mainHasRet = ((targetType != BfTargetType_BeefLib_DynamicLib) && (targetType != BfTargetType_BeefLib_StaticLib)) || (isDllMain);
 
 	// Generate "main"
@@ -3069,6 +3148,12 @@ void BfCompiler::GenerateDynCastData()
 	firstDerivedIds.Resize(mCurTypeId);
 	nextSiblingIds.Resize(mCurTypeId);
 
+	// The sibling order decides every inheritance id, so link siblings in a stable order rather
+	//  than mResolvedTypes' hash order, which varies between runs and would change the type data
+	//  on every build. Linking prepends, so sorting by descending type id visits siblings in
+	//  ascending order: a newly added type usually has a high id and lands after its siblings,
+	//  moving fewer existing ids.
+	Array<BfTypeInstance*> derivedTypes;
 	for (auto type : mContext->mResolvedTypes)
 	{
 		if (type->IsBoxed())
@@ -3081,6 +3166,15 @@ void BfCompiler::GenerateDynCastData()
 		if (typeInst->mBaseType == NULL)
 			continue;
 
+		derivedTypes.Add(typeInst);
+	}
+	std::sort(derivedTypes.begin(), derivedTypes.end(), [](BfTypeInstance* lhs, BfTypeInstance* rhs)
+		{
+			return lhs->mTypeId > rhs->mTypeId;
+		});
+
+	for (auto typeInst : derivedTypes)
+	{
 		int baseId = typeInst->mBaseType->mTypeId;
 		int firstDerivedId = firstDerivedIds[baseId];
 
@@ -4359,7 +4453,17 @@ void BfCompiler::ProcessAutocompleteTempType()
 		return;
 	}
 
+	// We can be running nested inside an in-flight compile (during one of its lock yields) that has been canceled.
+	//  That compile needs to resume in the fast-finish state it yielded in, otherwise it's left canceled but not
+	//  fast-finishing and its comptime calls run to completion instead of bailing out and deferring their rebuild.
+	//  Comptime execution here will have cleared the 'special check' flag, so that gets re-armed as well.
+	bool prevFastFinish = mFastFinish;
 	mFastFinish = false;
+	defer(
+	{
+		if (prevFastFinish)
+			RequestFastFinish();
+	});
 
 	SetAndRestoreValue<BfMethodState*> prevMethodState(module->mCurMethodState, NULL);
 	SetAndRestoreValue<BfTypeInstance*> prevTypeInstance(module->mCurTypeInstance, NULL);
@@ -5688,6 +5792,7 @@ void BfCompiler::ClearUnusedStringPoolEntries()
 		{
 			CompileLog("Clearing unused string: %d %s\n", itr->mKey, stringPoolEntry.mString.c_str());
 			mContext->mStringObjectPool.Remove(stringPoolEntry.mString);
+			mContext->mStringStableIdMap.Remove(stringPoolEntry.mStableId);
 			itr = mContext->mStringObjectIdMap.Remove(itr);
 		}
 		else
@@ -5775,7 +5880,8 @@ bool BfCompiler::DoWorkLoop(bool onlyReifiedTypes, bool onlyReifiedMethods)
 
 BfMangler::MangleKind BfCompiler::GetMangleKind()
 {
-	if (mOptions.mToolsetType == BfToolsetType_GNU)
+	if ((mOptions.mToolsetType == BfToolsetType_GNU) ||
+		((mOptions.mPlatformType == BfPlatformType_Linux) && (mOptions.mToolsetType == BfToolsetType_LLVM)))
 		return BfMangler::MangleKind_GNU;
 	return (mSystem->mPtrSize == 8) ? BfMangler::MangleKind_Microsoft_64 : BfMangler::MangleKind_Microsoft_32;
 }
@@ -6032,7 +6138,8 @@ void BfCompiler::PopulateReified()
 										{
 											if ((methodDef->mIsOverride) && (methodDef->mParams.mSize == declaringMethod->mMethodDef->mParams.mSize))
 											{
-												auto implMethod = typeInst->mModule->GetRawMethodInstance(typeInst, methodDef);
+												// 'methodDef' is from checkTypeInst's method set, so mIdx indexes that type's methods
+												auto implMethod = typeInst->mModule->GetRawMethodInstance(checkTypeInst, methodDef);
 												if ((implMethod != NULL) && (typeInst->mModule->CompareMethodSignatures(declaringMethod, implMethod)))
 												{
 													if ((implMethod != NULL) && ((!implMethod->mMethodInstanceGroup->IsImplemented()) || (!implMethod->mIsReified)))
@@ -6233,6 +6340,7 @@ void BfCompiler::HotCommit()
 		return;
 
 	mHotState->mCommittedHotCompileIdx = mOptions.mHotCompileIdx;
+	mHotState->mUncommittedOutFiles.Clear();
 
 	for (auto type : mContext->mResolvedTypes)
 	{
@@ -7249,7 +7357,7 @@ bool BfCompiler::DoCompile(const StringImpl& outputDirectory)
 			}
 		}
 
-		if (corlibProject == NULL)
+		if ((corlibProject == NULL) && (typeDef != NULL))
 			corlibProject = typeDef->mProject;
 		return typeDef;
 	};
@@ -7316,6 +7424,7 @@ bool BfCompiler::DoCompile(const StringImpl& outputDirectory)
 	mGenericIEnumeratorTypeDef = _GetRequiredType("System.Collections.IEnumerator", 1);
 	mGenericIRefEnumeratorTypeDef = _GetRequiredType("System.Collections.IRefEnumerator", 1);
 	mInlineAttributeTypeDef = _GetRequiredType("System.InlineAttribute");
+	mNoInlineAttributeTypeDef = _GetRequiredType("System.NoInlineAttribute");
 	mThreadTypeDef = _GetRequiredType("System.Threading.Thread");
 	mInternalTypeDef = _GetRequiredType("System.Internal");
 	mPlatformTypeDef = _GetRequiredType("System.Platform");
@@ -7332,6 +7441,11 @@ bool BfCompiler::DoCompile(const StringImpl& outputDirectory)
 	mIOnTypeDoneTypeDef = _GetRequiredType("System.IOnTypeDone");
 	mIOnFieldInitTypeDef = _GetRequiredType("System.IOnFieldInit");
 	mIOnMethodInitTypeDef = _GetRequiredType("System.IOnMethodInit");
+
+	mCompilerOptionsPlatformTypeTypeDef = _GetRequiredType("System.Compiler.Options.PlatformType");
+	mCompilerOptionsMachineTypeTypeDef = _GetRequiredType("System.Compiler.Options.MachineType");
+	mCompilerOptionsToolsetTypeTypeDef = _GetRequiredType("System.Compiler.Options.ToolsetType");
+	mCompilerOptionsOptLevelTypeDef = _GetRequiredType("System.Compiler.Options.OptLevel");
 
 	mLinkNameAttributeTypeDef = _GetRequiredType("System.LinkNameAttribute");
 	mCallingConventionAttributeTypeDef = _GetRequiredType("System.CallingConventionAttribute");
@@ -7410,11 +7524,7 @@ bool BfCompiler::DoCompile(const StringImpl& outputDirectory)
 				mPassInstance->Fail(StrFormat("Project '%s' must reference core library '%s'", bfProject->mName.c_str(), mBfObjectTypeDef->mProject->mName.c_str()));
 			}
 
-			if ((bfProject->mTargetType != BfTargetType_BeefConsoleApplication) && (bfProject->mTargetType != BfTargetType_BeefWindowsApplication) &&
-				(bfProject->mTargetType != BfTargetType_BeefLib_DynamicLib) && (bfProject->mTargetType != BfTargetType_BeefLib_StaticLib) &&
-				(bfProject->mTargetType != BfTargetType_C_ConsoleApplication) && (bfProject->mTargetType != BfTargetType_C_WindowsApplication) &&
-				(bfProject->mTargetType != BfTargetType_BeefTest) &&
-				(bfProject->mTargetType != BfTargetType_BeefApplication_StaticLib) && (bfProject->mTargetType != BfTargetType_BeefApplication_DynamicLib))
+			if (!bfProject->IsFinalProgramTarget())
 				continue;
 
 			if (bfProject->mTargetType == BfTargetType_BeefTest)
@@ -9917,6 +10027,12 @@ BF_EXPORT const char* BF_CALLTYPE BfCompiler_GetCollapseRegions(BfCompiler* bfCo
 	String& outString = *gTLStrReturn.Get();
 	outString.Clear();
 
+	if (bfCompiler->mValueTypeTypeDef == NULL)
+	{
+		// Sanity check. Resolve compiler not started
+		return outString.c_str();
+	}
+
 	class CollapseVisitor : public BfElementVisitor
 	{
 	public:
@@ -10629,6 +10745,13 @@ BF_EXPORT void BF_CALLTYPE BfCompiler_ClearBuildCache(BfCompiler* bfCompiler)
 	bfCompiler->ClearBuildCache();
 }
 
+BF_EXPORT void BF_CALLTYPE BfCompiler_SetCompilerInfo(BfCompiler* bfCompiler, const char* compilerPath, const char* compilerVersion, int64 compilerBuildDate)
+{
+	bfCompiler->mCompilerPath = compilerPath;
+	bfCompiler->mCompilerVersion = compilerVersion;
+	bfCompiler->mCompilerBuildDate = compilerBuildDate;
+}
+
 BF_EXPORT void BF_CALLTYPE BfCompiler_SetBuildValue(BfCompiler* bfCompiler, char* cacheDir, char* key, char* value)
 {
 	bfCompiler->mCodeGen.SetBuildValue(cacheDir, key, value);
@@ -10970,6 +11093,15 @@ BF_EXPORT const char* BF_CALLTYPE BfCompiler_GetUsedOutputFileNames(BfCompiler* 
 	if (bfCompiler->mHotState != NULL)
 	{
 		Array<String> outPaths;
+		HashSet<String> outPathSet;
+
+		for (auto& fileEntry : bfCompiler->mHotState->mUncommittedOutFiles)
+		{
+			if (fileEntry.mProject != bfProject)
+				continue;
+			if (outPathSet.Add(fileEntry.mFileName))
+				outPaths.Add(fileEntry.mFileName);
+		}
 
 		for (int i = 0; i < (int)bfCompiler->mHotState->mQueuedOutFiles.size(); i++)
 		{
@@ -10978,10 +11110,12 @@ BF_EXPORT const char* BF_CALLTYPE BfCompiler_GetUsedOutputFileNames(BfCompiler* 
 				continue;
 			if (!bfCompiler->mHotState->mHotProject->mUsedModules.Contains(fileEntry.mModule))
 				continue;
-			outPaths.Add(fileEntry.mFileName);
+			if (outPathSet.Add(fileEntry.mFileName))
+				outPaths.Add(fileEntry.mFileName);
 
 			if ((flags & BfUsedOutputFlags_FlushQueuedHotFiles) != 0)
 			{
+				bfCompiler->mHotState->mUncommittedOutFiles.Add(fileEntry);
 				bfCompiler->mHotState->mQueuedOutFiles.RemoveAtFast(i);
 				i--;
 			}
@@ -11042,6 +11176,7 @@ BF_EXPORT const char* BF_CALLTYPE BfCompiler_GetSymbolReferences(BfCompiler* bfC
 	outString.clear();
 	SetAndRestoreValue<BfResolvePassData*> prevCompilerResolvePassData(bfCompiler->mResolvePassData, resolvePassData);
 	SetAndRestoreValue<BfPassInstance*> prevPassInstance(bfCompiler->mPassInstance, bfPassInstance);
+	int localMethodStartIdx = bfCompiler->mContext->mLocalMethodGraveyard.mSize;
 	bfCompiler->GetSymbolReferences();
 
 	std::map<String, String*> sortedParserMap;
@@ -11057,6 +11192,10 @@ BF_EXPORT const char* BF_CALLTYPE BfCompiler_GetSymbolReferences(BfCompiler* bfC
 			outString += "\n";
 		outString += parserData.first + "\t" + *(parserData.second);
 	}
+	// Reference searches process method bodies without running a full compile's cleanup.
+	// Retire their temporary local methods now, or each search can pin an old source AST.
+	// Leave pre-existing entries alone: they may belong to another compiler operation.
+	bfCompiler->mContext->CleanupLocalMethods(localMethodStartIdx);
 	return outString.c_str();
 }
 
@@ -11154,19 +11293,24 @@ BF_EXPORT void BF_CALLTYPE BfCompiler_SetOptions(BfCompiler* bfCompiler, BfProje
 	options->mHotCompileIdx = hotIdx;
 	options->mTargetTriple = targetTriple;
 	options->mTargetCPU = targetCPU;
+	// The legacy entry point establishes defaults; SetMathOptions overrides these.
+	options->mFloatingPointMode = BfFloatingPointMode_Precise;
+	options->mFMASetting = BfFMASetting_TargetDefault;
 
-	if (options->mTargetTriple.StartsWith("x86_64-"))
+	if (options->mTargetTriple.StartsWith("x86_64-", StringImpl::CompareKind_OrdinalIgnoreCase))
 		options->mMachineType = BfMachineType_x64;
-	else if (options->mTargetTriple.StartsWith("i686-"))
+	else if ((options->mTargetTriple.StartsWith("i686-", StringImpl::CompareKind_OrdinalIgnoreCase)) || (options->mTargetTriple.StartsWith("i386-", StringImpl::CompareKind_OrdinalIgnoreCase)))
 		options->mMachineType = BfMachineType_x86;
-	else if ((options->mTargetTriple.StartsWith("arm64")) || (options->mTargetTriple.StartsWith("aarch64")))
+	else if ((options->mTargetTriple.StartsWith("arm64", StringImpl::CompareKind_OrdinalIgnoreCase)) || (options->mTargetTriple.StartsWith("aarch64", StringImpl::CompareKind_OrdinalIgnoreCase)))
 		options->mMachineType = BfMachineType_AArch64;
-	else if (options->mTargetTriple.StartsWith("armv"))
+	else if (options->mTargetTriple.StartsWith("armv", StringImpl::CompareKind_OrdinalIgnoreCase))
 		options->mMachineType = BfMachineType_ARM;
-	else if (options->mTargetTriple.StartsWith("wasm32"))
+	else if (options->mTargetTriple.StartsWith("wasm32", StringImpl::CompareKind_OrdinalIgnoreCase))
 		options->mMachineType = BfMachineType_Wasm32;
-	else if (options->mTargetTriple.StartsWith("wasm64"))
+	else if (options->mTargetTriple.StartsWith("wasm64", StringImpl::CompareKind_OrdinalIgnoreCase))
 		options->mMachineType = BfMachineType_Wasm64;
+	else if (options->mTargetTriple.EndsWith("32"))
+		options->mMachineType = BfMachineType_Wasm32;
 	else
 		options->mMachineType = BfMachineType_x64; // Default
 
@@ -11262,6 +11406,14 @@ BF_EXPORT void BF_CALLTYPE BfCompiler_SetOptions(BfCompiler* bfCompiler, BfProje
 		options->mEmitDynamicCastCheck = false;
 		options->mRuntimeChecks = (optionFlags & BfCompilerOptionFlag_RuntimeChecks) != 0;
 	}
+}
+
+BF_EXPORT void BF_CALLTYPE BfCompiler_SetMathOptions(BfCompiler* bfCompiler, int32 floatingPointMode, int32 fmaSetting)
+{
+	bfCompiler->mOptions.mFloatingPointMode = (floatingPointMode == BfFloatingPointMode_NotSet) ?
+		BfFloatingPointMode_Precise : (BfFloatingPointMode)floatingPointMode;
+	bfCompiler->mOptions.mFMASetting = (fmaSetting == BfFMASetting_NotSet) ?
+		BfFMASetting_TargetDefault : (BfFMASetting)fmaSetting;
 }
 
 BF_EXPORT void BF_CALLTYPE BfCompiler_ForceRebuild(BfCompiler* bfCompiler)

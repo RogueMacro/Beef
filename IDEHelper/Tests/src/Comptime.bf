@@ -315,6 +315,42 @@ namespace Tests
 		const String cTest1 = new String('A', 12);
 		const uint8[?] cTest0Binary = Compiler.ReadBinary("Test0.txt");
 
+		class MethodSource
+		{
+			public static void Alpha() { }
+			public static void Beta() { }
+		}
+
+		// TypeInstance.GetMethod(int) is overridden by an extension that reads the
+		// runtime method table, which does not exist at comptime. Without a comptime
+		// branch in that override every index answers NoResults for a type whose
+		// methods are all present, and Comptime_GetMethodCount still reports them.
+		struct ComptimeMethodLookup
+		{
+			[OnCompile(.TypeInit), Comptime]
+			static void Generate()
+			{
+				let source = (TypeInstance)typeof(MethodSource);
+
+				int found = 0;
+				int named = 0;
+				for (int i < 64)
+				{
+					if (source.GetMethod(i) case .Ok(let method))
+					{
+						found++;
+						if ((method.Name == "Alpha") || (method.Name == "Beta"))
+							named++;
+					}
+				}
+
+				Compiler.EmitTypeBody(typeof(Self), scope $"""
+					public const int cFound = {found};
+					public const int cNamed = {named};
+					""");
+			}
+		}
+
 		class ClassB<T> where T : const int
 		{
 			public typealias TA = comptype(GetVal(10, T));
@@ -528,6 +564,112 @@ namespace Tests
 		{
 		}
 
+		class DeclWalks
+		{
+			[Comptime]
+			static int CountDecls()
+			{
+				int count = 0;
+				for (let decl in Type.TypeDeclarations)
+					count++;
+				return count;
+			}
+
+			[OnCompile(.TypeInit), Comptime]
+			static void Init()
+			{
+				// Two enumerations in one evaluation see the same declarations
+				int first = CountDecls();
+				int second = CountDecls();
+				Compiler.EmitTypeBody(typeof(Self), scope $"public const int cFirst = {first}; public const int cSecond = {second};");
+			}
+		}
+
+		[Reflect, AlwaysInclude(IncludeAllMethods=true)]
+		class WithDefaults
+		{
+			public enum Mode { Off, On }
+
+			public static void Method(int a, float b = 1.5f, Mode m = .On, String s = "x", int c = ClassB.mA) {}
+		}
+
+		class ParamDefaults
+		{
+			[Comptime]
+			static bool HasDefault(int paramIdx)
+			{
+				let method = typeof(WithDefaults).GetMethod("Method").Value;
+				return method.GetParamFlags(paramIdx).HasFlag(.HasDefault);
+			}
+
+			[OnCompile(.TypeInit), Comptime]
+			static void Init()
+			{
+				let text = scope String();
+				for (int i = 0; i < 5; i++)
+					text.AppendF("public const bool cHasDefault{} = {};\n", i, HasDefault(i) ? "true" : "false");
+				Compiler.EmitTypeBody(typeof(Self), text);
+			}
+		}
+
+		/// A comptime job whose memory outgrows what a context carries over, so the context
+		/// that runs the next attribute starts from a bare stack and the attribute's own
+		/// allocation is the one that has to grow the buffer
+		class BigComptimeJob
+		{
+			[OnCompile(.TypeInit), Comptime]
+			static void Init()
+			{
+				let bytes = new uint8[9 * 1024 * 1024];
+				bytes[bytes.Count - 1] = 1;
+				Compiler.EmitTypeBody(typeof(Self), scope $"public const int cLast = {bytes[bytes.Count - 1]};\n");
+				delete bytes;
+			}
+		}
+
+		[AttributeUsage(.Class)]
+		struct StampAttribute : Attribute, IComptimeTypeApply
+		{
+			int32 mValue;
+
+			public this(int32 value)
+			{
+				mValue = value;
+			}
+
+			[Comptime]
+			public void ApplyToType(Type type)
+			{
+				Compiler.EmitTypeBody(type, scope $"public const int32 cStamp = {mValue};\n");
+			}
+		}
+
+		/// The field forces BigComptimeJob first; the attribute is then constructed in a
+		/// context whose buffer was reallocated by that very allocation, which is where an
+		/// unsequenced 'alloc - base' read the base from before the move
+		[Stamp(77)]
+		class StampedAfterBigJob
+		{
+			public BigComptimeJob mJob;
+		}
+
+		/// The alias is what the generator reflects; the function type it names is used
+		/// nowhere else, so the reflection is what has to populate it.
+		public typealias UnusedFactory = function int32(int32 a);
+
+		class AliasReflection
+		{
+			[OnCompile(.TypeInit), Comptime]
+			static void Init()
+			{
+				let alias = typeof(UnusedFactory);
+				let text = scope String();
+				text.AppendF("public const int32 cAliasId = {};\n", (int32)alias.TypeId);
+				text.AppendF("public const int32 cUnderlyingId = {};\n", (int32)alias.UnderlyingType.TypeId);
+				Compiler.EmitTypeBody(typeof(Self), text);
+			}
+		}
+
 		struct Pos3f : Float3
 		{
 			[OnCompile(.TypeInit), Comptime]
@@ -636,6 +778,9 @@ namespace Tests
 			Test.Assert((Object)cTest1 == (Object)"AAAAAAAAAAAA");
 			Test.Assert((cTest0Binary[0] == (.)'T') && ((cTest0Binary.Count == 6) || (cTest0Binary.Count == 7)));
 
+			Test.Assert(ComptimeMethodLookup.cFound > 0);
+			Test.Assert(ComptimeMethodLookup.cNamed == 2);
+
 			ClassB<const 3>.TA f = default;
 			Test.Assert(typeof(decltype(f)) == typeof(float));
 			Test.Assert(ClassB<const 3>.cTimesTen == 30);
@@ -683,6 +828,203 @@ namespace Tests
 
 			const int cVal = GetLocalVal2();
 			Test.Assert(cVal == 102);
+
+			Test.Assert(DeclWalks.cFirst > 0);
+			Test.Assert(DeclWalks.cSecond == DeclWalks.cFirst);
+			// The declaration's defaults, as a flag: at comptime through the emitted constants, and
+			// at runtime through the same accessor
+			Test.Assert(!ParamDefaults.cHasDefault0);
+			Test.Assert(ParamDefaults.cHasDefault1);
+			Test.Assert(ParamDefaults.cHasDefault2);
+			Test.Assert(ParamDefaults.cHasDefault3);
+			Test.Assert(ParamDefaults.cHasDefault4);
+			let method = typeof(WithDefaults).GetMethod("Method").Value;
+			Test.Assert(!method.GetParamFlags(0).HasFlag(.HasDefault));
+			Test.Assert(method.GetParamFlags(1).HasFlag(.HasDefault));
+			Test.Assert(method.GetParamFlags(4).HasFlag(.HasDefault));
+			// An attribute constructed right after a job that made the context grow
+			Test.Assert(BigComptimeJob.cLast == 1);
+			Test.Assert(StampedAfterBigJob.cStamp == 77);
+			// Reflecting an alias at comptime populates the type it names
+			Test.Assert(AliasReflection.cAliasId != 0);
+			Test.Assert(AliasReflection.cUnderlyingId != 0);
+			Test.Assert(AliasReflection.cUnderlyingId != AliasReflection.cAliasId);
+		}
+
+		// A zero-length copy or set is a no-op whatever the addresses, but comptime treated a null one (as an empty span
+		//  has) as an access violation
+		[Comptime]
+		static int ZeroLengthMemOps()
+		{
+			Span<int> empty = default;
+			empty.CopyTo(Span<int>());
+			Internal.MemCpy(null, null, 0);
+			Internal.MemSet(null, 0, 0);
+			int size = empty.Length;
+			Internal.MemCpy(null, empty.Ptr, size);
+			Internal.MemSet(empty.Ptr, 0, size);
+			List<int> list = scope .();
+			list.AddRange(empty);
+			return list.Count + 1;
+		}
+
+		const int cZeroLengthMemOps = ZeroLengthMemOps();
+
+		[Test]
+		public static void TestZeroLengthMemOps()
+		{
+			Test.Assert(cZeroLengthMemOps == 1);
+		}
+
+		/// Reads its base's methods while it is applied, the way a generator asks whether an
+		///  ancestor already declares a member
+		[AttributeUsage(.Class)]
+		struct ReadsBaseMethodsAttribute : Attribute, IComptimeTypeApply
+		{
+			[Comptime]
+			public void ApplyToType(Type type)
+			{
+				int count = 0;
+				for (let m in type.BaseType.GetMethods(.Public | .Instance | .DeclaredOnly))
+				{
+					Test.Assert(m.ReturnType != null);
+					for (int paramIdx < m.ParamCount)
+						Test.Assert(m.GetParamType(paramIdx) != null);
+					count++;
+				}
+				Compiler.EmitTypeBody(type, scope $"public const int cBaseMethodsSeen = {count};\n");
+			}
+		}
+
+		/// Declaring Make populates CycleDerived, whose generator reads this type's methods before
+		///  they are all declared
+		class CycleBase
+		{
+			public int First => 1;
+			public int Before(int value) => value;
+			public CycleDerived Make(int value) => null;
+			public int Second => 2;
+		}
+
+		/// CycleBase's members without the cycle
+		class CycleTwin
+		{
+			public int First => 1;
+			public int Before(int value) => value;
+			public Object Make(int value) => null;
+			public int Second => 2;
+		}
+
+		[ReadsBaseMethods]
+		class CycleDerived : CycleBase
+		{
+		}
+
+		[Comptime]
+		static int CountDeclaredMethods(Type type)
+		{
+			int count = 0;
+			for (let m in type.GetMethods(.Public | .Instance | .DeclaredOnly))
+			{
+				Test.Assert(m.ReturnType != null);
+				for (int paramIdx < m.ParamCount)
+					Test.Assert(m.GetParamType(paramIdx) != null);
+				count++;
+			}
+			return count;
+		}
+
+		class ScopeCycleOwner
+		{
+			public int Before(int value) => value;
+			public ScopeCycleScope BeginScope() => default;
+		}
+
+		struct ScopeCycleScope
+		{
+			[OnCompile(.TypeInit), Comptime]
+			static void EmitBindings()
+			{
+				// Resolving BeginScope's return type can run this before its declaration finishes.
+				int count = CountDeclaredMethods(typeof(ScopeCycleOwner));
+				Compiler.EmitTypeBody(typeof(Self), scope $"public const int cMethodsSeen = {count};\n");
+			}
+		}
+
+		[Comptime]
+		static bool HasScopeCycleMethod()
+		{
+			for (let method in typeof(ScopeCycleOwner).GetMethods(.Public | .Instance | .DeclaredOnly))
+			{
+				if (method.Name == "BeginScope")
+				{
+					Test.Assert(method.ReturnType == typeof(ScopeCycleScope));
+					Test.Assert(method.ParamCount == 0);
+					return true;
+				}
+			}
+			return false;
+		}
+
+		[Test]
+		public static void TestMethodsReadDuringScopeTypeInit()
+		{
+			Test.Assert(CountDeclaredMethods(typeof(ScopeCycleOwner)) >= 2);
+			Test.Assert(ScopeCycleScope.cMethodsSeen >= 0);
+			Test.Assert(HasScopeCycleMethod());
+		}
+
+		class RecursiveSnapshotOwner
+		{
+			[Comptime]
+			static int ObserveDeclaredMethods()
+			{
+				// Ready is callable before the recursive lookup, even though it appears after Pending.
+				Test.Assert(Ready(123) == 123);
+				bool foundReady = false;
+				for (let method in typeof(RecursiveSnapshotOwner).GetMethods(.Public | .NonPublic | .Static | .DeclaredOnly))
+				{
+					if (method.Name == "Ready")
+					{
+						Test.Assert(method.ReturnType == typeof(int));
+						Test.Assert(method.ParamCount == 1);
+						Test.Assert(method.GetParamType(0) == typeof(int));
+						foundReady = true;
+					}
+				}
+				Test.Assert(foundReady);
+				return 0;
+			}
+
+			public static void Pending<T>(int value = ObserveDeclaredMethods()) {}
+
+			[AlwaysInclude]
+			public static int Ready(int value) => value;
+		}
+
+		[Comptime]
+		static int CountRecursiveSnapshotMethods()
+		{
+			int count = 0;
+			for (let method in typeof(RecursiveSnapshotOwner).GetMethods(.Public | .NonPublic | .Static | .DeclaredOnly))
+				count++;
+			return count;
+		}
+
+		[Test]
+		public static void TestMethodsVisibleDuringRecursiveReflection()
+		{
+			Test.Assert(CountRecursiveSnapshotMethods() >= 3);
+		}
+
+		// A type's methods read while it was still declaring them (through a cycle) were cached as
+		//  they stood, so every later read in the compile saw that partial list
+		[Test]
+		public static void TestMethodsReadAfterACycle()
+		{
+			Test.Assert(CountDeclaredMethods(typeof(CycleTwin)) >= 3);
+			Test.Assert(CountDeclaredMethods(typeof(CycleBase)) == CountDeclaredMethods(typeof(CycleTwin)));
+			Test.Assert(CycleDerived.cBaseMethodsSeen >= 0);
 		}
 	}
 }

@@ -660,6 +660,7 @@ public:
 	int mMaxDeclBlockId; // If blocks merge, this is the highest index
 	bool mIsLooped;
 	bool mHasFakeBr;
+	bool mRemovedCondBr;
 	BeVTrackingList* mSuccLiveness;
 	BeVTrackingList* mSuccVRegsInitialized;
 	BeVTrackingList* mPredVRegsInitialized;
@@ -673,6 +674,7 @@ public:
 		mLabelIdx = -1;
 		mIsLooped = false;
 		mHasFakeBr = false;
+		mRemovedCondBr = false;
 		mBlockIdx = -1;
 		mMaxDeclBlockId = -1;
 		mSuccLiveness = NULL;
@@ -921,7 +923,7 @@ enum BeMCInstForm
 	// FRM32 = float, FRM64 = double
 	BeMCInstForm_XMM32_IMM,
 	BeMCInstForm_XMM64_IMM,
-	BeMCInstForm_XMM32_FRM32, 
+	BeMCInstForm_XMM32_FRM32,
 	BeMCInstForm_XMM64_FRM32,
 	BeMCInstForm_XMM32_FRM64,
 	BeMCInstForm_XMM64_FRM64,
@@ -1045,18 +1047,93 @@ public:
 	void DetectLoops();
 };
 
+#define BE_BUMP_SIZE  0x2000
+
+class BeMCIntHashSet
+{
+public:
+	int* mValues;        // Dense array of values for cache-friendly sequential iteration
+	int* mBuckets;       // Hash table: 1-based index into mValues (0 = empty slot)
+	int  mCount;         // Number of stored elements
+	int  mBucketMask;    // (bucketCount - 1), where bucketCount is always a power of 2
+	BumpAllocatorT<BE_BUMP_SIZE>* mAlloc;
+
+	int* begin() const { return mValues; }
+	int* end()   const { return mValues + mCount; }
+
+	// Insert val. Returns true if val was new (not already present).
+	bool Add(int val)
+	{
+		if ((mBuckets == NULL) || ((unsigned)(mCount * 2) >= (unsigned)(mBucketMask + 1)))
+			Grow();
+
+		int bucket = (unsigned)val & (unsigned)mBucketMask;
+		for (;;)
+		{
+			int slot = mBuckets[bucket];
+			if (slot == 0)
+			{
+				mBuckets[bucket] = ++mCount;
+				mValues[mCount - 1] = val;
+				return true;
+			}
+			if (mValues[slot - 1] == val)
+				return false;
+			bucket = (bucket + 1) & mBucketMask;
+		}
+	}
+
+private:
+	void Grow()
+	{
+		int newBucketCount = (mBucketMask == 0) ? 16 : ((mBucketMask + 1) * 2);
+		int newMask = newBucketCount - 1;
+		// At 50% load factor, values capacity equals half the bucket count.
+		// This invariant ensures mValues always has room before the next Grow().
+		int newValuesCap = newBucketCount >> 1;
+
+		// BumpAllocatorT zero-initializes each pool (SetPool does memset(pool, 0, ALLOC_SIZE)).
+		// So the newBuckets array starts as all-zeros, which already encodes "all slots empty"
+		// (slot value 0 means empty in our encoding). No explicit memset needed.
+		int* newBuckets = (int*)mAlloc->AllocBytes(newBucketCount * sizeof(int), sizeof(int));
+		int* newValues = (int*)mAlloc->AllocBytes(newValuesCap * sizeof(int), sizeof(int));
+
+		if (mCount > 0)
+			memcpy(newValues, mValues, mCount * sizeof(int));
+
+		for (int i = 0; i < mCount; i++)
+		{
+			int v = mValues[i];
+			int bucket = (unsigned)v & (unsigned)newMask;
+			while (newBuckets[bucket] != 0)
+				bucket = (bucket + 1) & newMask;
+			newBuckets[bucket] = i + 1;
+		}
+
+		mValues = newValues;
+		mBuckets = newBuckets;
+		mBucketMask = newMask;
+	}
+};
+
+#define BE_REGCOST_SIZE 15
+
 class BeMCColorizer
 {
 public:
 	struct Node
 	{
-		HashSet<int> mEdges;
+		BeMCIntHashSet mEdges;
 		int mGraphEdgeCount;
 		bool mInGraph;
 		bool mSpilled;
-		bool mWantsReg;
+		bool mWantsReg;		
+#ifdef BE_REGCOST_SIZE
+		bool mRegCostFloat;
+		int mRegCost[BE_REGCOST_SIZE];		
+#else
 		int mRegCost[X64Reg_COUNT];
-		int mLowestRegCost;
+#endif		
 		int mMemCost;
 		//int mActualVRegIdx;
 
@@ -1065,24 +1142,24 @@ public:
 			Prepare();
 		}
 
-		void AdjustRegCost(X64CPURegister reg, int adjust)
-		{
-			BF_ASSERT((int)reg >= 0);
-			BF_ASSERT((int)reg < X64Reg_COUNT);
-			int newCost = mRegCost[(int)reg] + adjust;
-			mRegCost[(int)reg] = newCost;
-			if (newCost < mLowestRegCost)
-				mLowestRegCost = newCost;
+		void AdjustRegCost(X64CPURegister reg, int adjust);
+
+		void SetRegCostFloat()
+		{			
+			memset(mRegCost, 0, sizeof(mRegCost));
+			mRegCostFloat = true;
 		}
+
+		int GetRegCost(X64CPURegister reg);
 
 		void Prepare()
 		{
 			mWantsReg = false;
 			mInGraph = false;
 			mSpilled = false;
-			mGraphEdgeCount = 0;
-			mLowestRegCost = 0;
+			mGraphEdgeCount = 0;			
 			mMemCost = 0;
+			mRegCostFloat = false;
 			memset(mRegCost, 0, sizeof(mRegCost));
 			//mActualVRegIdx = -1;
 		}
@@ -1105,10 +1182,14 @@ public:
 		RegKind_Floats,
 	};
 
+	HashSet<int64> mEdgesFound;
 	Array<BlockInfo> mBlockInfo;
 	Array<Node> mNodes;
 	BeMCContext* mContext;
 	bool mReserveParamRegs;
+	BumpAllocatorT<BE_BUMP_SIZE> mNodeAlloc;
+	SizedArray<X64CPURegister, 32> mIntRegs;
+	SizedArray<X64CPURegister, 32> mFloatRegs;
 
 public:
 	BeMCColorizer(BeMCContext* mcContext);
@@ -1362,6 +1443,7 @@ public:
 	String ToString(bool showVRegFlags = true, bool showVRegDetails = false);
 	void Print(bool showVRegFlags, bool showVRegDetails);
 	void Print();
+	void Print(BeMCInst* inst);
 	BeMCOperand GetOperand(BeValue* value, bool allowMetaResult = false, bool allowFail = false, bool skipForceVRegAddr = false); // Meta results are PHIs or CmpResults
 	BeMCOperand CreateNot(const BeMCOperand& operand);
 	BeMCOperand TryToVector(BeValue* value);
@@ -1375,7 +1457,7 @@ public:
 	BeMCInst* AllocInst(BeMCInstKind instKind, const BeMCOperand& arg0, const BeMCOperand& arg1, int insertIdx = -1);
 	void MergeInstFlags(BeMCInst* prevInst, BeMCInst* inst, BeMCInst* nextInst);
 	void RemoveInst(BeMCBlock* block, int instIdx, bool needChangesMerged = true, bool removeFromList = true);
-	BeMCOperand AllocBinaryOp(BeMCInstKind instKind, const BeMCOperand & lhs, const BeMCOperand & rhs, BeMCBinIdentityKind identityKind, BeMCOverflowCheckKind overflowCheckKind = BeMCOverflowCheckKind_None);
+	BeMCOperand AllocBinaryOp(BeMCInstKind instKind, const BeMCOperand& lhs, const BeMCOperand& rhs, BeMCBinIdentityKind identityKind, BeMCOverflowCheckKind overflowCheckKind = BeMCOverflowCheckKind_None);
 	BeMCOperand GetCallArgVReg(int argIdx, BeTypeCode typeCode);
 	BeMCOperand CreateCall(const BeMCOperand& func, const SizedArrayImpl<BeMCOperand>& args, BeType* retType = NULL, BfIRCallingConv callingConv = BfIRCallingConv_CDecl, bool structRet = false, bool noReturn = false, int varArgStart = -1);
 	BeMCOperand CreateCall(const BeMCOperand& func, const SizedArrayImpl<BeValue*>& args, BeType* retType = NULL, BfIRCallingConv callingConv = BfIRCallingConv_CDecl, bool structRet = false, bool noReturn = false, int varArgStart = -1);
@@ -1417,7 +1499,7 @@ public:
 	void GenerateLiveness();
 	void IntroduceVRegs(const BeMCOperand& newVReg, BeMCBlock* block, int startInstIdx, int lastInstIdx);
 	void VRegSetInitialized(BeMCBlock* mcBlock, BeMCInst* inst, const BeMCOperand& operand, SizedArrayImpl<int>& addVec, SizedArrayImpl<int>& removeVec, bool deepSet, bool doSet);
-	bool CheckVRegEqualityRange(BeMCBlock * mcBlock, int instIdx, const BeMCOperand & vreg0, const BeMCOperand & vreg1, BeMCRemapper& regRemaps, bool onlyCheckFirstLifetime = false);
+	bool CheckVRegEqualityRange(BeMCBlock* mcBlock, int instIdx, const BeMCOperand& vreg0, const BeMCOperand& vreg1, BeMCRemapper& regRemaps, bool onlyCheckFirstLifetime = false);
 	BeMCInst* FindSafePreBranchInst(BeMCBlock* mcBlock);
 	void SimpleInitializedPass();
 	void DoLastUsePassHelper(BeMCInst* inst, const BeMCOperand& operand);
@@ -1441,7 +1523,7 @@ public:
 	BeMCOperand GetFixedOperand(const BeMCOperand& operand);
 	uint8 GetREX(const BeMCOperand& op0, const BeMCOperand& op1, bool is64Bit);
 	void EmitREX(const BeMCOperand& op0, const BeMCOperand& op1, bool is64Bit);
-	
+
 	uint8 EncodeRegNum(X64CPURegister regNum);
 	int GetRegSize(int regNum);
 	void ValidateRMResult(const BeMCOperand& operand, BeRMParamsInfo& rmInfo, bool doValidate = true);

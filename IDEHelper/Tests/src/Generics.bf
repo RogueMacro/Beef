@@ -105,18 +105,18 @@ namespace Tests
 
 		struct Disposer<T>
 		{
-			static void UseDispose(IDisposable disp)
+			public static void UseDispose(IDisposable disp)
 			{
 
 			}
 
-			static void DoDisposeA(mut T val) where T : IDisposable
+			public static void DoDisposeA(mut T val) where T : IDisposable
 			{
 				val.Dispose();
 				UseDispose(val);
 			}
 
-			static void DoDisposeB(mut T val) where T : IDisposable
+			public static void DoDisposeB(mut T val) where T : IDisposable
 			{
 				val.Dispose();
 			}
@@ -446,6 +446,8 @@ namespace Tests
 		[Test]
 		public static void TestBasics()
 		{
+			StructA sa = default;
+
 			Alloc2<StructA>();
 			Alloc3<StructA*>();
 
@@ -463,6 +465,9 @@ namespace Tests
 			ClassB cb = scope .();
 			Test.Assert(LibA.LibA0.GetVal(ca) == 123);
 			Test.Assert(LibA.LibA0.GetVal(cb) == 234);
+
+			Disposer<StructA>.DoDisposeA(mut sa);
+			Disposer<ClassB>.DoDisposeA(cb);
 
 			LibA.LibA0.Dispose(ca);
 			LibA.LibA0.Dispose(cb);
@@ -541,6 +546,60 @@ namespace Tests
 			A<float> b = .() { mA = 2 };
 			a += b;
 			Test.Assert(a.mA == 12);
+		}
+
+		class InferenceCollection<T>
+		{
+			public static void AddRange<TEnumerable, TItem>(TEnumerable items)
+				where T : operator implicit TItem
+				where TEnumerable : IEnumerable<T>
+				where Span<T> : operator implicit TEnumerable
+			{
+			}
+		}
+
+		static void CheckUninferableArgument<T>(List<T> items)
+		{
+			Test.Assert(![IgnoreErrors(true)]
+				{
+					InferenceCollection<T>.AddRange(items);
+					true
+				});
+		}
+
+		[Test]
+		public static void TestUninferableArgument()
+		{
+			CheckUninferableArgument(scope List<int>());
+		}
+
+		class OverloadedRange<T>
+		{
+			public int AddRange<TEnumerable>(TEnumerable items) where TEnumerable : IEnumerable<T> => 1;
+			public int AddRange<TEnumerable, TItem>(TEnumerable items) where T : operator implicit TItem where TEnumerable : IEnumerable<TItem> => 2;
+		}
+
+		// Called from a generic method, the owner is specialized with the caller's generic params. Overload matching substituted
+		//  the callee's method generic args into constraints that referred to the caller's params (both are method generic
+		//  params, by index), so both overloads were rejected and the call failed to compile
+		static int AddConverted<T, T2>(OverloadedRange<T> dst, List<T2> src) where T : operator implicit T2
+		{
+			return dst.AddRange(src);
+		}
+
+		static void CopyConverted<T, T2>(List<T> dst, List<T2> src) where T : operator implicit T2
+		{
+			dst.AddRange(src);
+		}
+
+		[Test]
+		public static void TestGenericCallerConstraints()
+		{
+			Test.Assert(AddConverted(scope OverloadedRange<int64>(), scope List<int32>()) == 2);
+
+			List<int64> dst = scope .();
+			CopyConverted(dst, scope List<int32>() { 1, 2, 3 });
+			Test.Assert((dst.Count == 3) && (dst[2] == 3));
 		}
 	}
 

@@ -7,6 +7,7 @@
 #include "BeefySysLib/util/ChunkedDataBuffer.h"
 #include "BeefySysLib/util/Dictionary.h"
 #include "BfAstAllocator.h"
+#include "BfUtil.h"
 #include <unordered_map>
 
 //#include "BfSystem.h"
@@ -103,15 +104,22 @@ enum BfTypeCode : uint8
 	BfTypeCode_Float,
 	BfTypeCode_Double,
 	BfTypeCode_Float2,
+	BfTypeCode_Float4,
+	BfTypeCode_Int32_4,
+	BfTypeCode_Bool2,
+	BfTypeCode_Bool4,
+	BfTypeCode_V128,
 	BfTypeCode_Object,
 	BfTypeCode_Interface,
 	BfTypeCode_Struct,
 	BfTypeCode_Enum,
 	BfTypeCode_TypeAlias,
 	BfTypeCode_Extension,
+	BfTypeCode_FloatX1,
 	BfTypeCode_FloatX2,
 	BfTypeCode_FloatX3,
 	BfTypeCode_FloatX4,
+	BfTypeCode_DoubleX1,
 	BfTypeCode_DoubleX2,
 	BfTypeCode_DoubleX3,
 	BfTypeCode_DoubleX4,
@@ -421,6 +429,7 @@ enum BfIRConfigConst : uint8
 enum BfIRIntrinsic : uint8
 {
 	BfIRIntrinsic__PLATFORM,
+	BfIRIntrinsic__LLVM,
 	BfIRIntrinsic_Abs,
 	BfIRIntrinsic_Add,
 	BfIRIntrinsic_And,
@@ -449,6 +458,7 @@ enum BfIRIntrinsic : uint8
 	BfIRIntrinsic_Div,
 	BfIRIntrinsic_Eq,
 	BfIRIntrinsic_Floor,
+	BfIRIntrinsic_Fma,
 	BfIRIntrinsic_Free,
 	BfIRIntrinsic_Gt,
 	BfIRIntrinsic_GtE,
@@ -460,6 +470,7 @@ enum BfIRIntrinsic : uint8
 	BfIRIntrinsic_LtE,
 	BfIRIntrinsic_Malloc,
 	BfIRIntrinsic_Max,
+	BfIRIntrinsic_MemCmp,
 	BfIRIntrinsic_MemCpy,
 	BfIRIntrinsic_MemMove,
 	BfIRIntrinsic_MemSet,
@@ -483,6 +494,7 @@ enum BfIRIntrinsic : uint8
 	BfIRIntrinsic_VAArg,
 	BfIRIntrinsic_VAEnd,
 	BfIRIntrinsic_VAStart,
+	BfIRIntrinsic_Vector,
 	BfIRIntrinsic_Xgetbv,
 	BfIRIntrinsic_Xor,
 
@@ -673,6 +685,10 @@ enum BfIRAttribute
 	BFIRAttribute_NoRecurse,
 	BFIRAttribute_Constructor,
 	BFIRAttribute_Destructor,
+	BfIRAttribute_FloatingPointMode,
+	BfIRAttribute_SIMDSetting,
+	BfIRAttribute_FMASetting,
+	BfIRAttribute_NoInline,
 };
 
 struct BfIRFunctionType

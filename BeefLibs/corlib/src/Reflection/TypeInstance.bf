@@ -76,7 +76,7 @@ namespace System
 		{
 			if (Compiler.IsComptime)
 			{
-				int64 nativeMethod = Comptime_GetMethod((.)TypeId, (.)methodIdx);
+				int64 nativeMethod = Type.[Friend]Comptime_GetMethod((.)TypeId, (.)methodIdx);
 				if (nativeMethod == 0)
 					return .Err(.NoResults);
 
@@ -85,10 +85,12 @@ namespace System
 			return .Err(.NoResults);
 		}
 
-		public virtual Result<Object> CreateObject()
+		public virtual Result<Object> CreateObject(IRawAllocator allocator)
 		{
 			return .Err;
 		}
+
+		public Result<Object> CreateObject() => CreateObject(null);
 
 		public virtual Result<void*> CreateValue()
 		{
@@ -119,12 +121,24 @@ namespace System.Reflection
 
 		public override Result<MethodInfo, MethodError> GetMethod(int methodIdx)
 		{
+			// This override replaces the one on the base declaration, so the comptime
+			// case has to be handled here too. At comptime there is no runtime method
+			// table: mMethodDataCount is 0, and without this every index answers
+			// NoResults for a type whose methods are all present.
+			if (Compiler.IsComptime)
+			{
+				int64 nativeMethod = Type.[Friend]Comptime_GetMethod((.)TypeId, (.)methodIdx);
+				if (nativeMethod == 0)
+					return .Err(.NoResults);
+				return MethodInfo(this, nativeMethod);
+			}
+
 			if ((methodIdx < 0) || (methodIdx >= mMethodDataCount))
 				return .Err(.NoResults);
 			return MethodInfo(this, &mMethodDataPtr[methodIdx]);
 		}
 
-		public override Result<Object> CreateObject()
+		public override Result<Object> CreateObject(IRawAllocator allocator)
 		{
 			if (mTypeClassVData == null)
 				return .Err;
@@ -178,14 +192,35 @@ namespace System.Reflection
 			int32 stackCount = Compiler.Options.AllocStackCount;
 			if (mAllocStackCountOverride != 0)
 				stackCount = mAllocStackCountOverride;
-			obj = Internal.Dbg_ObjectAlloc(mTypeClassVData, allocSize, mInstAlign, stackCount, 0);
+
+			// An append constructor may append objects that need marking, which the debug runtime
+			//  tracks in a record after the stack trace (the compiler only sets this when it's needed)
+			uint8 allocFlags = hasAppendAlloc ? 1 : 0;
+			if (allocator != null)
+			{
+				int stackTraceSize = Internal.Dbg_PrepareStackTrace(allocSize, stackCount);
+				int totalAllocSize = allocSize + stackTraceSize;
+				if (allocFlags != 0)
+					totalAllocSize += sizeof(int) * 4;
+				obj = Internal.UnsafeCastToObject(allocator.Alloc(totalAllocSize, mInstAlign));
+				Internal.Dbg_ObjectAllocatedEx(obj, allocSize, (.)(void*)mTypeClassVData, allocFlags);
+			}
+			else
+			{
+				obj = Internal.Dbg_ObjectAlloc(mTypeClassVData, allocSize, mInstAlign, stackCount, allocFlags);
+			}
 #else
-			void* mem = new [Align(16)] uint8[allocSize]* (?);
+			void* mem;
+			if (allocator != null)
+				mem = allocator.Alloc(allocSize, mInstAlign);
+			else
+				mem = new [Align(16)] uint8[allocSize]* (?);
 			obj = Internal.UnsafeCastToObject(mem);
 			*(void**)mem = (void*)mTypeClassVData;
 #if BF_ENABLE_OBJECT_DEBUG_FLAGS
 			Internal.Dbg_ObjectAllocated(obj, allocSize, (.)(void*)mTypeClassVData);
-			*(int*)mem |= 0x04/*BfObjectFlag_Allocate*/;
+			if (allocator == null)
+				*(int*)mem |= 0x04/*BfObjectFlag_Allocate*/;
 #else
 			*(void**)mem = (void*)mTypeClassVData;
 #endif

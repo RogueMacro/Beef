@@ -44,7 +44,7 @@
 //#define DBG_FORCE_SYNCHRONIZED
 
 // This is used for the Release DLL thunk and the build.dat file
-#define BF_CODEGEN_VERSION 14
+#define BF_CODEGEN_VERSION 17
 
 #undef DEBUG
 
@@ -350,6 +350,15 @@ void BfCodeGenThread::RunLoop()
 		}
 #endif
 
+		if (request->mOptions.mIsHotCompile)
+		{
+			// A cached object only exists on disk, but a hot compile has to hand the object to the debugger to load into
+			//  the running process, which may not contain this module at all (ie: an intervening rebuild dropped it).
+			//  Note the OgPlus backend already misses here, since mWriteToLib is hashed and is only set for non-hot builds
+			orderedHash = Val128();
+			hasCacheMatch = false;
+		}
+
 		//TODO: Temporary, to make sure it keeps getting rebuilt
 
 #ifdef CODEGEN_DISABLE_CACHE_BEEFBACKEND
@@ -387,6 +396,7 @@ void BfCodeGenThread::RunLoop()
 				BeHashContext hashCtx;
 				hashCtx.Mixin(request->mOptions.mHash);
 				beIRCodeGen->Hash(hashCtx);
+				hashCtx.Flush();
 				auto newOrderedHash = hashCtx.Finish128();
 				BfLogX(2, "Ordered hash for %s New:%s Old:%s\n", cacheFileName.c_str(), newOrderedHash.ToString().c_str(), orderedHash.ToString().c_str());
 				hasCacheMatch = newOrderedHash == orderedHash;

@@ -49,6 +49,7 @@ BfContext::BfContext(BfCompiler* compiler) :
 	mAllowLockYield = true;
 
 	mCurTypeState = NULL;
+	mDeepFailRevision = -1;
 	mCurNamespaceNodes = NULL;
 	mCurConstraintState = NULL;
 	mResolvingVarField = false;
@@ -142,12 +143,42 @@ int BfContext::GetStringLiteralId(const StringImpl& str)
 	mCurStringObjectPoolId++;
 	mStringObjectPool[str] = mCurStringObjectPoolId;
 
+	// The string's globals (__bfStrObj, __bfStrData) are named by a stable id from its content rather than by its id,
+	//  which depends on the order strings are first seen: with id-based names, a fresh compiler that met one new
+	//  literal renumbered every later one and changed hundreds of unrelated modules. The id itself stays sequential,
+	//  since String.GetInternId hands it out and expects compact ids. A collision takes the next free stable id.
+	int stableId = (int)(Hash64(str.c_str(), (int)str.length()) & 0x7FFFFFFF);
+	while (mStringStableIdMap.ContainsKey(stableId))
+		stableId = (stableId + 1) & 0x7FFFFFFF;
+	mStringStableIdMap[stableId] = mCurStringObjectPoolId;
+
 	BfStringPoolEntry stringPoolEntry;
 	stringPoolEntry.mString = str;
+	stringPoolEntry.mStableId = stableId;
 	stringPoolEntry.mFirstUsedRevision = mCompiler->mRevision;
 	stringPoolEntry.mLastUsedRevision = mCompiler->mRevision;
 	mStringObjectIdMap[mCurStringObjectPoolId] = stringPoolEntry;
 	return mCurStringObjectPoolId;
+}
+
+int BfContext::GetStringStableId(int stringId)
+{
+	BfStringPoolEntry* entry = NULL;
+	if (!mStringObjectIdMap.TryGetValue(stringId, &entry))
+	{
+		BF_FATAL("Unknown string id");
+		return -1;
+	}
+	return entry->mStableId;
+}
+
+// Maps the number in a string global's name back to the string id
+int BfContext::GetStringIdByStableId(int stableId)
+{
+	int* stringIdPtr = NULL;
+	if (!mStringStableIdMap.TryGetValue(stableId, &stringIdPtr))
+		return -1;
+	return *stringIdPtr;
 }
 
 void BfContext::AssignModule(BfType* type)
@@ -1265,6 +1296,8 @@ void BfContext::RebuildType(BfType* type, bool deleteOnDemandTypes, bool rebuild
 		}
 	}
 
+	typeInst->RemoveMethodsFromCEMachine();
+
 	//typeInst->mTypeDef->ClearEmitted();
 	for (auto localMethod : typeInst->mOwnedLocalMethods)
 		delete localMethod;
@@ -1284,7 +1317,7 @@ void BfContext::RebuildType(BfType* type, bool deleteOnDemandTypes, bool rebuild
 			genericTypeInstance->mGenericTypeInfo->mGenericExtensionInfo->Clear();
 		genericTypeInstance->mGenericTypeInfo->mProjectsReferenced.Clear();
 	}
-
+	
 	typeInst->mStaticSearchMap.Clear();
 	typeInst->mInternalAccessMap.Clear();
 	typeInst->mInterfaces.Clear();
@@ -1401,20 +1434,30 @@ bool BfContext::CanRebuild(BfType* type)
 //   ClassB, it means that ClassC code needs to be recompiled if ClassA data layout changes, but performing a ReadField
 //   (obviously) doesn't change the data layout of ClassC
 //  Calls: non-cascading dependency, since it's independent of data layout ConstValue: non-cascading data change
-void BfContext::TypeDataChanged(BfDependedType* dType, bool isNonStaticDataChange)
+void BfContext::TypeDataChanged(BfDependedType* dType, bool isNonStaticDataChange, BfRebuildFilter* rebuildFilter)
 {
 	BfLogSysM("TypeDataChanged %p\n", dType);
 
 	auto rebuildFlag = isNonStaticDataChange ? BfTypeRebuildFlag_NonStaticChange : BfTypeRebuildFlag_StaticChange;
 	if ((dType->mRebuildFlags & rebuildFlag) != 0) // Already did this change?
 		return;
-	dType->mRebuildFlags = (BfTypeRebuildFlags)(dType->mRebuildFlags | rebuildFlag);
+	if (rebuildFilter != NULL)
+	{
+		// A filtered change does not reach all of our dependents, so we cannot record it on the type as having been done
+		auto& changeSet = isNonStaticDataChange ? rebuildFilter->mNonStaticChangeSet : rebuildFilter->mStaticChangeSet;
+		if (!changeSet.Add(dType))
+			return;
+	}
+	else
+		dType->mRebuildFlags = (BfTypeRebuildFlags)(dType->mRebuildFlags | rebuildFlag);
 
 	// We need to rebuild all other types that rely on our data layout
 	for (auto& depItr : dType->mDependencyMap)
 	{
 		auto dependentType = depItr.mKey;
 		auto dependencyFlags = depItr.mValue.mFlags;
+		if ((rebuildFilter != NULL) && (dependentType->mActiveRevision < rebuildFilter->mMinActiveRevision))
+			continue;
 
 		auto dependentDType = dependentType->ToDependedType();
 		if (dependentDType != NULL)
@@ -1451,17 +1494,24 @@ void BfContext::TypeDataChanged(BfDependedType* dType, bool isNonStaticDataChang
 				}
 
 				if (hadChange)
-					TypeDataChanged(dependentDType, true);
+					TypeDataChanged(dependentDType, true, rebuildFilter);
+			}
+			else if ((dependencyFlags & BfDependencyMap::DependencyFlag_ValueTypeSizeDep) != 0)
+			{
+				// One of our consts sizes the dependent type (ie: int32[DepType.cVal]), so a change to our static data changes its
+				//  layout. We only get here with a static change when our const is itself computed from another type's const, and
+				//  the types that hold the dependent by value would otherwise keep its old size
+				TypeDataChanged(dependentDType, true, rebuildFilter);
 			}
 
 			if (dependencyFlags & BfDependencyMap::DependencyFlag_ConstValue)
 			{
-				TypeDataChanged(dependentDType, false);
+				TypeDataChanged(dependentDType, false, rebuildFilter);
 
 				// The ConstValue dependency may be that dependentType used one of our consts as
 				//  a default value to a method param, so assume callsites need rebuilding
 				if (dependentTypeInstance != NULL)
-					TypeMethodSignaturesChanged(dependentTypeInstance);
+					TypeMethodSignaturesChanged(dependentTypeInstance, rebuildFilter);
 			}
 
 			if (CanRebuild(dependentType))
@@ -1497,11 +1547,17 @@ void BfContext::TypeDataChanged(BfDependedType* dType, bool isNonStaticDataChang
 		RebuildType(dType);
 }
 
-void BfContext::TypeMethodSignaturesChanged(BfTypeInstance* typeInst)
+void BfContext::TypeMethodSignaturesChanged(BfTypeInstance* typeInst, BfRebuildFilter* rebuildFilter)
 {
 	if (typeInst->mRebuildFlags & BfTypeRebuildFlag_MethodSignatureChange) // Already did change?
 		return;
-	typeInst->mRebuildFlags = (BfTypeRebuildFlags) (typeInst->mRebuildFlags | BfTypeRebuildFlag_MethodSignatureChange);
+	if (rebuildFilter != NULL)
+	{
+		if (!rebuildFilter->mMethodSignatureChangeSet.Add(typeInst))
+			return;
+	}
+	else
+		typeInst->mRebuildFlags = (BfTypeRebuildFlags) (typeInst->mRebuildFlags | BfTypeRebuildFlag_MethodSignatureChange);
 
 	BfLogSysM("TypeMethodSignaturesChanged %p\n", typeInst);
 
@@ -1510,6 +1566,8 @@ void BfContext::TypeMethodSignaturesChanged(BfTypeInstance* typeInst)
 	{
 		auto dependentType = depItr.mKey;
 		auto dependencyFlags = depItr.mValue.mFlags;
+		if ((rebuildFilter != NULL) && (dependentType->mActiveRevision < rebuildFilter->mMinActiveRevision))
+			continue;
 
 		if (dependentType->mRevision != mCompiler->mRevision)
 		{
@@ -1902,22 +1960,7 @@ void BfContext::DeleteType(BfType* type, bool deferDepRebuilds)
  	BfLogSysM("Deleting Type: %p %s\n", type, mScratchModule->TypeToString(type).c_str());
 
 	if (typeInst != NULL)
-	{
-		for (auto& methodInstGroup : typeInst->mMethodInstanceGroups)
-		{
-			if ((methodInstGroup.mDefault != NULL) && (methodInstGroup.mDefault->mInCEMachine))
-				mCompiler->mCeMachine->RemoveMethod(methodInstGroup.mDefault);
-			if (methodInstGroup.mMethodSpecializationMap != NULL)
-			{
-				for (auto& methodSpecializationItr : *methodInstGroup.mMethodSpecializationMap)
-				{
-					auto methodInstance = methodSpecializationItr.mValue;
-					if (methodInstance->mInCEMachine)
-						mCompiler->mCeMachine->RemoveMethod(methodInstance);
-				}
-			}
-		}
-	}
+		typeInst->RemoveMethodsFromCEMachine();
 
 	// All dependencies cause rebuilds when we delete types
 	if (dType != NULL)
@@ -2026,8 +2069,19 @@ void BfContext::DeleteType(BfType* type, bool deferDepRebuilds)
 			else if (dependentTypeInst != NULL)
 			{
 				mGhostDependencies.Add(type);
-				// This keeps us from crashing from accessing deleted types on subsequent compiles
-				mFailTypes.TryAdd(dependentTypeInst, BfFailKind_Normal);
+				if (dependentTypeInst->mDefineState != BfTypeDefineState_Undefined)
+				{
+					// This keeps us from crashing from accessing deleted types on subsequent compiles
+					mFailTypes.TryAdd(dependentTypeInst, BfFailKind_Normal);
+					// The dependent was already rebuilt this revision (ie: before a mid-compile rebuild deleted us), so it still
+					//  refers to us for the rest of this compile. Its output can't be trusted, so compile again to rebuild it.
+					mCompiler->RequestExtraCompile();
+				}
+				// An already-undefined dependent holds no populated reference to us - it was reset for a
+				//  rebuild earlier in this same revision and re-resolves everything before anything reads
+				//  it, so there is nothing stale to repair. Marking it as a fail type anyway makes the next
+				//  revision redo it, and that keeps re-deleting the same on-demand dependencies, so the set
+				//  never drains and every resolve pass re-declares the same types
 			}
 		}
 	}
@@ -2252,6 +2306,12 @@ void BfContext::UpdateRevisedTypes()
 	// Temporarily store failTypes - we may need to re-insert into them after another failure
 	auto failTypes = mFailTypes;
 	mFailTypes.Clear();
+	// Other types may have consumed the incomplete state a cancelled comptime call left a type in (see BfModule::DeferRebuildType),
+	//  but only if they did some work after it was left that way. Any dependent that has been idle since then still holds what it
+	//  got from the last complete build of the type, and a real change from that is handled the same as it is without a cancel.
+	BfRebuildFilter deepRebuildFilter;
+	deepRebuildFilter.mMinActiveRevision = mDeepFailRevision;
+	mDeepFailRevision = -1;
 
 	bool wantsDebugInfo = (mCompiler->mOptions.mEmitDebugInfo);
 
@@ -2444,7 +2504,14 @@ void BfContext::UpdateRevisedTypes()
 			{
 				BfLogSysM("Rebuilding failed type %p %d\n", typeInst, (int)failKV.mValue);
 				if (failKV.mValue == BfFailKind_Deep)
-					TypeDataChanged(typeInst, true);
+				{
+					TypeDataChanged(typeInst, true, &deepRebuildFilter);
+					TypeMethodSignaturesChanged(typeInst, &deepRebuildFilter);
+					// Everything that could have been slotted against our incomplete emissions has been rebuilt now, so the retry
+					//  only needs to rebuild our dependents (again) if what it emits has actually changed
+					if (typeInst->mCeTypeInfo != NULL)
+						typeInst->mCeTypeInfo->mFastFinished = false;
+				}
 				else
 					RebuildType(typeInst);
 			}
@@ -2522,6 +2589,8 @@ void BfContext::UpdateRevisedTypes()
 		workspaceConfigHashCtx.Mixin(options->mMachineType);
 		workspaceConfigHashCtx.Mixin(options->mToolsetType);
 		workspaceConfigHashCtx.Mixin(options->mSIMDSetting);
+		workspaceConfigHashCtx.Mixin(options->mFloatingPointMode);
+		workspaceConfigHashCtx.Mixin(options->mFMASetting);
 
 		workspaceConfigHashCtx.Mixin(options->mEmitDebugInfo);
 		workspaceConfigHashCtx.Mixin(options->mEmitLineInfo);
@@ -2563,6 +2632,8 @@ void BfContext::UpdateRevisedTypes()
 			for (auto& filter : typeOptions.mAttributeFilters)
 				workspaceConfigHashCtx.MixinStr(filter);
 			workspaceConfigHashCtx.Mixin(typeOptions.mSIMDSetting);
+			workspaceConfigHashCtx.Mixin(typeOptions.mFloatingPointMode);
+			workspaceConfigHashCtx.Mixin(typeOptions.mFMASetting);
 			workspaceConfigHashCtx.Mixin(typeOptions.mOptimizationLevel);
 			workspaceConfigHashCtx.Mixin(typeOptions.mEmitDebugInfo);
 			workspaceConfigHashCtx.Mixin(typeOptions.mAndFlags);
@@ -2617,6 +2688,9 @@ void BfContext::UpdateRevisedTypes()
 				buildConfigHashCtx.Mixin(isTestConfig);
 
 				buildConfigHashCtx.Mixin(codeGenOptions.mOptLevel);
+				buildConfigHashCtx.Mixin(codeGenOptions.mSIMDSetting);
+				buildConfigHashCtx.Mixin(codeGenOptions.mFloatingPointMode);
+				buildConfigHashCtx.Mixin(codeGenOptions.mFMASetting);
 				buildConfigHashCtx.Mixin(codeGenOptions.mSizeLevel);
 				buildConfigHashCtx.Mixin(codeGenOptions.mUseCFLAA);
 				buildConfigHashCtx.Mixin(codeGenOptions.mUseNewSROA);
@@ -2727,7 +2801,7 @@ void BfContext::UpdateRevisedTypes()
 
 		if (mCompiler->mInterfaceSlotCountChanged)
 		{
-			if ((module->mUsedSlotCount >= 0) && (module->mUsedSlotCount != mCompiler->mMaxInterfaceSlots))
+			if ((module->mHadSlotCountDependency) && (module->mUsedSlotCount != mCompiler->mMaxInterfaceSlots))
 				needsModuleRebuild = true;
 		}
 
@@ -2745,6 +2819,22 @@ void BfContext::UpdateRevisedTypes()
 	}
 
 	mCompiler->mInterfaceSlotCountChanged = false;
+	// A project-only option change does not change source signatures, but inline
+	// copies in other projects must be regenerated with the source method's policy.
+	Array<BfTypeInstance*> inlinePolicyChangedTypes;
+	for (auto module : moduleRebuildList)
+	{
+		if ((!module->mIsDeleting) && (module->mProject != NULL) && (module->mProject->mBuildConfigChanged))
+		{
+			for (auto typeInst : module->mOwnedTypeInstances)
+				inlinePolicyChangedTypes.Add(typeInst);
+		}
+	}
+	// Invalidating a dependent may start a module revision and change its owned
+	// types immediately, so never walk an ownership array while doing that work.
+	for (auto typeInst : inlinePolicyChangedTypes)
+		if (!typeInst->IsDeleting())
+			TypeInlineMethodInternalsChanged(typeInst);
 	for (auto module : moduleRebuildList)
 	{
 		if (!module->mIsDeleting)
@@ -2775,7 +2865,7 @@ void BfContext::VerifyTypeLookups(BfTypeInstance* typeInst)
 		if (lookupEntry.mName.IsEmpty())
 		{
 			// If the name lookup failed before, thats because we didn't have the right atoms.  Are there new atoms now?
-			if (lookupEntry.mAtomUpdateIdx != mSystem->mAtomUpdateIdx)
+			if (lookupEntry.mAtomUpdateIdx != (uint32)mSystem->mAtomCreateIdx)
 				isDirty = true;
 		}
 		else
@@ -2805,7 +2895,13 @@ void BfContext::VerifyTypeLookups(BfTypeInstance* typeInst)
 					lookupResultCtx.mResult = lookupResult;
 					lookupResultCtx.mIsVerify = true;
 
-					BfTypeDef* result = typeInst->mModule->FindTypeDefRaw(lookupEntry.mName, lookupEntry.mNumGenericParams, typeInst, useTypeDef, NULL, &lookupResultCtx);
+					// Pass AllowGlobalContainer so this can reproduce a lookup that originally resolved to a
+					//  namespace-level globals container. Without it FindTypeDefRaw finds the container and then
+					//  returns NULL, so every cached lookup of a 'static' container looks like it changed and we
+					//  treat the referencing type as having a whole new signature - rebuilding it and everything
+					//  that depends on it, on every single compile
+					BfTypeDef* result = typeInst->mModule->FindTypeDefRaw(lookupEntry.mName, lookupEntry.mNumGenericParams, typeInst, useTypeDef, NULL, &lookupResultCtx,
+						BfResolveTypeRefFlag_AllowGlobalContainer);
 					if ((result == NULL) && (lookupResult->mFoundInnerType))
 					{
 						// Allow this- if there were new types added then the types would be rebuilt already
@@ -3048,14 +3144,19 @@ void BfContext::VerifyTypeLookups()
 //  actively referenced previously, this method will generate BfMethodSpecializationRequest for all used
 //  methods from previously-built modules
 void BfContext::QueueMethodSpecializations(BfTypeInstance* typeInst, bool checkSpecializedMethodRebuildFlag)
-{
-	BF_ASSERT(!typeInst->IsDeleting());
-
+{		
 	BP_ZONE("BfContext::QueueMethodSpecializations");
 
 	auto module = typeInst->mModule;
 	if (module == NULL)
 		return;
+
+	if (typeInst->IsDeleting())
+	{
+		mCompiler->RequestExtraCompile();
+		module->InternalError("QueueMethodSpecializations using deleted type");
+		return;
+	}
 
 	BfLogSysM("QueueMethodSpecializations typeInst %p module %p\n", typeInst, module);
 
@@ -3118,6 +3219,9 @@ void BfContext::QueueMethodSpecializations(BfTypeInstance* typeInst, bool checkS
 
 void BfContext::MarkAsReferenced(BfDependedType* depType)
 {
+	if (depType->IsDeleting())
+		return;
+
 	BF_ASSERT((depType->mRebuildFlags & BfTypeRebuildFlag_AwaitingReference) != 0);
 	depType->mRebuildFlags = (BfTypeRebuildFlags)(depType->mRebuildFlags & ~BfTypeRebuildFlag_AwaitingReference);
 
@@ -3481,6 +3585,50 @@ void BfContext::Finish()
 {
 }
 
+void BfContext::CleanupLocalMethods(int startIdx)
+{
+	BF_ASSERT((startIdx >= 0) && (startIdx <= mLocalMethodGraveyard.mSize));
+	Array<BfLocalMethod*> survivingLocalMethods;
+	for (int i = 0; i < startIdx; i++)
+		survivingLocalMethods.Add(mLocalMethodGraveyard[i]);
+
+	for (int i = startIdx; i < mLocalMethodGraveyard.mSize; i++)
+	{
+		auto localMethod = mLocalMethodGraveyard[i];
+		bool inCEMachine = false;
+		if (localMethod->mMethodInstanceGroup != NULL)
+		{
+			if ((localMethod->mMethodInstanceGroup->mDefault != NULL) && (localMethod->mMethodInstanceGroup->mDefault->mInCEMachine))
+				inCEMachine = true;
+			if (localMethod->mMethodInstanceGroup->mMethodSpecializationMap != NULL)
+			{
+				for (auto& kv : *localMethod->mMethodInstanceGroup->mMethodSpecializationMap)
+					if (kv.mValue->mInCEMachine)
+						inCEMachine = true;
+			}
+		}
+
+		if (inCEMachine)
+		{
+			localMethod->mMethodInstanceGroup->mOwner->mOwnedLocalMethods.Add(localMethod);
+		}
+		else if ((localMethod->mMethodInstanceGroup != NULL) && (localMethod->mMethodInstanceGroup->mRefCount > 0))
+		{
+			BfLogSysM("BfContext::CleanupLocalMethods surviving local method with refs %p\n", localMethod);
+			localMethod->Dispose();
+			survivingLocalMethods.push_back(localMethod);
+		}
+		else
+		{
+			// Live BfMethodRefTypes retain the group through mRefCount, including those
+			// used by pending specializations. Unrelated queued work must not retain
+			// every old local method (and its entire source parser).
+			delete localMethod;
+		}
+	}
+	mLocalMethodGraveyard = survivingLocalMethods;
+}
+
 void BfContext::Cleanup()
 {
 	BfLogSysM("BfContext::Cleanup() MethodWorkList: %d LocalMethodGraveyard: %d\n", mMethodWorkList.size(), mLocalMethodGraveyard.size());
@@ -3497,47 +3645,7 @@ void BfContext::Cleanup()
 		UpdateAfterDeletingTypes();
 	}
 
-	///
-	{
-		Array<BfLocalMethod*> survivingLocalMethods;
-
-		for (auto localMethod : mLocalMethodGraveyard)
-		{
-			bool inCEMachine = false;
-			if (localMethod->mMethodInstanceGroup != NULL)
-			{
-				if ((localMethod->mMethodInstanceGroup->mDefault != NULL) && (localMethod->mMethodInstanceGroup->mDefault->mInCEMachine))
-					inCEMachine = true;
-				if (localMethod->mMethodInstanceGroup->mMethodSpecializationMap != NULL)
-				{
-					for (auto& kv : *localMethod->mMethodInstanceGroup->mMethodSpecializationMap)
-						if (kv.mValue->mInCEMachine)
-							inCEMachine = true;
-				}
-			}
-
-			if (inCEMachine)
-			{
-				localMethod->mMethodInstanceGroup->mOwner->mOwnedLocalMethods.Add(localMethod);
-			}
-			else if ((localMethod->mMethodInstanceGroup != NULL) && (localMethod->mMethodInstanceGroup->mRefCount > 0))
-			{
-				BfLogSysM("BfContext::Cleanup surviving local method with refs %p\n", localMethod);
-				localMethod->Dispose();
-				survivingLocalMethods.push_back(localMethod);
-			}
-			else if (!mMethodWorkList.empty())
-			{
-				// We can't remove the local methods if they still may be referenced by a BfMethodRefType used to specialize a method
-				BfLogSysM("BfContext::Cleanup surviving local method %p\n", localMethod);
-				localMethod->Dispose();
-				survivingLocalMethods.push_back(localMethod);
-			}
-			else
-				delete localMethod;
-		}
-		mLocalMethodGraveyard = survivingLocalMethods;
-	}
+	CleanupLocalMethods();
 
 	// Clean up deleted BfTypes
 	// These need to get deleted before the modules because we access mModule in the MethodInstance dtors

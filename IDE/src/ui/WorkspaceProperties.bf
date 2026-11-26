@@ -566,7 +566,7 @@ namespace IDE.ui
 				{
 					Workspace.ConfigSelection configSelection;
 					var curWorkspaceOptions = mCurWorkspaceOptions[optionsIdx];
-	                curWorkspaceOptions.mConfigSelections.TryGetValue(project, out configSelection);
+	                curWorkspaceOptions.mConfigSelections.TryGetValue(project.mProjectName, out configSelection);
 	                if (configSelection == null)
 	                    continue;
 
@@ -593,7 +593,7 @@ namespace IDE.ui
 	                propEntry.mApplyAction = new () =>
 	                    {
 	                        Workspace.ConfigSelection setConfigSelection;
-	                        curWorkspaceOptions.mConfigSelections.TryGetValue(project, out setConfigSelection);
+	                        curWorkspaceOptions.mConfigSelections.TryGetValue(project.mProjectName, out setConfigSelection);
 	                        if (setConfigSelection == null)
 	                        {
 	                            IDEApp.sApp.Fail(scope String()..AppendF("Project '{0}' not in workspace", project.mProjectName));
@@ -1050,6 +1050,8 @@ namespace IDE.ui
             AddPropertiesItem(category, "SIMD Instructions", "mBfSIMDSetting");
             AddPropertiesItem(category, "Optimization Level", "mBfOptimizationLevel",
                 scope String[] ( "O0", "O1", "O2", "O3", "Og", "Og+"));
+			AddPropertiesItem(category, "Floating Point Optimization", "mBfFloatingPointMode",
+				scope String[] ( "Precise", "Allow FMA", "Fast" ));
 			AddPropertiesItem(category, "LTO Type", "mLTOType");
             AddPropertiesItem(category, "No Omit Frame Pointers", "mNoOmitFramePointers");
 			AddPropertiesItem(category, "Large Strings", "mLargeStrings");

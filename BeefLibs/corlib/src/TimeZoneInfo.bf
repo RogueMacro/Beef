@@ -1915,42 +1915,13 @@ namespace System {
             return GetLocalTimeZoneFromWin32Data(timeZoneInformation, dstDisabled);
             
 #else // FEATURE_WIN32_REGISTRY
-            // Without Registry support, just create a dummy TZ for now
+            // Without Registry support, read the system's tzfile (TimeZoneInfo.Unix.bf)
             return GetLocalTimeZoneFromTzFile();
 #endif // FEATURE_WIN32_REGISTRY
         }
 
 
-#if !FEATURE_WIN32_REGISTRY
-        //
-        // GetLocalTimeZoneFromTzFile -
-        //
-        // Helper function used by 'GetLocalTimeZone()' - this function wraps the call
-        // for loading time zone data from computers without Registry support.
-        //
-        // The GetLocalTzFile() call returns a Byte[] containing the compiled tzfile.
-        // 
-        static private TimeZoneInfo GetLocalTimeZoneFromTzFile() {
-            /*uint8[] rawData = GetLocalTzFile();
-
-            if (rawData != null) {
-                try {
-                    return new TimeZoneInfo(rawData, false); // create a TimeZoneInfo instance from the TZif data w/ DST support
-                }
-                catch (ArgumentException) {}
-                catch (InvalidTimeZoneException) {}
-                try {
-                    return new TimeZoneInfo(rawData, true); // create a TimeZoneInfo instance from the TZif data w/o DST support
-                }
-                catch (ArgumentException) {}
-                catch (InvalidTimeZoneException) {}
-             }
-            // the data returned from the PAL is completely bogus; return a dummy entry
-            return CreateCustomTimeZone(c_localId, TimeSpan.Zero, c_localId, c_localId);*/
-			// TODO: Not implemented.
-            return Utc;
-        }
-#endif // !FEATURE_WIN32_REGISTRY
+        // GetLocalTimeZoneFromTzFile (platforms without the Windows registry) lives in TimeZoneInfo.Unix.bf
 
 
         //

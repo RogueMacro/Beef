@@ -18,6 +18,7 @@ using Beefy.geom;
 using Beefy.res;
 using System.Diagnostics;
 using Beefy.utils;
+using Beefy.mcp;
 using IDE.Debugger;
 using IDE.Compiler;
 using IDE.Util;
@@ -120,6 +121,15 @@ namespace IDE
 	{
 		public static String sRTVersionStr = "042";
 		public const String cVersion = "0.43.6";
+		public const String cEmSdkDep = "EmsdkDep3_Done.txt";
+
+#if BF_PLATFORM_LINUX || BF_PLATFORM_MACOS
+		public const uint8[?] cAppIcon = [IgnoreErrors]{ Compiler.ReadBinary("Resources/beeflang.png") };
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void BFApp_RegisterAppIcon(uint8* imageData, int size);
+#endif
+
 
 #if BF_PLATFORM_WINDOWS
 		public static readonly String sPlatform64Name = "Win64";
@@ -135,9 +145,17 @@ namespace IDE
 		public static readonly String sPlatform32Name = "Unknown32";
 #endif
 
+#if BF_MACHINE_AARCH64
+		public static readonly String sArch64Name = "aarch64";
+#else
+		public static readonly String sArch64Name = "x86_64";
+#endif
+
 		public static bool sExitTest;
+		public static String sTitle = "Beef IDE";
 
 		public Verbosity mVerbosity = .Default;
+		public List<String> mExtraWorkspacePreprocessorMacros = new .() ~ DeleteContainerAndItems!(_);
 		public BeefVerb mVerb;
 		public bool mDbgCompileDump;
 		public int mDbgCompileIdx = -1;
@@ -150,6 +168,8 @@ namespace IDE
 		public String mDeferredRelaunchCmd ~ delete _;
 		public int? mTargetExitCode;
 		public FileVersionInfo mVersionInfo ~ delete _;
+		DateTime mExeDateUtc;
+		public uint64 mCompilerId = ((uint64)Process.CurrentId << 32) ^ (uint64)Platform.BfpSystem_GetTimeStamp();
 
 		//public ToolboxPanel mToolboxPanel;
 		public Monitor mMonitor = new Monitor() ~ delete _;
@@ -170,6 +190,7 @@ namespace IDE
 		public bool mDbgTimeAutocomplete;
 		public bool mDbgPerfAutocomplete;
 		public bool mStopPending;
+		public String mDeferredCompilerText = new .() ~ delete _;
 		public BeefConfig mBeefConfig = new BeefConfig() ~ delete _;
 		public List<String> mDeferredFails = new .() ~ DeleteContainerAndItems!(_);
 		public String mInitialCWD = new .() ~ delete _;
@@ -181,7 +202,6 @@ namespace IDE
 		public DarkDockingFrame mDockingFrame;
 		public MainFrame mMainFrame;
 		public GlobalUndoManager mGlobalUndoManager = new GlobalUndoManager() ~ delete _;
-		public SourceControl mSourceControl = new SourceControl() ~ delete _;
 		public GitManager mGitManager = new .() ~ delete _;
 
 		public WidgetWindow mPopupWindow;
@@ -257,6 +277,10 @@ namespace IDE
 		public BfCompiler mBfBuildCompiler;
 		public int mCompileSinceCleanCount;
 		public BuildContext mBuildContext ~ delete _;
+		public bool mLinuxLLVMFallback;
+		public String mLinuxClangPath = new .() ~ delete _;
+		public String mLinuxLLDPath = new .() ~ delete _;
+		public String mLinuxArPath = new .() ~ delete _;
 #if IDE_C_SUPPORT
 		public ClangCompiler mDepClang ~ delete _;
 #endif
@@ -330,6 +354,7 @@ namespace IDE
 		public FileChangedDialog mFileChangedDialog;
 		public FindAndReplaceDialog mFindAndReplaceDialog;
 		public LaunchDialog mLaunchDialog;
+		public RemoteDebugDialog mRemoteDebugDialog;
 		public SymbolReferenceHelper mSymbolReferenceHelper;
 		public WrappedMenuValue mViewWhiteSpace = .(false);
 		public bool mEnableGCCollect = true;
@@ -354,6 +379,11 @@ namespace IDE
 		public IPCHelper mIPCHelper ~ delete _;
 		public bool mIPCHadFocus;
 #endif
+		// MCP endpoint (see IDE/MCP.md). Enabled with -mcp or -mcp=<port>.
+		public MCPServer mMCPServer ~ delete _;
+		public int32 mMCPPort = -1; // -1 = off, 0 = default port
+		public const int32 cDefaultMCPPort = 4300;
+		bool mMCPClientActive; // Drives the "(MCP Waiting)" / "(MCP Control)" title suffix
 
 		int32 mProcessAttachId;
 #if BF_PLATFORM_WINDOWS
@@ -364,6 +394,14 @@ namespace IDE
 
 		class LaunchData
 		{
+			public enum Kind
+			{
+				Normal,
+				GDB,
+				GDB_WSL
+			}
+
+			public Kind mKind;
 			public String mTargetPath ~ delete _;
 			public String mArgs ~ delete _;
 			public String mWorkingDir ~ delete _;
@@ -388,6 +426,18 @@ namespace IDE
 		public class ExecutionCmd
 		{
 			public bool mOnlyIfNotFailed;
+
+			public virtual bool IsReady => true;
+			public virtual float? PercentageDone => null;
+
+			public virtual void Execute()
+			{
+			}
+
+			public virtual void GetStatus(String outStr)
+			{
+
+			}
 		}
 
 		public class WriteEmitCmd : ExecutionCmd
@@ -414,7 +464,7 @@ namespace IDE
 		class ProcessBfCompileCmd : ExecutionCmd
 		{
 			public BfPassInstance mBfPassInstance ~ delete _;
-			public CompileKind mCompileKind;
+			public CompileKind mCompileKind ~ _.Dispose();
 			public Project mHotProject;
 			public Stopwatch mStopwatch ~ delete _;
 			public Profiler mProfiler;
@@ -468,6 +518,7 @@ namespace IDE
 		{
 			public String mCmd ~ delete _;
 			public String mPath ~ delete _;
+			public bool mSkipIfBuildFailed;
 		}
 
 		public enum ArgsFileKind
@@ -494,6 +545,9 @@ namespace IDE
 
 		public class ExecutionInstance
 		{
+			public String mFileName ~ delete _;
+			public String mArgs ~ delete _;
+
 			public SpawnedProcess mProcess /*~ delete _*/;
 			public List<String> mDeferredOutput = new List<String>() ~ DeleteContainerAndItems!(_);
 			public Stopwatch mStopwatch = new Stopwatch() ~ delete _;
@@ -679,6 +733,37 @@ namespace IDE
 				});
 		}
 
+		public virtual void DeletePanels()
+		{
+			mixin RemoveAndDelete(var widget)
+			{
+				Widget.RemoveAndDelete(widget);
+				widget = null;
+			}
+
+			RemoveAndDelete!(mProjectPanel);
+			RemoveAndDelete!(mClassViewPanel);
+			RemoveAndDelete!(mOutputPanel);
+#if BF_PLATFORM_WINDOWS
+			RemoveAndDelete!(mTerminalPanel);
+			RemoveAndDelete!(mConsolePanel);
+#endif
+			RemoveAndDelete!(mImmediatePanel);
+			RemoveAndDelete!(mFindResultsPanel);
+			RemoveAndDelete!(mAutoWatchPanel);
+			RemoveAndDelete!(mWatchPanel);
+			RemoveAndDelete!(mMemoryPanel);
+			RemoveAndDelete!(mCallStackPanel);
+			RemoveAndDelete!(mBreakpointPanel);
+			RemoveAndDelete!(mDiagnosticsPanel);
+			RemoveAndDelete!(mModulePanel);
+			RemoveAndDelete!(mThreadPanel);
+			RemoveAndDelete!(mProfilePanel);
+			RemoveAndDelete!(mPropertiesPanel);
+			RemoveAndDelete!(mAutoCompletePanel);
+			RemoveAndDelete!(mBookmarksPanel);
+		}
+
 		void PCChanged()
 		{
 			var disasmPanel = TryGetDisassemblyPanel();
@@ -717,6 +802,9 @@ namespace IDE
 
 		public ~this()
 		{
+			// An open file-changed dialog dies with its window below; its destructor asserts we no
+			// longer point at it.
+			mFileChangedDialog = null;
 #if !CLI
 			if (!mStartedWithTestScript && !mForceFirstRun)
 			{
@@ -739,33 +827,7 @@ namespace IDE
 					}
 				});*/
 
-			mixin RemoveAndDelete(var widget)
-			{
-				Widget.RemoveAndDelete(widget);
-				widget = null;
-			}
-
-			RemoveAndDelete!(mProjectPanel);
-			RemoveAndDelete!(mClassViewPanel);
-			RemoveAndDelete!(mOutputPanel);
-#if BF_PLATFORM_WINDOWS
-			RemoveAndDelete!(mTerminalPanel);
-			RemoveAndDelete!(mConsolePanel);
-#endif
-			RemoveAndDelete!(mImmediatePanel);
-			RemoveAndDelete!(mFindResultsPanel);
-			RemoveAndDelete!(mAutoWatchPanel);
-			RemoveAndDelete!(mWatchPanel);
-			RemoveAndDelete!(mMemoryPanel);
-			RemoveAndDelete!(mCallStackPanel);
-			RemoveAndDelete!(mBreakpointPanel);
-			RemoveAndDelete!(mDiagnosticsPanel);
-			RemoveAndDelete!(mModulePanel);
-			RemoveAndDelete!(mThreadPanel);
-			RemoveAndDelete!(mProfilePanel);
-			RemoveAndDelete!(mPropertiesPanel);
-			RemoveAndDelete!(mAutoCompletePanel);
-			RemoveAndDelete!(mBookmarksPanel);
+			DeletePanels();
 
 			if (mSymbolReferenceHelper != null)
 				mSymbolReferenceHelper.Close();
@@ -826,6 +888,12 @@ namespace IDE
 #endif
 			delete mSpellChecker;
 
+			mixin RemoveAndDelete(var widget)
+			{
+				Widget.RemoveAndDelete(widget);
+				widget = null;
+			}
+
 			//NOTE: this must be done after the resolve compiler has been destroyed
 			RemoveAndDelete!(mErrorsPanel);
 
@@ -851,7 +919,7 @@ namespace IDE
 			}
 		}
 
-		void WithStandardPanels(delegate void(Panel panel) dlg)
+		protected virtual void WithStandardPanels(delegate void(Panel panel) dlg)
 		{
 			dlg(mProjectPanel);
 			dlg(mClassViewPanel);
@@ -891,6 +959,9 @@ namespace IDE
 				mDebugger.mIsRunning = false;
 				mExecutionPaused = false;
 			}
+
+			if (mMCPServer != null)
+				mMCPServer.Stop();
 
 			base.Shutdown();
 		}
@@ -1290,12 +1361,12 @@ namespace IDE
 						}
 					}
 				});
-			WithSourceViewPanels(scope (sourceViewPanel) =>
+			WithContentPanels(scope (contentPanel) =>
 				{
-					if (sourceViewPanel.HasUnsavedChanges())
+					if (contentPanel.HasUnsavedChanges())
 					{
 						var fileName = scope String();
-						Path.GetFileName(sourceViewPanel.mFilePath, fileName);
+						Path.GetFileName(contentPanel.mFilePath, fileName);
 						if (fileName.IsWhiteSpace)
 							fileName.Set("untitled");
 						if (!changedList.Contains(fileName))
@@ -1373,12 +1444,12 @@ namespace IDE
 
 			List<String> changedList = scope List<String>();
 			defer ClearAndDeleteItems(changedList);
-			WithSourceViewPanelsOf(window, scope (sourceViewPanel) =>
+			WithContentPanelsOf(window, scope (contentPanel) =>
 				{
-					if (sourceViewPanel.HasUnsavedChanges())
+					if (contentPanel.HasUnsavedChanges())
 					{
 						var fileName = new String();
-						Path.GetFileName(sourceViewPanel.mFilePath, fileName);
+						Path.GetFileName(contentPanel.mFilePath, fileName);
 						changedList.Add(fileName);
 					}
 				});
@@ -1394,10 +1465,10 @@ namespace IDE
 					bool hadError = false;
 					// We use a close delay after saving so the user can see we actually saved before closing down
 					var _this = this;
-					WithSourceViewPanelsOf(window, scope [&] (sourceViewPanel) =>
+					WithContentPanelsOf(window, scope [&] (contentPanel) =>
 						{
-							if ((!hadError) && (sourceViewPanel.HasUnsavedChanges()))
-								if (!_this.SaveFile(sourceViewPanel))
+							if ((!hadError) && (contentPanel.HasUnsavedChanges()))
+								if (!_this.SaveFile(contentPanel))
 									hadError = true;
 						});
 					if (hadError)
@@ -1408,10 +1479,10 @@ namespace IDE
 			aDialog.AddButton("Don't Save", new (evt) =>
 				{
 					var _this = this;
-					WithSourceViewPanelsOf(window, scope [&] (sourceViewPanel) =>
+					WithContentPanelsOf(window, scope [&] (contentPanel) =>
 						{
-							if (sourceViewPanel.HasUnsavedChanges())
-								_this.RevertSourceViewPanel(sourceViewPanel);
+							if (contentPanel.HasUnsavedChanges())
+								_this.RevertContentPanel(contentPanel);
 						});
 					CloseTabs();
 					CloseWindow();
@@ -1521,8 +1592,6 @@ namespace IDE
 
 			if (Utils.WriteTextFile(path, useText) case .Err)
 			{
-				if (gApp.mSettings.mEditorSettings.mPerforceAutoCheckout)
-					mSourceControl.Checkout(path);
 				Thread.Sleep(10);
 				if (Utils.WriteTextFile(path, useText) case .Err)
 				{
@@ -1602,7 +1671,7 @@ namespace IDE
 			return Utils.LoadTextFile(fileName, outBuffer, autoRetry, onPreFilter);
 		}
 
-		public bool SaveFileAs(SourceViewPanel sourceViewPanel)
+		public virtual bool SaveFileAs(ContentPanel sourceViewPanel)
 		{
 #if !CLI
 			String fullDir = scope .();
@@ -1735,6 +1804,22 @@ namespace IDE
 				}
 			}
 			return true;
+		}
+
+		public bool SaveFile(ContentPanel contentPanel, String forcePath = null)
+		{
+			if (var sourceViewPanel = contentPanel as SourceViewPanel)
+				return SaveFile(sourceViewPanel, forcePath);
+
+			return false;
+		}
+
+		/// Saves any content panel (source or binary)
+		public bool SaveFile(ContentPanel contentPanel)
+		{
+			if (let sourceViewPanel = contentPanel as SourceViewPanel)
+				return SaveFile(sourceViewPanel);
+			return contentPanel.Save();
 		}
 
 		public ProjectSource FindProjectItem(ProjectFolder projectFolder, String relPath)
@@ -1922,7 +2007,7 @@ namespace IDE
 			return LoadWorkspaceUserData(sd);
 		}
 
-		void SaveWorkspaceUserData(StructuredData sd)
+		protected virtual void SaveWorkspaceUserData(StructuredData sd)
 		{
 			sd.Add("FileVersion", 1);
 			sd.Add("LastConfig", mConfigName);
@@ -2095,7 +2180,7 @@ namespace IDE
 			}
 		}
 
-		bool SaveWorkspaceUserData(bool showErrors = true)
+		protected virtual bool SaveWorkspaceUserData(bool showErrors = true)
 		{
 			// Don't save if we didn't finish creating the workspace
 			if (mWorkspace.mNeedsCreate)
@@ -3343,13 +3428,27 @@ namespace IDE
 			case .Git(let url, let ver):
 
 				var checkPath = scope String();
-				if (mPackMan.CheckLock(projectName, checkPath, var projectFailed))
+				String checkError = scope .();
+				if (mPackMan.CheckLock(projectName, url, checkPath, checkError, var projectFailed))
 				{
 					projectFilePath = scope:: String(checkPath);
 				}
 				else
 				{
-					mPackMan.GetWithVersion(projectName, url, ver);
+					if (projectFailed)
+					{
+						Fail(checkError);
+						return .Err(.LoadFailed);
+					}
+					String versionError = scope .();
+					if (mPackMan.GetWithVersion(projectName, url, ver, versionError) case .Err)
+					{
+						if (!versionError.IsEmpty)
+							Fail(versionError);
+						else
+							Fail(scope $"Failed to initialize managed library support for project '{projectName}'");
+						return .Err(.NotFound);
+					}
 					isDeferredLoad = true;
 				}
 			default:
@@ -3498,7 +3597,7 @@ namespace IDE
 			if (data.GetBool("DefaultDocumentsTabbedView"))
 				mActiveDocumentsTabbedView = tabbedView;
 
-			SourceViewTabButton activeTab = null;
+			ContentTabButton activeTab = null;
 			for ( data.Enumerate("Tabs"))
 			{
 				Panel panel = Panel.Create(data);
@@ -3508,7 +3607,7 @@ namespace IDE
 
 				bool isActive = data.GetBool("Active");
 
-				var newTabButton = new SourceViewTabButton();
+				var newTabButton = new ContentTabButton();
 				newTabButton.Label = "";
 				data.GetString("TabLabel", newTabButton.mLabel);
 				newTabButton.mIsPinned = data.GetBool("TabIsPinned");
@@ -3599,7 +3698,7 @@ namespace IDE
 			mRequestedShowKind = data.GetEnum<BFWindow.ShowKind>("ShowKind");
 		}
 
-		bool LoadWorkspaceUserData(StructuredData data)
+		protected virtual bool LoadWorkspaceUserData(StructuredData data)
 		{
 			//
 			{
@@ -3817,21 +3916,31 @@ namespace IDE
 		}
 
 		[IDECommand]
-		public void SaveFile()
+		public virtual void SaveFile()
 		{
 			var sourceViewPanel = GetActiveSourceViewPanel();
 			if (sourceViewPanel != null)
+			{
 				SaveFile(sourceViewPanel);
+				return;
+			}
+
+			if (let contentPanel = GetActiveDocumentPanel() as ContentPanel)
+				SaveFile(contentPanel);
 		}
 
 		[IDECommand]
-		public void SaveAs()
+		public virtual void SaveAs()
 		{
 			var sourceViewPanel = GetActiveSourceViewPanel();
 			if (sourceViewPanel != null)
 			{
 				SaveFileAs(sourceViewPanel);
+				return;
 			}
+
+			if (let contentPanel = GetActiveDocumentPanel() as ContentPanel)
+				SaveFileAs(contentPanel);
 		}
 
 		[IDECommand]
@@ -3948,9 +4057,9 @@ namespace IDE
 		{
 			bool success = true;
 
-			WithSourceViewPanels(scope [&] (sourceViewPanel) =>
+			WithContentPanels(scope [&] (contentPanel) =>
 				{
-					success &= SaveFile(sourceViewPanel);
+					success &= SaveFile(contentPanel);
 				});
 			mWorkspace.WithProjectItems(scope [&] (projectItem) =>
 				{
@@ -4241,7 +4350,7 @@ namespace IDE
 			if ((activeDoumentPanel == null) && (mActiveDocumentsTabbedView != null))
 			{
 				var activeTab = mActiveDocumentsTabbedView.GetActiveTab();
-				activeTab.Activate();
+				activeTab?.Activate();
 				return;
 			}
 
@@ -4311,6 +4420,10 @@ namespace IDE
 			{
 				memoryPanel.GotoAddress();
 			}
+			else if (let binaryDataPanel = activePanel as BinaryDataPanel)
+			{
+				binaryDataPanel.ShowGotoOffset();
+			}
 		}
 
 		[IDECommand]
@@ -4324,19 +4437,8 @@ namespace IDE
 		[IDECommand]
 		public void Cmd_RenameItem()
 		{
-			let activePanel = GetActivePanel();
-			if (var projectPanel = activePanel as ProjectPanel)
-			{
-				projectPanel.TryRenameItem();
-			}
-			else if (var watchPanel = activePanel as WatchPanel)
-			{
-				watchPanel.TryRenameItem();
-			}
-			else if (var bookmarksPanel = activePanel as BookmarksPanel)
-			{
-				bookmarksPanel.TryRenameItem();
-			}
+			if (var panel = GetActivePanel() as Panel)
+				panel.TryRenameItem();
 		}
 
 		[IDECommand]
@@ -5282,7 +5384,7 @@ namespace IDE
 			OpenedNew
 		}
 
-		ShowTabResult ShowTab(Widget tabContent, String name, bool ownsContent, bool setFocus)
+		ShowTabResult ShowTab(Widget tabContent, String name, bool ownsContent, bool setFocus, bool isDocument = false)
 		{
 			var result = ShowTabResult.Existing;
 			var tabButton = GetTab(tabContent);
@@ -5300,6 +5402,8 @@ namespace IDE
 						});
 				}
 
+				if ((tabbedView == null) && (isDocument))
+					tabbedView = GetDefaultDocumentTabbedView();
 				if (tabbedView == null)
 					tabbedView = FindTabbedView(mDockingFrame, -1, 1);
 				if (tabbedView == null)
@@ -5328,7 +5432,7 @@ namespace IDE
 				sourceViewPanel.RecordHistoryLocation();
 		}
 
-		void ShowPanel(Panel panel, String label, bool setFocus = true)
+		protected void ShowPanel(Panel panel, String label, bool setFocus = true, bool isDocument = false)
 		{
 			if (!mInitialized)
 				return;
@@ -5336,7 +5440,7 @@ namespace IDE
 			if (setFocus)
 				mLastActivePanel = panel;
 			RecordHistoryLocation();
-			ShowTab(panel, label, false, setFocus);
+			ShowTab(panel, label, false, setFocus, isDocument);
 			if (setFocus)
 				panel.FocusForKeyboard();
 
@@ -5779,6 +5883,20 @@ namespace IDE
 			mLaunchDialog.mOnClosed.Add(new () => { mLaunchDialog = null; });
 		}
 
+		[IDECommand]
+		void DoRemoteDebug()
+		{
+			if (mRemoteDebugDialog != null)
+			{
+				mRemoteDebugDialog.mWidgetWindow.SetForeground();
+				return;
+			}
+
+			mRemoteDebugDialog = new RemoteDebugDialog();
+			mRemoteDebugDialog.PopupWindow(mMainWindow);
+			mRemoteDebugDialog.mOnClosed.Add(new () => { mRemoteDebugDialog = null; });
+		}
+
 		void DoProfile()
 		{
 			if (gApp.mProfilePanel.mUserProfiler != null)
@@ -5890,12 +6008,28 @@ namespace IDE
 			return (mTestManager != null);
 		}
 
-		[IDECommand]
-		protected void RunTests(bool includeIgnored, bool debug)
+		void TestConfigNotSupported()
+		{
+			// Under BeefBuild the config defaults to "Test", so a non-Test config was explicitly requested - don't silently substitute another one
+			OutputErrorLine("Workspace configuration '{}' does not have a Test build kind, so tests cannot be run with it. Omit '-config' to use the 'Test' configuration, or set 'BuildKind = \"Test\"' on this configuration.", mConfigName);
+			TestFailed();
+		}
+
+		protected void DoRunTests(bool includeIgnored, bool debug, Project project)
 		{
 			var workspaceOptions = GetCurWorkspaceOptions();
 			if (CurrentPlatform == .Wasm)
 			{
+				// Wasm tests run by launching the module in a browser, which needs the IDE. The
+				// guard below only covers a non-Test config, so BeefBuild otherwise reached
+				// CompileAndRun and crashed on its unconditional mOutputPanel.Clear().
+				if (mMainFrame == null)
+				{
+					OutputErrorLine("Tests cannot be run for wasm32 from the command line: the module has to be launched in a browser, which requires the IDE.");
+					TestFailed();
+					return;
+				}
+
 				if (workspaceOptions.mBuildKind != .Test)
 					mMainFrame.mStatusBar.SelectConfig("Test");
 				CompileAndRun(true);
@@ -5924,14 +6058,21 @@ namespace IDE
 
 			if (workspaceOptions.mBuildKind != .Test)
 			{
+				if (mMainFrame == null)
+				{
+					TestConfigNotSupported();
+					return;
+				}
 				mMainFrame.mStatusBar.SelectConfig("Test");
 			}
 
 			workspaceOptions = GetCurWorkspaceOptions();
 			if (workspaceOptions.mBuildKind != .Test)
 			{
-				mMainFrame.mStatusBar.SelectConfig(prevConfigName);
+				if (mMainFrame != null)
+					mMainFrame.mStatusBar.SelectConfig(prevConfigName);
 				OutputErrorLine("No valid Test workspace configuration exists");
+				TestFailed();
 				return;
 			}
 
@@ -5942,6 +6083,8 @@ namespace IDE
 			mTestManager.mPrevConfigName = new String(prevConfigName);
 			mTestManager.mDebug = debug && (platformType != .Wasm);
 			mTestManager.mIncludeIgnored = includeIgnored;
+			if (project != null)
+				mTestManager.mTargetTestProject = new .(project.mProjectName);
 
 			if (mOutputPanel != null)
 				mOutputPanel.Clear();
@@ -5949,11 +6092,18 @@ namespace IDE
 			if (!Compile(.Test, null))
 			{
 				mTestManager.BuildFailed();
+				TestFailed();
 			}
 			if (!mTestManager.HasProjects)
 			{
 				OutputLineSmart("WARNING: No projects have a test configuration specified");
 			}
+		}
+
+		[IDECommand]
+		protected void RunTests(bool includeIgnored, bool debug)
+		{
+			DoRunTests(includeIgnored, debug, null);
 		}
 
 		[IDECommand]
@@ -5995,6 +6145,11 @@ namespace IDE
 		public void UpdateMenuItem_HasActiveDocument(IMenu menu)
 		{
 			menu.SetDisabled(GetActiveDocumentPanel() == null);
+		}
+
+		public virtual void UpdateMenuItem_SaveAs(IMenu menu)
+		{
+			UpdateMenuItem_HasActiveDocument(menu);
 		}
 
 		public void UpdateMenuItem_HasLastActiveDocument(IMenu menu)
@@ -6045,87 +6200,59 @@ namespace IDE
 			menu.SetDisabled(mDebugger.mIsRunning);
 		}
 
-		public void CreateMenu()
+		public virtual void CreateMenu_Populate(MenuInfo root)
 		{
-			scope AutoBeefPerf("IDEApp.CreateMenu");
-
-			SysMenu root = mMainWindow.mSysMenu;
-
-			String keyStr = scope String();
-
-			SysMenu AddMenuItem(SysMenu menu, String dispString, String cmdName, MenuItemUpdateHandler menuItemUpdateHandler = null,
-				SysBitmap bitmap = null, bool enabled = true,  int32 checkState = -1, bool radioCheck = false)
-			{
-				let ideCommand = mCommands.mCommandMap[cmdName];
-				if (ideCommand != null)
-				{
-					keyStr.Clear();
-					ideCommand.ToString(keyStr);
-					keyStr.Insert(0, "#");
-				}
-
-				let itemMenu = menu.AddMenuItem(dispString, (ideCommand != null) ? keyStr : null, new (evt) => ideCommand.mAction(), menuItemUpdateHandler, bitmap, enabled, checkState, radioCheck);
-				if (ideCommand != null)
-				{
-					ideCommand.mMenuItem = itemMenu;
-				}
-
-				return itemMenu;
-			}
-
-			//////////
-
-			SysMenu subMenu = root.AddMenuItem("&File");
+			var subMenu = root.AddMenuItem("&File");
 			let newMenu = subMenu.AddMenuItem("&New");
-			AddMenuItem(newMenu, "New &Workspace", "New Workspace");
-			AddMenuItem(newMenu, "New &Project", "New Project");
-			AddMenuItem(newMenu, "New &Debug Session", "New Debug Session");
-			AddMenuItem(newMenu, "New &File", "New File");
+			newMenu.AddMenuItem("New &Workspace", "New Workspace");
+			newMenu.AddMenuItem("New &Project", "New Project");
+			newMenu.AddMenuItem("New &Debug Session", "New Debug Session");
+			newMenu.AddMenuItem("New &File", "New File");
 
 			let openMenu = subMenu.AddMenuItem("&Open");
 			//openMenu.AddMenuItem("&Open Workspace...", GetCmdKey("Open Workspace"), new (evt) => { OpenWorkspace(); } );
-			AddMenuItem(openMenu, "Open &Workspace...", "Open Workspace");
-			AddMenuItem(openMenu, "Open &Project...", "Open Project");
-			AddMenuItem(openMenu, "Open &Debug Session...", "Open Debug Session");
-			AddMenuItem(openMenu, "Open &File...", "Open File");
-			AddMenuItem(openMenu, "&Open File in Workspace", "Open File in Workspace");
-			AddMenuItem(openMenu, "&Open Corresponding (cpp/h)", "Open Corresponding");
-			AddMenuItem(openMenu, "Open &Crash Dump...", "Open Crash Dump");
+			openMenu.AddMenuItem("Open &Workspace...", "Open Workspace");
+			openMenu.AddMenuItem("Open &Project...", "Open Project");
+			openMenu.AddMenuItem("Open &Debug Session...", "Open Debug Session");
+			openMenu.AddMenuItem("Open &File...", "Open File");
+			openMenu.AddMenuItem("&Open File in Workspace", "Open File in Workspace");
+			openMenu.AddMenuItem("&Open Corresponding (cpp/h)", "Open Corresponding");
+			openMenu.AddMenuItem("Open &Crash Dump...", "Open Crash Dump");
 
 			let recentMenu = subMenu.AddMenuItem("Open &Recent");
-			mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedWorkspace].mMenu = recentMenu.AddMenuItem("Open Recent &Workspace");
-			mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedDebugSession].mMenu = recentMenu.AddMenuItem("Open Recent &Debug Session");
-			mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedFile].mMenu = recentMenu.AddMenuItem("Open Recent &File");
-			mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedCrashDump].mMenu = recentMenu.AddMenuItem("Open Recent &Crash Dump");
+			recentMenu.AddMenuItem("Open Recent &Workspace").mOnCreate = new (menu) => { mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedWorkspace].mMenu = menu; };
+			recentMenu.AddMenuItem("Open Recent &Debug Session").mOnCreate = new (menu) => { mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedDebugSession].mMenu = menu; };
+			recentMenu.AddMenuItem("Open Recent &File").mOnCreate = new (menu) => { mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedFile].mMenu = menu; };
+			recentMenu.AddMenuItem("Open Recent &Crash Dump").mOnCreate = new (menu) => { mSettings.mRecentFiles.mRecents[(int)RecentFiles.RecentKind.OpenedCrashDump].mMenu = menu; };
 
-			AddMenuItem(subMenu, "&Save File", "Save File", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Save &As...", "Save As", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Save A&ll", "Save All");
+			subMenu.AddMenuItem("&Save File", "Save File", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("Save &As...", "Save As", new => UpdateMenuItem_SaveAs);
+			subMenu.AddMenuItem("Save A&ll", "Save All");
 			let prefMenu = subMenu.AddMenuItem("&Preferences");
-			AddMenuItem(prefMenu, "&Settings", "Settings");
-			AddMenuItem(prefMenu, "Reload Settings", "Reload Settings");
-			AddMenuItem(prefMenu, "Reset UI", "Reset UI");
-			AddMenuItem(prefMenu, "Safe Mode", "Safe Mode Toggle", new (menu) => { menu.SetCheckState(mSafeMode ? 1 : 0); }, null, true, mSafeMode ? 1 : 0);
-			AddMenuItem(subMenu, "Close Workspace", "Close Workspace", new => UpdateMenuItem_HasWorkspace);
-			AddMenuItem(subMenu, "E&xit", "Exit");
+			prefMenu.AddMenuItem("&Settings", "Settings");
+			prefMenu.AddMenuItem("Reload Settings", "Reload Settings");
+			prefMenu.AddMenuItem("Reset UI", "Reset UI");
+			prefMenu.AddMenuItem("Safe Mode", "Safe Mode Toggle", new (menu) => { menu.SetCheckState(mSafeMode ? 1 : 0); }, null, true, mSafeMode ? 1 : 0);
+			subMenu.AddMenuItem("Close Workspace", "Close Workspace", new => UpdateMenuItem_HasWorkspace);
+			subMenu.AddMenuItem("E&xit", "Exit");
 
 			//////////
 
 			subMenu = root.AddMenuItem("&Edit");
-			AddMenuItem(subMenu, "Quick &Find...", "Find in Document", new => UpdateMenuItem_HasActivePanel);
-			AddMenuItem(subMenu, "Quick &Replace...", "Replace in Document", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Find in &Files...", "Find in Files");
-			AddMenuItem(subMenu, "Replace in Files...", "Replace in Files");
-			AddMenuItem(subMenu, "Find Prev", "Find Prev", new => UpdateMenuItem_HasActivePanel);
-			AddMenuItem(subMenu, "Find Next", "Find Next", new => UpdateMenuItem_HasActivePanel);
-			AddMenuItem(subMenu, "Show &Current", "Show Current");
+			subMenu.AddMenuItem("Quick &Find...", "Find in Document", new => UpdateMenuItem_HasActivePanel);
+			subMenu.AddMenuItem("Quick &Replace...", "Replace in Document", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("Find in &Files...", "Find in Files");
+			subMenu.AddMenuItem("Replace in Files...", "Replace in Files");
+			subMenu.AddMenuItem("Find Prev", "Find Prev", new => UpdateMenuItem_HasActivePanel);
+			subMenu.AddMenuItem("Find Next", "Find Next", new => UpdateMenuItem_HasActivePanel);
+			subMenu.AddMenuItem("Show &Current", "Show Current");
 
-			AddMenuItem(subMenu, "&Goto Line...", "Goto Line", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Goto &Method...", "Goto Method", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "&Rename Symbol", "Rename Symbol", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Show Fi&xit", "Show Fixit", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Find &All References", "Find All References", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Find C&lass...", "Find Class");
+			subMenu.AddMenuItem("&Goto Line...", "Goto Line", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("Goto &Method...", "Goto Method", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("&Rename Symbol", "Rename Symbol", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("Show Fi&xit", "Show Fixit", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("Find &All References", "Find All References", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("Find C&lass...", "Find Class");
 			subMenu.AddMenuItem(null);
 
 			var encodingMenu = subMenu.AddMenuItem("Encoding");
@@ -6133,11 +6260,18 @@ namespace IDE
 
 			void AddLineEndingKind(String name, LineEndingKind lineEndingKind)
 			{
-				lineEndingMenu.AddMenuItem(name, null,
+				bool allowLast;
+#if !BF_PLATFORM_WINDOWS
+				allowLast = true;
+#else
+				allowLast = false;
+#endif
+
+				lineEndingMenu.AddMenuItem(name,
 					new (menu) =>
 					{
 						var sysMenu = (SysMenu)menu;
-						var sourceViewPanel = GetActiveSourceViewPanel();
+						var sourceViewPanel = GetActiveSourceViewPanel(allowLast);
 						if (sourceViewPanel != null)
 						{
 							if (sourceViewPanel.mEditData.mLineEndingKind != lineEndingKind)
@@ -6152,7 +6286,7 @@ namespace IDE
 					{
 						var sysMenu = (SysMenu)menu;
 
-						var sourceViewPanel = GetActiveSourceViewPanel();
+						var sourceViewPanel = GetActiveSourceViewPanel(allowLast);
 						if (sourceViewPanel != null)
 						{
 							sysMenu.Modify(null, null, null, true, (sourceViewPanel.mEditData.mLineEndingKind == lineEndingKind) ? 1 : 0, true);
@@ -6168,47 +6302,47 @@ namespace IDE
 			AddLineEndingKind("Mac OS 9", .Cr);
 
 			var bookmarkMenu = subMenu.AddMenuItem("Boo&kmarks");
-			AddMenuItem(bookmarkMenu, "&Toggle Bookmark", "Bookmark Toggle");
-			AddMenuItem(bookmarkMenu, "&Next Bookmark", "Bookmark Next");
-			AddMenuItem(bookmarkMenu, "&Previous Bookmark", "Bookmark Prev");
-			AddMenuItem(bookmarkMenu, "&Clear Bookmarks", "Bookmark Clear");
+			bookmarkMenu.AddMenuItem("&Toggle Bookmark", "Bookmark Toggle");
+			bookmarkMenu.AddMenuItem("&Next Bookmark", "Bookmark Next");
+			bookmarkMenu.AddMenuItem("&Previous Bookmark", "Bookmark Prev");
+			bookmarkMenu.AddMenuItem("&Clear Bookmarks", "Bookmark Clear");
 
 			var comptimeMenu = subMenu.AddMenuItem("Comptime");
 			var emitViewCompiler = comptimeMenu.AddMenuItem("Emit View Compiler");
-			var subItem = emitViewCompiler.AddMenuItem("Resolve", null,
+			var subItem = emitViewCompiler.AddMenuItem("Resolve",
 				new (menu) => { SetEmbedCompiler(.Resolve); },
 				new (menu) => { menu.SetCheckState((mSettings.mEditorSettings.mEmitCompiler == .Resolve) ? 1 : 0); },
 				null, true, (mSettings.mEditorSettings.mEmitCompiler == .Resolve) ? 1 : 0);
-			subItem = emitViewCompiler.AddMenuItem("Build", null,
+			subItem = emitViewCompiler.AddMenuItem("Build",
 				new (menu) => { SetEmbedCompiler(.Build); },
 				new (menu) => { menu.SetCheckState((mSettings.mEditorSettings.mEmitCompiler == .Build) ? 1 : 0); },
 				null, true, (mSettings.mEditorSettings.mEmitCompiler == .Build) ? 1 : 0);
 
 			var advancedEditMenu = subMenu.AddMenuItem("Advanced");
-			AddMenuItem(advancedEditMenu, "Duplicate Line", "Duplicate Line");
-			AddMenuItem(advancedEditMenu, "Move Line Up", "Move Line Up");
-			AddMenuItem(advancedEditMenu, "Move Line Down", "Move Line Down");
-			AddMenuItem(advancedEditMenu, "Move Statement Up", "Move Statement Up");
-			AddMenuItem(advancedEditMenu, "Move Statement Down", "Move Statement Down");
+			advancedEditMenu.AddMenuItem("Duplicate Line", "Duplicate Line");
+			advancedEditMenu.AddMenuItem("Move Line Up", "Move Line Up");
+			advancedEditMenu.AddMenuItem("Move Line Down", "Move Line Down");
+			advancedEditMenu.AddMenuItem("Move Statement Up", "Move Statement Up");
+			advancedEditMenu.AddMenuItem("Move Statement Down", "Move Statement Down");
 			advancedEditMenu.AddMenuItem(null);
-			AddMenuItem(advancedEditMenu, "Make Uppercase", "Make Uppercase");
-			AddMenuItem(advancedEditMenu, "Make Lowercase", "Make Lowercase");
-			AddMenuItem(advancedEditMenu, "Comment Block", "Comment Block");
-			AddMenuItem(advancedEditMenu, "Comment Lines", "Comment Lines");
-			AddMenuItem(advancedEditMenu, "Comment Toggle", "Comment Toggle");
-			AddMenuItem(advancedEditMenu, "Uncomment Selection", "Uncomment Selection");
-			AddMenuItem(advancedEditMenu, "Reformat Document", "Reformat Document");
-			mViewWhiteSpace.mMenu = AddMenuItem(advancedEditMenu, "View White Space", "View White Space", null, null, true, mViewWhiteSpace.Bool ? 1 : 0);
+			advancedEditMenu.AddMenuItem("Make Uppercase", "Make Uppercase");
+			advancedEditMenu.AddMenuItem("Make Lowercase", "Make Lowercase");
+			advancedEditMenu.AddMenuItem("Comment Block", "Comment Block");
+			advancedEditMenu.AddMenuItem("Comment Lines", "Comment Lines");
+			advancedEditMenu.AddMenuItem("Comment Toggle", "Comment Toggle");
+			advancedEditMenu.AddMenuItem("Uncomment Selection", "Uncomment Selection");
+			advancedEditMenu.AddMenuItem("Reformat Document", "Reformat Document");
+			advancedEditMenu.AddMenuItem("View White Space", "View White Space", null, null, true, mViewWhiteSpace.Bool ? 1 : 0).mOnCreate = new (menu) => { mViewWhiteSpace.mMenu = menu; };
 
 			if (mSettings.mEnableDevMode)
 			{
 				subMenu.AddMenuItem(null);
 				var internalEditMenu = subMenu.AddMenuItem("Internal");
-				internalEditMenu.AddMenuItem("Hilight Cursor References", null, new (menu) => { ToggleCheck(menu, ref gApp.mSettings.mEditorSettings.mHiliteCursorReferences); }, null, null, true, gApp.mSettings.mEditorSettings.mHiliteCursorReferences ? 1 : 0);
-				internalEditMenu.AddMenuItem("Delayed Autocomplete", null, new (menu) => { ToggleCheck(menu, ref gApp.mDbgDelayedAutocomplete); }, null, null, true, gApp.mDbgDelayedAutocomplete ? 1 : 0);
-				internalEditMenu.AddMenuItem("Time Autocomplete", null, new (menu) => { ToggleCheck(menu, ref gApp.mDbgTimeAutocomplete); }, null, null, true, gApp.mDbgTimeAutocomplete ? 1 : 0);
-				internalEditMenu.AddMenuItem("Perf Autocomplete", null, new (menu) => { ToggleCheck(menu, ref gApp.mDbgPerfAutocomplete); }, null, null, true, gApp.mDbgPerfAutocomplete ? 1 : 0);
-				internalEditMenu.AddMenuItem("Dump Undo Buffer", null, new (menu) =>
+				internalEditMenu.AddMenuItem("Hilight Cursor References", new (menu) => { ToggleCheck(menu, ref gApp.mSettings.mEditorSettings.mHiliteCursorReferences); }, null, null, true, gApp.mSettings.mEditorSettings.mHiliteCursorReferences ? 1 : 0);
+				internalEditMenu.AddMenuItem("Delayed Autocomplete", new (menu) => { ToggleCheck(menu, ref gApp.mDbgDelayedAutocomplete); }, null, null, true, gApp.mDbgDelayedAutocomplete ? 1 : 0);
+				internalEditMenu.AddMenuItem("Time Autocomplete", new (menu) => { ToggleCheck(menu, ref gApp.mDbgTimeAutocomplete); }, null, null, true, gApp.mDbgTimeAutocomplete ? 1 : 0);
+				internalEditMenu.AddMenuItem("Perf Autocomplete", new (menu) => { ToggleCheck(menu, ref gApp.mDbgPerfAutocomplete); }, null, null, true, gApp.mDbgPerfAutocomplete ? 1 : 0);
+				internalEditMenu.AddMenuItem("Dump Undo Buffer", new (menu) =>
 					{
 						if (var panel = GetActiveSourceViewPanel())
 						{
@@ -6221,41 +6355,41 @@ namespace IDE
 			//////////
 
 			subMenu = root.AddMenuItem("&View");
-			AddMenuItem(subMenu, "AutoComplet&e", "Show Autocomplete Panel");
-			AddMenuItem(subMenu, "&Auto Watches", "Show Auto Watches");
-			AddMenuItem(subMenu, "Boo&kmarks", "Show Bookmarks");
-			AddMenuItem(subMenu, "&Breakpoints", "Show Breakpoints");
-			AddMenuItem(subMenu, "&Call Stack", "Show Call Stack");
-			AddMenuItem(subMenu, "C&lass View", "Show Class View");
-			AddMenuItem(subMenu, "&Diagnostics", "Show Diagnostics");
-			AddMenuItem(subMenu, "E&rrors", "Show Errors");
-			AddMenuItem(subMenu, "&Find Results", "Show Find Results");
-			AddMenuItem(subMenu, "&Terminal", "Show Terminal");
-			AddMenuItem(subMenu, "Co&nsole", "Show Console");
-			AddMenuItem(subMenu, "&Immediate Window", "Show Immediate");
-			AddMenuItem(subMenu, "&Memory", "Show Memory");
-			AddMenuItem(subMenu, "Mod&ules", "Show Modules");
-			AddMenuItem(subMenu, "&Output", "Show Output");
-			AddMenuItem(subMenu, "&Profiler", "Show Profiler");
-			AddMenuItem(subMenu, "T&hreads", "Show Threads");
-			AddMenuItem(subMenu, "&Watches", "Show Watches");
-			AddMenuItem(subMenu, "Work&space Explorer", "Show Workspace Explorer");
+			subMenu.AddMenuItem("AutoComplet&e", "Show Autocomplete Panel");
+			subMenu.AddMenuItem("&Auto Watches", "Show Auto Watches");
+			subMenu.AddMenuItem("Boo&kmarks", "Show Bookmarks");
+			subMenu.AddMenuItem("&Breakpoints", "Show Breakpoints");
+			subMenu.AddMenuItem("&Call Stack", "Show Call Stack");
+			subMenu.AddMenuItem("C&lass View", "Show Class View");
+			subMenu.AddMenuItem("&Diagnostics", "Show Diagnostics");
+			subMenu.AddMenuItem("E&rrors", "Show Errors");
+			subMenu.AddMenuItem("&Find Results", "Show Find Results");
+			subMenu.AddMenuItem("&Terminal", "Show Terminal");
+			subMenu.AddMenuItem("Co&nsole", "Show Console");
+			subMenu.AddMenuItem("&Immediate Window", "Show Immediate");
+			subMenu.AddMenuItem("&Memory", "Show Memory");
+			subMenu.AddMenuItem("Mod&ules", "Show Modules");
+			subMenu.AddMenuItem("&Output", "Show Output");
+			subMenu.AddMenuItem("&Profiler", "Show Profiler");
+			subMenu.AddMenuItem("T&hreads", "Show Threads");
+			subMenu.AddMenuItem("&Watches", "Show Watches");
+			subMenu.AddMenuItem("Work&space Explorer", "Show Workspace Explorer");
 			subMenu.AddMenuItem(null);
-			AddMenuItem(subMenu, "Next Document Panel", "Next Document Panel");
-			AddMenuItem(subMenu, "Navigate Backwards", "Navigate Backwards");
-			AddMenuItem(subMenu, "Navigate Forwards", "Navigate Forwards");
+			subMenu.AddMenuItem("Next Document Panel", "Next Document Panel");
+			subMenu.AddMenuItem("Navigate Backwards", "Navigate Backwards");
+			subMenu.AddMenuItem("Navigate Forwards", "Navigate Forwards");
 
 			//////////
 
 			subMenu = root.AddMenuItem("&Build");
-			AddMenuItem(subMenu, "&Build Workspace", "Build Workspace", new => UpdateMenuItem_HasWorkspace);
-			AddMenuItem(subMenu, "&Debug Comptime", "Debug Comptime", new => UpdateMenuItem_DebugStopped_HasWorkspace);
-			AddMenuItem(subMenu, "&Clean", "Clean", new => UpdateMenuItem_DebugStopped_HasWorkspace);
-			AddMenuItem(subMenu, "Clean Beef", "Clean Beef", new => UpdateMenuItem_DebugStopped_HasWorkspace);
+			subMenu.AddMenuItem("&Build Workspace", "Build Workspace", new => UpdateMenuItem_HasWorkspace);
+			subMenu.AddMenuItem("&Debug Comptime", "Debug Comptime", new => UpdateMenuItem_DebugStopped_HasWorkspace);
+			subMenu.AddMenuItem("&Clean", "Clean", new => UpdateMenuItem_DebugStopped_HasWorkspace);
+			subMenu.AddMenuItem("Clean Beef", "Clean Beef", new => UpdateMenuItem_DebugStopped_HasWorkspace);
 			//subMenu.AddMenuItem("Compile Current File", null, new (menu) => { CompileCurrentFile(); });
-			AddMenuItem(subMenu, "Cancel Build", "Cancel Build", new (menu) => { menu.SetDisabled(!IsCompiling); });
+			subMenu.AddMenuItem("Cancel Build", "Cancel Build", new (menu) => { menu.SetDisabled(!IsCompiling); });
 
-			subMenu.AddMenuItem("Verbose", null, new (menu) =>
+			subMenu.AddMenuItem("Verbose", new (menu) =>
 				{
 					if (mVerbosity != .Diagnostic)
 						mVerbosity = .Diagnostic;
@@ -6268,15 +6402,15 @@ namespace IDE
 			if (mSettings.mEnableDevMode)
 			{
 				var internalBuildMenu = subMenu.AddMenuItem("Internal");
-				internalBuildMenu.AddMenuItem("Autobuild (Debug)", null, new (menu) => { mDebugAutoBuild = !mDebugAutoBuild; });
-				internalBuildMenu.AddMenuItem("Autorun (Debug)", null, new (menu) => { mDebugAutoRun = !mDebugAutoRun; });
-				internalBuildMenu.AddMenuItem("Disable Compiling", null, new (menu) => { ToggleCheck(menu, ref mDisableBuilding); }, null, null, true, mDisableBuilding ? 1 : 0);
+				internalBuildMenu.AddMenuItem("Autobuild (Debug)", new (menu) => { mDebugAutoBuild = !mDebugAutoBuild; });
+				internalBuildMenu.AddMenuItem("Autorun (Debug)", new (menu) => { mDebugAutoRun = !mDebugAutoRun; });
+				internalBuildMenu.AddMenuItem("Disable Compiling", new (menu) => { ToggleCheck(menu, ref mDisableBuilding); }, null, null, true, mDisableBuilding ? 1 : 0);
 			}
 
 			//////////
 
 			subMenu = root.AddMenuItem("&Debug");
-			AddMenuItem(subMenu, "&Start Debugging", "Start Debugging", new (item) =>
+			subMenu.AddMenuItem("&Start Debugging", "Start Debugging", new (item) =>
 				{
 					SysMenu sysMenu = (.)item;
 					if (mDebugger.mIsRunning)
@@ -6284,38 +6418,39 @@ namespace IDE
 					else
 						sysMenu.Modify("&Start Debugging", sysMenu.mHotKey, null, mWorkspace.IsInitialized);
 				});
-			AddMenuItem(subMenu, "Start Wit&hout Debugging", "Start Without Debugging", new => UpdateMenuItem_DebugStopped_HasWorkspace);
-			AddMenuItem(subMenu, "Start With&out Compiling", "Start Without Compiling", new => UpdateMenuItem_DebugStopped_HasWorkspace);
-			AddMenuItem(subMenu, "&Launch Process...", "Launch Process", new => UpdateMenuItem_DebugStopped);
-			AddMenuItem(subMenu, "&Attach to Process...", "Attach to Process", new => UpdateMenuItem_DebugStopped);
-			AddMenuItem(subMenu, "&Stop Debugging", "Stop Debugging", new => UpdateMenuItem_DebugOrTestRunning);
-			AddMenuItem(subMenu, "Break All", "Break All", new => UpdateMenuItem_DebugNotPaused);
-			AddMenuItem(subMenu, "Remove All Breakpoints", "Remove All Breakpoints");
-			AddMenuItem(subMenu, "Show &Disassembly", "Show Disassembly");
-			AddMenuItem(subMenu, "&Quick Watch", "Show QuickWatch", new => UpdateMenuItem_DebugPaused);
-			AddMenuItem(subMenu, "&Profile", "Profile", new => UpdateMenuItem_HasWorkspace);
+			subMenu.AddMenuItem("Start Wit&hout Debugging", "Start Without Debugging", new => UpdateMenuItem_DebugStopped_HasWorkspace);
+			subMenu.AddMenuItem("Start With&out Compiling", "Start Without Compiling", new => UpdateMenuItem_DebugStopped_HasWorkspace);
+			subMenu.AddMenuItem("&Launch Process...", "Launch Process", new => UpdateMenuItem_DebugStopped);
+			subMenu.AddMenuItem("&Attach to Process...", "Attach to Process", new => UpdateMenuItem_DebugStopped);
+			subMenu.AddMenuItem("Remote &Debug...", "Remote Debug", new => UpdateMenuItem_DebugStopped);
+			subMenu.AddMenuItem("&Stop Debugging", "Stop Debugging", new => UpdateMenuItem_DebugOrTestRunning);
+			subMenu.AddMenuItem("Break All", "Break All", new => UpdateMenuItem_DebugNotPaused);
+			subMenu.AddMenuItem("Remove All Breakpoints", "Remove All Breakpoints");
+			subMenu.AddMenuItem("Show &Disassembly", "Show Disassembly");
+			subMenu.AddMenuItem("&Quick Watch", "Show QuickWatch", new => UpdateMenuItem_DebugPaused);
+			subMenu.AddMenuItem("&Profile", "Profile", new => UpdateMenuItem_HasWorkspace);
 			subMenu.AddMenuItem(null);
-			AddMenuItem(subMenu, "Step Into", "Step Into", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
-			AddMenuItem(subMenu, "Step Over", "Step Over", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
-			AddMenuItem(subMenu, "Step Out", "Step Out", new => UpdateMenuItem_DebugPaused);
+			subMenu.AddMenuItem("Step Into", "Step Into", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
+			subMenu.AddMenuItem("Step Over", "Step Over", new => UpdateMenuItem_DebugPausedOrStopped_HasWorkspace);
+			subMenu.AddMenuItem("Step Out", "Step Out", new => UpdateMenuItem_DebugPaused);
 			subMenu.AddMenuItem(null);
-			AddMenuItem(subMenu, "To&ggle Breakpoint", "Breakpoint Toggle", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(subMenu, "Toggle Thread Breakpoint", "Breakpoint Toggle Thread", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("To&ggle Breakpoint", "Breakpoint Toggle", new => UpdateMenuItem_HasActiveDocument);
+			subMenu.AddMenuItem("Toggle Thread Breakpoint", "Breakpoint Toggle Thread", new => UpdateMenuItem_HasActiveDocument);
 			var newBreakpointMenu = subMenu.AddMenuItem("New &Breakpoint");
-			AddMenuItem(newBreakpointMenu, "&Memory Breakpoint...", "Breakpoint Memory", new => UpdateMenuItem_DebugRunning);
-			AddMenuItem(newBreakpointMenu, "&Symbol Breakpoint...", "Breakpoint Symbol");
+			newBreakpointMenu.AddMenuItem("&Memory Breakpoint...", "Breakpoint Memory", new => UpdateMenuItem_DebugRunning);
+			newBreakpointMenu.AddMenuItem("&Symbol Breakpoint...", "Breakpoint Symbol");
 
 			if (mSettings.mEnableDevMode)
 			{
 				var internalDebugMenu = subMenu.AddMenuItem("Internal");
-				internalDebugMenu.AddMenuItem("Error Test", null, new (menu) => { DoErrorTest(); });
-				internalDebugMenu.AddMenuItem("Reconnect BeefPerf", null, new (menu) => { BeefPerf.RetryConnect(); });
-				AddMenuItem(internalDebugMenu, "Report Memory", "Report Memory");
-				internalDebugMenu.AddMenuItem("Crash", null, new (menu) => { int* ptr = null; *ptr = 123; });
-				internalDebugMenu.AddMenuItem("Show Welcome", null, new (menu) => { ShowWelcome(); });
-				internalDebugMenu.AddMenuItem("Exit Test", null, new (menu) => { ExitTest(); });
-				internalDebugMenu.AddMenuItem("Run Test", null, new (menu) => { mRunTest = !mRunTest; });
-				internalDebugMenu.AddMenuItem("GC Collect", null, new (menu) =>
+				internalDebugMenu.AddMenuItem("Error Test", new (menu) => { DoErrorTest(); });
+				internalDebugMenu.AddMenuItem("Reconnect BeefPerf", new (menu) => { BeefPerf.RetryConnect(); });
+				internalDebugMenu.AddMenuItem("Report Memory", "Report Memory");
+				internalDebugMenu.AddMenuItem("Crash", new (menu) => { int* ptr = null; *ptr = 123; });
+				internalDebugMenu.AddMenuItem("Show Welcome", new (menu) => { ShowWelcome(); });
+				internalDebugMenu.AddMenuItem("Exit Test", new (menu) => { ExitTest(); });
+				internalDebugMenu.AddMenuItem("Run Test", new (menu) => { mRunTest = !mRunTest; });
+				internalDebugMenu.AddMenuItem("GC Collect", new (menu) =>
 					{
 						var profileId = Profiler.StartSampling().GetValueOrDefault();
 						for (int i < 10)
@@ -6323,10 +6458,10 @@ namespace IDE
 						if (profileId != 0)
 							profileId.Dispose();
 					});
-				internalDebugMenu.AddMenuItem("Enable GC Collect", null, new (menu) => { ToggleCheck(menu, ref mEnableGCCollect); EnableGCCollect = mEnableGCCollect; }, null, null, true, mEnableGCCollect ? 1 : 0);
-				internalDebugMenu.AddMenuItem("Fast Updating", null, new (menu) => { ToggleCheck(menu, ref mDbgFastUpdate); EnableGCCollect = mDbgFastUpdate; }, null, null, true, mDbgFastUpdate ? 1 : 0);
-				internalDebugMenu.AddMenuItem("Alloc String", null, new (menu) => { new String("Alloc String"); });
-				internalDebugMenu.AddMenuItem("Perform Long Update Checks", null, new (menu) =>
+				internalDebugMenu.AddMenuItem("Enable GC Collect", new (menu) => { ToggleCheck(menu, ref mEnableGCCollect); EnableGCCollect = mEnableGCCollect; }, null, null, true, mEnableGCCollect ? 1 : 0);
+				internalDebugMenu.AddMenuItem("Fast Updating", new (menu) => { ToggleCheck(menu, ref mDbgFastUpdate); EnableGCCollect = mDbgFastUpdate; }, null, null, true, mDbgFastUpdate ? 1 : 0);
+				internalDebugMenu.AddMenuItem("Alloc String", new (menu) => { new String("Alloc String"); }, null);
+				internalDebugMenu.AddMenuItem("Perform Long Update Checks", new (menu) =>
 					{
 						bool wantsLongUpdateCheck = mLongUpdateProfileId != 0;
 						ToggleCheck(menu, ref wantsLongUpdateCheck);
@@ -6345,34 +6480,95 @@ namespace IDE
 			//////////
 
 			var testMenu = root.AddMenuItem("&Test");
-			var testRunMenu = testMenu.AddMenuItem("&Run", null, null, new => UpdateMenuItem_DebugStopped_HasWorkspace);
-			AddMenuItem(testRunMenu, "&Normal Tests", "Run Normal Tests");
-			AddMenuItem(testRunMenu, "&All Tests", "Run All Tests");
+			var testRunMenu = testMenu.AddMenuItem("&Run", (MenuItemSelectedHandler)null, new => UpdateMenuItem_DebugStopped_HasWorkspace);
+			testRunMenu.AddMenuItem("&Normal Tests", "Run Normal Tests");
+			testRunMenu.AddMenuItem("&All Tests", "Run All Tests");
 
 
-			var testDebugMenu = testMenu.AddMenuItem("&Debug", null, null, new => UpdateMenuItem_DebugStopped_HasWorkspace);
-			AddMenuItem(testDebugMenu, "&Normal Tests", "Debug Normal Tests");
-			AddMenuItem(testDebugMenu, "&All Tests", "Debug All Tests");
+			var testDebugMenu = testMenu.AddMenuItem("&Debug", (MenuItemSelectedHandler)null, new => UpdateMenuItem_DebugStopped_HasWorkspace);
+			testDebugMenu.AddMenuItem("&Normal Tests", "Debug Normal Tests");
+			testDebugMenu.AddMenuItem("&All Tests", "Debug All Tests");
 			testDebugMenu.AddMenuItem(null);
-			testDebugMenu.AddMenuItem("Break on Failure", null, new (menu) =>
+			testDebugMenu.AddMenuItem("Break on Failure", new (menu) =>
 				{
 					ToggleCheck(menu, ref mTestBreakOnFailure);
 				}, null, null, true, mTestBreakOnFailure ? 1 : 0);
 
-			AddMenuItem(testMenu, "Enable Console", "Test Enable Console", null, null, true, mTestEnableConsole ? 1 : 0);
+			testMenu.AddMenuItem("Enable Console", "Test Enable Console", null, null, true, mTestEnableConsole ? 1 : 0);
 
 			//////////
 
-			mWindowMenu = root.AddMenuItem("&Window");
-			AddMenuItem(mWindowMenu, "&Close Document", "Close Document", new => UpdateMenuItem_HasLastActiveDocument);
-			AddMenuItem(mWindowMenu, "Close &Panel", "Close Panel", new => UpdateMenuItem_HasActivePanel);
-			AddMenuItem(mWindowMenu, "&Close All", "Close All Panels");
-			AddMenuItem(mWindowMenu, "Close All Except Current", "Close All Panels Except");
-			AddMenuItem(mWindowMenu, "&New View into File", "View New", new => UpdateMenuItem_HasActiveDocument);
-			AddMenuItem(mWindowMenu, "&Split View", "View Split", new => UpdateMenuItem_HasActiveDocument);
+			var windowMenu = root.AddMenuItem("&Window");
+			windowMenu.mOnCreate = new (menu) => { mWindowMenu = menu; };
+			windowMenu.AddMenuItem("&Close Document", "Close Document", new => UpdateMenuItem_HasLastActiveDocument);
+			windowMenu.AddMenuItem("Close &Panel", "Close Panel", new => UpdateMenuItem_HasActivePanel);
+			windowMenu.AddMenuItem("&Close All", "Close All Panels");
+			windowMenu.AddMenuItem("Close All Except Current", "Close All Panels Except");
+			windowMenu.AddMenuItem("&New View into File", "View New", new => UpdateMenuItem_HasActiveDocument);
+			windowMenu.AddMenuItem("&Split View", "View Split", new => UpdateMenuItem_HasActiveDocument);
 
 			subMenu = root.AddMenuItem("&Help");
-			AddMenuItem(subMenu, "&About", "About");
+			subMenu.AddMenuItem("&About", "About");
+		}
+
+		public void CreateMenu_Children(MenuInfo menuInfo, SysMenu sysMenu)
+		{
+			String keyStr = scope .();
+
+			for (var childInfo in menuInfo.mChildren)
+			{
+				defer
+				{
+					// Pass ownership to SysMenu.AddMenuItem
+					childInfo.mMenuItemSelectedHandler = null;
+					childInfo.mMenuItemUpdateHandler = null;
+				}
+
+				keyStr.Clear();
+				IDECommand ideCommand = null;
+				if (childInfo.mCmdName != null)
+				{
+					ideCommand = mCommands.mCommandMap.GetValue(childInfo.mCmdName).GetValueOrDefault();
+					if (ideCommand != null)
+					{
+						keyStr.Clear();
+						ideCommand.ToString(keyStr);
+						keyStr.Insert(0, "#");
+					}
+				}
+
+				var menuItemSelectedHandler = childInfo.mMenuItemSelectedHandler;
+				if ((menuItemSelectedHandler == null) && (ideCommand != null))
+					menuItemSelectedHandler = new (evt) => ideCommand.mAction();
+
+				let childMenu = sysMenu.AddMenuItem(childInfo.mDispString, (ideCommand != null) ? keyStr : null, menuItemSelectedHandler, childInfo.mMenuItemUpdateHandler, childInfo.mBitmap, childInfo.mEnabled, childInfo.mCheckState, childInfo.mRadioCheck);
+				if (ideCommand != null)
+				{
+					ideCommand.mMenuItem = childMenu;
+				}
+
+				if (childInfo.mOnCreate != null)
+					childInfo.mOnCreate(childMenu);
+
+				if (childInfo.mChildren != null)
+					CreateMenu_Children(childInfo, childMenu);
+			}
+		}
+
+		public void CreateMenu()
+		{
+			MenuInfo rootInfo = scope .();
+			CreateMenu_Populate(rootInfo);
+
+			SysMenu root;
+#if BF_PLATFORM_WINDOWS
+			root = mMainWindow.mSysMenu;
+#else
+			root = mMainFrame.mMenuBar.mSysMenuRoot;
+			defer mMainFrame.RehupSize();
+#endif
+
+			CreateMenu_Children(rootInfo, root);
 		}
 
 		IDETabbedView CreateTabbedView()
@@ -6505,7 +6701,7 @@ namespace IDE
 			GetDefaultDocumentTabbedView();
 		}
 
-		public Widget GetActivePanel()
+		public virtual Widget GetActivePanel()
 		{
 			if (mRunningTestScript)
 				return mLastActivePanel;
@@ -6577,10 +6773,10 @@ namespace IDE
 			return mMainWindow;
 		}
 
-		public Widget GetActiveDocumentPanel()
+		public virtual Widget GetActiveDocumentPanel()
 		{
 			var activePanel = GetActivePanel();
-			if ((activePanel is SourceViewPanel) || (activePanel is DisassemblyPanel))
+			if ((activePanel is SourceViewPanel) || (activePanel is DisassemblyPanel) || (activePanel is ContentPanel))
 				return activePanel;
 			return null;
 		}
@@ -6596,7 +6792,7 @@ namespace IDE
 				if (activeTab != null)
 				{
 					var lastActivePanel = activeTab.mContent;
-					if ((lastActivePanel is SourceViewPanel) || (lastActivePanel is DisassemblyPanel))
+					if ((lastActivePanel is SourceViewPanel) || (lastActivePanel is DisassemblyPanel) || (lastActivePanel is ContentPanel))
 						return lastActivePanel;
 				}
 			}
@@ -6644,6 +6840,22 @@ namespace IDE
 				WithSourceViewPanelsOf(window, func);
 		}
 
+		public void WithContentPanelsOf(BFWindow window, delegate void(ContentPanel) func)
+		{
+			WithTabsOf(window, scope (tab) =>
+				{
+					var contentPanel = tab.mContent as ContentPanel;
+					if (contentPanel != null)
+						func(contentPanel);
+				});
+		}
+
+		public void WithContentPanels(delegate void(ContentPanel) func)
+		{
+			for (let window in mWindows)
+				WithContentPanelsOf(window, func);
+		}
+
 		TabbedView.TabButton SetupTab(TabbedView tabView, String name, float width, Widget content, bool ownsContent) // 2
 		{
 			TabbedView.TabButton tabButton = tabView.AddTab(name, width, content, ownsContent, GetTabInsertIndex(tabView));
@@ -6687,7 +6899,7 @@ namespace IDE
 			disassemblyPanel = new DisassemblyPanel();
 			//diassemblyPanel.Show(filePath);
 
-			var newTabButton = new SourceViewTabButton();
+			var newTabButton = new ContentTabButton();
 			newTabButton.Label = DisassemblyPanel.sPanelName;
 			newTabButton.mWantWidth = newTabButton.GetWantWidth();
 			newTabButton.mHeight = tabbedView.mTabHeight;
@@ -6723,7 +6935,7 @@ namespace IDE
 			return index;
 		}
 
-		public class SourceViewTabButton : DarkTabbedView.DarkTabButton
+		public class ContentTabButton : DarkTabbedView.DarkTabButton
 		{
 			public bool mIsTemp;
 
@@ -6745,6 +6957,8 @@ namespace IDE
 					bool isFillWidget = false;
 					if (mContent is SourceViewPanel)
 						isFillWidget = true;
+					if (mContent is BinaryDataPanel)
+						isFillWidget = true;
 					if (mContent is DisassemblyPanel)
 						isFillWidget = true;
 
@@ -6754,6 +6968,9 @@ namespace IDE
 						mTabbedView.mHasFillWidget = true;
 					}
 				}
+
+				if (var panel = mContent as Panel)
+					panel.Activate(setFocus ? .Active : .Passive);
 			}
 
 			public override void Draw(Graphics g)
@@ -6763,38 +6980,47 @@ namespace IDE
 				if (mWidth < mWantWidth / 2)
 					return;
 
-				var sourceViewPanel = mContent as SourceViewPanel;
-				if (sourceViewPanel != null)
+				// Unsaved-changes indicator works for any content panel (source or binary)
+				bool drewIndicator = false;
+				if (let contentPanel = mContent as ContentPanel)
 				{
-					if (sourceViewPanel.HasUnsavedChanges())
+					if (contentPanel.HasUnsavedChanges())
 					{
 						g.SetFont(IDEApp.sApp.mTinyCodeFont);
 						g.DrawString("*", mWantWidth - DarkTheme.sUnitSize + GS!(2), 0);
-					}
-					else if (sourceViewPanel.mLoadFailed)
-					{
-						g.SetFont(IDEApp.sApp.mCodeFont);
-						using (g.PushColor(0xFFFF8080))
-							g.DrawString("!", mWantWidth - DarkTheme.sUnitSize, 0);
+						drewIndicator = true;
 					}
 				}
-				else if (let findResultsPanel = mContent as FindResultsPanel)
+
+				if (!drewIndicator)
 				{
-					if (findResultsPanel.IsSearching)
+					if (let sourceViewPanel = mContent as SourceViewPanel)
 					{
-						g.SetFont(IDEApp.sApp.mTinyCodeFont);
-						String rotChars = @"/-\|";
-						StringView sv = .(rotChars, (mUpdateCnt / 16) % 4, 1);
-						g.DrawString(sv, mWantWidth - DarkTheme.sUnitSize, 0);
+						if (sourceViewPanel.mLoadFailed)
+						{
+							g.SetFont(IDEApp.sApp.mCodeFont);
+							using (g.PushColor(0xFFFF8080))
+								g.DrawString("!", mWantWidth - DarkTheme.sUnitSize, 0);
+						}
 					}
-				}
-				else if (let profilePanel = mContent as ProfilePanel)
-				{
-					if (profilePanel.IsSamplingHidden)
+					else if (let findResultsPanel = mContent as FindResultsPanel)
 					{
-						//using (g.PushColor(((mUpdateCnt / 20) % 2 == 0) ? 0xFFF0F0F0 : 0xFFFFFFFF))
-						using (g.PushColor(0x80FFFFFF))
-							g.Draw(DarkTheme.sDarkTheme.GetImage(.RedDot), GS!(8), GS!(0));
+						if (findResultsPanel.IsSearching)
+						{
+							g.SetFont(IDEApp.sApp.mTinyCodeFont);
+							String rotChars = @"/-\|";
+							StringView sv = .(rotChars, (mUpdateCnt / 16) % 4, 1);
+							g.DrawString(sv, mWantWidth - DarkTheme.sUnitSize, 0);
+						}
+					}
+					else if (let profilePanel = mContent as ProfilePanel)
+					{
+						if (profilePanel.IsSamplingHidden)
+						{
+							//using (g.PushColor(((mUpdateCnt / 20) % 2 == 0) ? 0xFFF0F0F0 : 0xFFFFFFFF))
+							using (g.PushColor(0x80FFFFFF))
+								g.Draw(DarkTheme.sDarkTheme.GetImage(.RedDot), GS!(8), GS!(0));
+						}
 					}
 				}
 
@@ -6818,18 +7044,19 @@ namespace IDE
 				if (btn == 1)
 				{
 					Menu menu = new Menu();
-					if (var sourceViewPanel = mContent as SourceViewPanel)
+
+					if (var contentPanel = mContent as ContentPanel)
 					{
 						var item = menu.AddItem("Copy Full Path");
 						item.mOnMenuItemSelected.Add(new (menu) =>
 							{
-								gApp.SetClipboardText(sourceViewPanel.mFilePath);
+								gApp.SetClipboardText(contentPanel.mFilePath);
 							});
 						item = menu.AddItem("Open Containing Folder");
 						item.mOnMenuItemSelected.Add(new (menu) =>
 							{
 								let directory = scope String();
-								Path.GetDirectoryPath(sourceViewPanel.mFilePath, directory);
+								Path.GetDirectoryPath(contentPanel.mFilePath, directory);
 
 								ProcessStartInfo procInfo = scope ProcessStartInfo();
 								procInfo.UseShellExecute = true;
@@ -6842,7 +7069,7 @@ namespace IDE
 						item.mOnMenuItemSelected.Add(new (menu) =>
 							{
 								let directory = scope String();
-								Path.GetDirectoryPath(sourceViewPanel.mFilePath, directory);
+								Path.GetDirectoryPath(contentPanel.mFilePath, directory);
 
 								ProcessStartInfo procInfo = scope ProcessStartInfo();
 								procInfo.UseShellExecute = true;
@@ -6855,7 +7082,7 @@ namespace IDE
 						item = menu.AddItem("Show in Workspace Panel");
 						item.mOnMenuItemSelected.Add(new (menu) =>
 							{
-								sourceViewPanel.SyncWithWorkspacePanel();
+								contentPanel.SyncWithWorkspacePanel();
 							});
 						item = menu.AddItem("Close");
 						item.mOnMenuItemSelected.Add(new (menu) =>
@@ -6900,9 +7127,9 @@ namespace IDE
 				Point point;
 				if (DarkTooltipManager.CheckMouseover(this, 25, out point))
 				{
-					var sourceViewPanel = mContent as SourceViewPanel;
-					if ((sourceViewPanel != null) && (sourceViewPanel.mFilePath != null))
-						DarkTooltipManager.ShowTooltip(sourceViewPanel.mFilePath, this, point.x, 14);
+					var contentPanel = mContent as ContentPanel;
+					if ((contentPanel != null) && (contentPanel.mFilePath != null))
+						DarkTooltipManager.ShowTooltip(contentPanel.mFilePath, this, point.x, 14);
 				}
 			}
 		}
@@ -7157,6 +7384,33 @@ namespace IDE
 
 		public (SourceViewPanel panel, TabbedView.TabButton tabButton) ShowSourceFile(String filePath, ProjectSource projectSource = null, SourceShowType showType = SourceShowType.ShowExisting, bool setFocus = true)
 		{
+			// Binary files load into a BinaryDataPanel rather than a SourceViewPanel, in which case
+			//  the source-view result is null (the file still successfully opened).
+			var (panel, tabButton) = ShowContentFile(filePath, projectSource, showType, setFocus);
+			return (panel as SourceViewPanel, tabButton);
+		}
+
+		protected virtual Result<ContentPanel> CreateContentPanel(StringView useFilePath, ProjectSource projectSource, SourceShowType showType)
+		{
+			if (!useFilePath.IsEmpty)
+			{
+				if (IDEUtils.IsBinaryFile(useFilePath).GetValueOrDefault())
+				{
+					var binaryDataPanel = new BinaryDataPanel();
+					if (!binaryDataPanel.Show(useFilePath))
+					{
+						delete binaryDataPanel;
+						return null;
+					}
+					return binaryDataPanel;
+				}	
+			}
+
+			return .Err;
+		}
+
+		public (ContentPanel panel, TabbedView.TabButton tabButton) ShowContentFile(String filePath, ProjectSource projectSource = null, SourceShowType showType = SourceShowType.ShowExisting, bool setFocus = true)
+		{
 			DeleteAndNullify!(mDeferredShowSource);
 
 			//TODO: PUT BACK!
@@ -7191,8 +7445,8 @@ namespace IDE
 			if ((useFilePath == null) & (showType != .New))
 				return (null, null);
 
-			SourceViewPanel sourceViewPanel = null;
-			DarkTabbedView.DarkTabButton sourceViewPanelTab = null;
+			ContentPanel contentPanel = null;
+			DarkTabbedView.DarkTabButton contentPanelTab = null;
 
 			if ((useProjectSource == null) && (useFilePath != null))
 			{
@@ -7216,21 +7470,21 @@ namespace IDE
 				delegate void(TabbedView.TabButton) tabFunc = scope [&] (tabButton) =>
 					{
 						var darkTabButton = (DarkTabbedView.DarkTabButton)tabButton;
-						if (tabButton.mContent is SourceViewPanel)
+						if (tabButton.mContent is ContentPanel)
 						{
-							var checkSourceViewPanel = (SourceViewPanel)tabButton.mContent;
+							var checkContentPanel = (ContentPanel)tabButton.mContent;
 
-							if (checkSourceViewPanel.FileNameMatches(useFilePath))
+							if (checkContentPanel.FileNameMatches(useFilePath))
 							{
-								if (sourceViewPanel != null)
+								if (contentPanel != null)
 								{
 									// Already found one that matches our active tabbed view?
-									if (sourceViewPanelTab.mTabbedView == mActiveDocumentsTabbedView)
+									if (contentPanelTab.mTabbedView == mActiveDocumentsTabbedView)
 										return;
 								}
 
-								sourceViewPanel = checkSourceViewPanel;
-								sourceViewPanelTab = darkTabButton;
+								contentPanel = checkContentPanel;
+								contentPanelTab = darkTabButton;
 							}
 						}
 					};
@@ -7242,60 +7496,82 @@ namespace IDE
 				else
 					WithTabs(tabFunc);
 
-				if (sourceViewPanelTab != null)
+				if (contentPanelTab != null)
 				{
 					//matchedTabButton = tabButton;
-					if ((sourceViewPanelTab.mIsRightTab) && (showType != SourceShowType.Temp))
+					if ((contentPanelTab.mIsRightTab) && (showType != SourceShowType.Temp))
 					{
-						MakeTabPermanent(sourceViewPanelTab);
+						MakeTabPermanent(contentPanelTab);
 					}
 
+					
 					if ((useProjectSource != null) &&
-						(sourceViewPanel.mProjectSource != useProjectSource))
+						(contentPanel.mProjectSource != useProjectSource))
 					{
 						//TODO: Change project source in view
-						sourceViewPanel.AttachToProjectSource(useProjectSource);
+						contentPanel.AttachToProjectSource(useProjectSource);
 						//sourceViewPanel.mProjectSource = useProjectSource;
 						//sourceViewPanel.QueueFullRefresh(true);
 					}
 
-					ActivateWindow(sourceViewPanelTab.mWidgetWindow);
-					sourceViewPanelTab.Activate(setFocus);
-					sourceViewPanelTab.mTabbedView.FinishTabAnim();
+					ActivateWindow(contentPanelTab.mWidgetWindow);
+					contentPanelTab.Activate(setFocus);
+					contentPanelTab.mTabbedView.FinishTabAnim();
 					if (setFocus)
-						sourceViewPanel.FocusEdit();
+					{
+						contentPanel.Activate(.Explicit);
+					}
 
-					sourceViewPanel.CheckEmitRevision();
+					if (var sourceViewPanel = contentPanel as SourceViewPanel)
+						sourceViewPanel.CheckEmitRevision();
 				}
 			}
 
-			if (sourceViewPanel != null)
-				return (sourceViewPanel, sourceViewPanelTab);
+			if (contentPanel != null)
+				return (contentPanel, contentPanelTab);
 
 			//ShowSourceFile(filePath, projectSource, showTemp, setFocus);
 
 			DarkTabbedView tabbedView = GetDefaultDocumentTabbedView();
 			ActivateWindow(tabbedView.mWidgetWindow);
-			sourceViewPanel = new SourceViewPanel();
-			bool success;
-			if (useProjectSource != null)
-			{
-				success = sourceViewPanel.Show(useProjectSource, !mInitialized);
-			}
-			else
-				success = sourceViewPanel.Show(useFilePath, !mInitialized);
-			sourceViewPanel.mEmitRevision = emitRevision;
-			if (emitRevision != -1)
-				sourceViewPanel.mEditWidget.mEditWidgetContent.mIsReadOnly = true;
 
-			if (!success)
+			///
+			// The resolved item, not the caller's (often null) one: content panels key on it.
+			switch (CreateContentPanel(useFilePath, useProjectSource, showType))
 			{
-				sourceViewPanel.Close();
-				delete sourceViewPanel;
-				return (null, null);
+			case .Ok(out contentPanel):
+				if (contentPanel == null)
+					return (null, null);
+			case .Err:
 			}
 
-			var newTabButton = new SourceViewTabButton();
+			if (contentPanel == null)
+			{
+				var sourceViewPanel = new SourceViewPanel();
+				bool success;
+				if (useProjectSource != null)
+				{
+					success = sourceViewPanel.Show(useProjectSource, !mInitialized);
+				}
+				else
+					success = sourceViewPanel.Show(useFilePath, !mInitialized);
+				sourceViewPanel.mEmitRevision = emitRevision;
+				if (emitRevision != -1)
+					sourceViewPanel.mEditWidget.mEditWidgetContent.mIsReadOnly = true;
+
+				if (!success)
+				{
+					sourceViewPanel.Close();
+					delete sourceViewPanel;
+					return (null, null);
+				}
+				contentPanel = sourceViewPanel;
+			}
+
+			if ((contentPanel != null) && (projectSource != null) && (contentPanel.mProjectSource != projectSource))
+				contentPanel.AttachToProjectSource(projectSource);
+
+			var newTabButton = new ContentTabButton();
 			newTabButton.Label = "";
 			if (useFilePath != null)
 				Path.GetFileName(useFilePath, newTabButton.mLabel);
@@ -7303,7 +7579,7 @@ namespace IDE
 				newTabButton.mLabel.Set("untitled");
 			newTabButton.mWantWidth = newTabButton.GetWantWidth();
 			newTabButton.mHeight = tabbedView.mTabHeight;
-			newTabButton.mContent = sourceViewPanel;
+			newTabButton.mContent = contentPanel;
 
 			if (showType == SourceShowType.Temp)
 			{
@@ -7323,12 +7599,19 @@ namespace IDE
 			}
 			else
 				tabbedView.AddTab(newTabButton, GetTabInsertIndex(tabbedView));
-			newTabButton.mCloseClickedEvent.Add(new () => DocumentCloseClicked(sourceViewPanel));
+			newTabButton.mCloseClickedEvent.Add(new () => DocumentCloseClicked(contentPanel));
 			newTabButton.Activate(setFocus);
-			if ((setFocus) && (sourceViewPanel.mWidgetWindow != null))
-				sourceViewPanel.FocusEdit();
+			if ((setFocus) && (contentPanel.mWidgetWindow != null))
+			{
+				if (var sourceViewPanel = contentPanel as SourceViewPanel)
+					sourceViewPanel.FocusEdit();
+				else
+					contentPanel.SetFocus();
+			}
 
-			return (sourceViewPanel, newTabButton);
+			mErrorsPanel?.OnSourceViewOpened();
+
+			return (contentPanel, newTabButton);
 		}
 
 		int GetRecentFilesIdx(String filePath)
@@ -7384,6 +7667,10 @@ namespace IDE
 
 		public void AddToRecentDisplayedFilesList(String path)
 		{
+			if ((path == null) || (path.IsEmpty))
+			{
+				return;
+			}
 			RecentFiles.Add(mRecentlyDisplayedFiles, path, 20);
 			UpdateRecentDisplayedFilesMenuItems();
 		}
@@ -7410,17 +7697,24 @@ namespace IDE
 				mRecentFileSelector.Prev();
 		}
 
+		protected virtual bool ShowSpecialFile(StringView name)
+		{
+			if (name == DisassemblyPanel.sPanelName)
+			{
+				ShowDisassemblyPanel();
+				return true;
+			}
+			return false;
+		}
+
 		void ShowRecentFile(int idx, bool setFocus = true, bool checkIfExists = false)
 		{
 			if (idx >= mRecentlyDisplayedFiles.Count)
 				return;
 
 			String sourceFile = mRecentlyDisplayedFiles[idx];
-			if (sourceFile == DisassemblyPanel.sPanelName)
-			{
-				ShowDisassemblyPanel();
+			if (ShowSpecialFile(sourceFile))
 				return;
-			}
 			if ((checkIfExists) && (!File.Exists(sourceFile)))
 				return;
 			ShowSourceFile(sourceFile, null, SourceShowType.ShowExisting, setFocus);
@@ -7452,34 +7746,44 @@ namespace IDE
 
 		void DocumentCloseClicked(Widget documentPanel)
 		{
-			var sourceViewPanel = documentPanel as SourceViewPanel;
-			if (sourceViewPanel == null)
+			var contentPanel = documentPanel as ContentPanel;
+			if (contentPanel == null)
 			{
 				CloseDocument(documentPanel);
 				return;
 			}
 
-			// This is a test
-			// This is a test
+			// For source panels, only prompt if this is the last view of the underlying data
+			bool isLastView = true;
+			if (let sourceViewPanel = contentPanel as SourceViewPanel)
+				isLastView = sourceViewPanel.IsLastViewOfData();
 
-			if ((!sourceViewPanel.HasUnsavedChanges()) || (!sourceViewPanel.IsLastViewOfData()))
+			if ((!contentPanel.HasUnsavedChanges()) || (!isLastView))
 			{
-				CloseDocument(sourceViewPanel);
+				CloseDocument(contentPanel);
 				return;
 			}
 
-			// This is a test
-
 			String fileName = scope String();
-			if (sourceViewPanel.mFilePath != null)
-				Path.GetFileName(sourceViewPanel.mFilePath, fileName);
+			if (contentPanel.mFilePath != null)
+				Path.GetFileName(contentPanel.mFilePath, fileName);
 			else
 				fileName.Append("untitled");
 			Dialog aDialog = ThemeFactory.mDefault.CreateDialog("Save file?", scope String()..AppendF("Save changes to '{0}' before closing?", fileName), DarkTheme.sDarkTheme.mIconWarning);
-			aDialog.mDefaultButton = aDialog.AddButton("Save", new (evt) => { SaveFile(sourceViewPanel); CloseDocument(sourceViewPanel); });
-			aDialog.AddButton("Don't Save", new (evt) => CloseDocument(sourceViewPanel));
+			aDialog.mDefaultButton = aDialog.AddButton("Save", new (evt) => { SaveFile(contentPanel); CloseDocument(contentPanel); });
+			// CloseDocument handles reverting a source panel; a binary panel's in-memory edits are simply discarded on close
+			aDialog.AddButton("Don't Save", new (evt) => CloseDocument(contentPanel));
 			aDialog.mEscButton = aDialog.AddButton("Cancel");
 			aDialog.PopupWindow(mMainWindow);
+		}
+
+		/// Reverts unsaved changes in any content panel (source or binary)
+		void RevertContentPanel(ContentPanel contentPanel)
+		{
+			if (let sourceViewPanel = contentPanel as SourceViewPanel)
+				RevertSourceViewPanel(sourceViewPanel);
+			else if (let binaryDataPanel = contentPanel as BinaryDataPanel)
+				binaryDataPanel.RevertChanges();
 		}
 
 		void RevertSourceViewPanel(SourceViewPanel sourceViewPanel)
@@ -7642,6 +7946,8 @@ namespace IDE
 				}
 			}
 
+			mErrorsPanel?.OnSourceViewClosed();
+
 			//var intDict = scope Dictionary<String, int>();
 
 			/*if (mRecentFilesList.Count >= 1)
@@ -7758,7 +8064,7 @@ namespace IDE
 				CloseDocument(sourceViewPanel);
 		}
 
-		public SourceViewPanel ShowProjectItem(ProjectItem projectItem, bool showTemp = true, bool setFocus = true)
+		public virtual SourceViewPanel ShowProjectItem(ProjectItem projectItem, bool showTemp = true, bool setFocus = true)
 		{
 			if (projectItem is ProjectSource)
 			{
@@ -7896,7 +8202,7 @@ namespace IDE
 			var (sourceViewPanel, tabButton) = ShowSourceFile(useFilePath, null, showTemp ? SourceShowType.Temp : SourceShowType.ShowExisting);
 			if (sourceViewPanel == null)
 				return null;
-			if (((filePath.StartsWith("$")) && (var svTabButton = tabButton as SourceViewTabButton)))
+			if (((filePath.StartsWith("$")) && (var svTabButton = tabButton as ContentTabButton)))
 				svTabButton.mIsTemp = true;
 			sourceViewPanel.ShowHotFileIdx(showHotIdx);
 			sourceViewPanel.ShowFileLocation(refHotIdx, Math.Max(0, line), Math.Max(0, column), hilitePosition);
@@ -8067,7 +8373,7 @@ namespace IDE
 				{
 					sourceViewPanel.mIsSourceCode = true; // It's always source code, even if there is no extension (ie: stl types like "vector")
 
-					if ((aliasFilePath != null) && (var svTabButton = tabButton as SourceViewTabButton))
+					if ((aliasFilePath != null) && (var svTabButton = tabButton as ContentTabButton))
 					{
 						svTabButton.mIsTemp = true;
 					}
@@ -8147,6 +8453,13 @@ namespace IDE
 			{
 				if (mLaunchData.mArgs != null)
 				{
+					if (mLaunchData.mTargetPath == null)
+					{
+						mLaunchData.mTargetPath = new .();
+						mLaunchData.mTargetPath.Append(key);
+						return true;
+					}
+
 					if (!mLaunchData.mArgs.IsEmpty)
 						mLaunchData.mArgs.Append(" ");
 					mLaunchData.mArgs.Append(key);
@@ -8171,6 +8484,11 @@ namespace IDE
 				{
 				case "-autoshutdown":
 					mDebugAutoShutdownCounter = 200;
+				case "-mcp":
+					mMCPPort = 0;
+					// From here on, not just once the server is up: a crash during startup must print,
+					// not sit in a dialog nobody will click.
+					Runtime.SetCrashReportKind(.PrintOnly);
 				case "-new":
 					mVerb = .Open;
 				case "-testNoExit":
@@ -8182,9 +8500,23 @@ namespace IDE
 					mWantsClean = true;
 				case "-dbgCompileDump":
 					mDbgCompileDump = true;
+				case "-gdb":
+					if (mLaunchData == null)
+						mLaunchData = new .();
+					mLaunchData.mKind = .GDB;
+					mLaunchData.mPaused = true;
+				case "-gdb_wsl":
+					if (mLaunchData == null)
+						mLaunchData = new .();
+					if (mLaunchData.mArgs == null)
+						mLaunchData.mArgs = new .();
+					mLaunchData.mKind = .GDB_WSL;
+					mLaunchData.mPaused = true;
 				case "-launch":
 					if (mLaunchData == null)
 						mLaunchData = new .();
+					if (mLaunchData.mArgs == null)
+						mLaunchData.mArgs = new .();
 				case "-launchPaused":
 					if (mLaunchData != null)
 						mLaunchData.mPaused = true;
@@ -8244,6 +8576,11 @@ namespace IDE
 					if (mSetPlatformName == null)
 						mSetPlatformName = new String();
 					mSetPlatformName.Set(value);
+				case "-mcp":
+					mMCPPort = int32.Parse(value).GetValueOrDefault();
+					Runtime.SetCrashReportKind(.PrintOnly);
+					if (mMCPPort <= 0)
+						Fail(scope $"Invalid MCP port '{value}'");
 				case "-test":
 					Runtime.SetCrashReportKind(.PrintOnly);
 
@@ -8771,6 +9108,20 @@ namespace IDE
 				window.mFocusWidget?.KeyDown(evt);
 				evt.mHandled = true;
 			}
+
+#if !BF_PLATFORM_WINDOWS
+			if (evt.mKeyFlags.HeldKeys == .Alt)
+			{
+				for (var btn in mMainFrame.mMenuBar.mButtons)
+				{
+					if (evt.mKeyCode == btn.MenuKey)
+					{
+						mMainFrame.mMenuBar.ShowMenu(btn);
+						break;
+					}
+				}
+			}
+#endif
 		}
 
 		void SysKeyUp(KeyCode keyCode)
@@ -9243,7 +9594,24 @@ namespace IDE
 		{
 			//Debug.Assert(executionInstance == null);
 
+			bool isWSL = false;
+
 			String fileName = scope String(inFileName);
+			if (fileName == "@wsl")
+			{
+				isWSL = true;
+				fileName.Set("wsl.exe");
+			}
+
+#if !BF_PLATFORM_WINDOWS
+			if (!inFileName.Contains('/'))
+			{
+				String buffer = scope .(256);
+				if (BuildContext.FindExecutableInPath(fileName, buffer) case .Ok)
+					fileName.Set(buffer);
+			}
+#endif
+
 			QuoteIfNeeded(fileName);
 
 			ProcessStartInfo startInfo = scope ProcessStartInfo();
@@ -9263,6 +9631,9 @@ namespace IDE
 
 
 			var executionInstance = new ExecutionInstance();
+
+			executionInstance.mFileName = new .(inFileName);
+			executionInstance.mArgs = new .(args);
 
 #if BF_PLATFORM_WINDOWS
 			if (runFlags.HasFlag(.BatchCommand))
@@ -9314,6 +9685,12 @@ namespace IDE
 				String tempFileName = scope String();
 				Path.GetTempFileName(tempFileName);
 
+				if (isWSL)
+				{
+					tempFileName.Replace(".tmp", "");
+					tempFileName.Append(".sh");
+				}
+
 				Encoding encoding = Encoding.UTF8;
 				if (useArgsFile == .UTF16WithBom)
 					encoding = Encoding.UTF16WithBOM;
@@ -9322,11 +9699,31 @@ namespace IDE
 				if (result case .Err)
 					OutputLine("Failed to create temporary param file");
 				String arguments = scope String();
-				arguments.Concat("@", tempFileName);
-				startInfo.SetArguments(arguments);
+
+				if (isWSL)
+				{
+					arguments.Append(tempFileName);
+					IDEUtils.WSLPathFix(arguments);
+					startInfo.SetArguments(arguments);
+				}
+				else
+				{
+					arguments.Concat("@", tempFileName);
+					startInfo.SetArguments(arguments);
+				}
 
 				delete executionInstance.mTempFileName;
 				executionInstance.mTempFileName = new String(tempFileName);
+			}
+			else
+			{
+				if (isWSL)
+				{
+					String arguments = scope .();
+					arguments.Append("-- ");
+					arguments.Append(args);
+					startInfo.SetArguments(arguments);
+				}
 			}
 
 			if (mVerbosity >= .Detailed)
@@ -9497,9 +9894,9 @@ namespace IDE
 							}
 
 							if (executionInstance.mCanceled)
-								OutputLine("Execution Canceled");
+								OutputLine($"Execution of '{executionInstance.mFileName}' cancelled");
 							else if (failed)
-								OutputLine("Execution Failed");
+								OutputErrorLine($"Execution of '{executionInstance.mFileName}' with args '{executionInstance.mArgs}' exited with code '{executionInstance.mExitCode}'");
 						}
 
 						if (executionInstance.mTempFileName != null)
@@ -9576,7 +9973,12 @@ namespace IDE
 				waitForBuildClang = (mDepClang.mCompileWaitsForQueueEmpty) && (mDepClang.HasQueuedCommands());
 #endif
 				if ((next is ProcessBfCompileCmd) && (mBfBuildCompiler.HasQueuedCommands() || (waitForBuildClang)))
+				{
+					var processCompileCmd = (ProcessBfCompileCmd)next;
+					if (processCompileCmd.mBfPassInstance != null)
+						ShowBeefCompileMessages(processCompileCmd.mBfPassInstance);
 					return;
+				}
 
 				/*if (next is BuildCompletedCmd)
 				{
@@ -9594,7 +9996,12 @@ namespace IDE
 
 				if (let scriptCmd = next as ScriptCmd)
 				{
-					if (mBuildContext?.mScriptManager != null)
+					if ((buildFailed) && (scriptCmd.mSkipIfBuildFailed))
+					{
+						// Drop the command rather than running it against a missing or stale target
+						DeleteAndNullify!(scriptCmd.mCmd);
+					}
+					else if (mBuildContext?.mScriptManager != null)
 					{
 						if (scriptCmd.mCmd != null)
 						{
@@ -9672,6 +10079,10 @@ namespace IDE
 						}
 					}
 				}
+
+				if (!next.IsReady)
+					return;
+
 #endif
 				defer delete next;
 				mExecutionQueue.RemoveAt(0);
@@ -9827,6 +10238,7 @@ namespace IDE
 
 					CompileResult(buildCompletedCmd.mHotProjectName, !buildCompletedCmd.mFailed);
 
+					FlushDeferredCompilerText(true);
 					if (buildCompletedCmd.mFailed)
 						OutputLineSmart("ERROR: BUILD FAILED. Total build time: {0:0.00}s", buildCompletedCmd.mStopwatch.ElapsedMilliseconds / 1000.0f);
 					else if ((mVerbosity >= .Detailed) && (buildCompletedCmd.mStopwatch != null))
@@ -9886,7 +10298,7 @@ namespace IDE
 				}
 				else
 				{
-					Runtime.FatalError("Unknown command");
+					next.Execute();
 				}
 			}
 		}
@@ -10155,6 +10567,69 @@ namespace IDE
 		}
 #endif
 
+		public Workspace.ToolsetType GetBuildToolset(Workspace.Options options)
+		{
+			if ((mLinuxLLVMFallback) && (options.mToolsetType == .LLVM) &&
+				(Workspace.PlatformType.GetFromName(mPlatformName, options.mTargetTriple) == .Linux))
+				return .GNU;
+			return options.mToolsetType;
+		}
+
+		public BuildOptions.LTOType GetBuildLTOType(Workspace.Options workspaceOptions, Project.Options options)
+		{
+			if ((Workspace.PlatformType.GetFromName(mPlatformName, workspaceOptions.mTargetTriple) == .Linux) &&
+				(GetBuildToolset(workspaceOptions) == .GNU))
+				return .None;
+			return options.mBeefOptions.mLTOType.GetValueOrDefault(workspaceOptions.mLTOType);
+		}
+
+		void CheckLinuxBuildTools()
+		{
+			mLinuxLLVMFallback = false;
+			mLinuxClangPath.Clear();
+			mLinuxLLDPath.Clear();
+			mLinuxArPath.Clear();
+			let options = GetCurWorkspaceOptions();
+			if (Workspace.PlatformType.GetFromName(mPlatformName, options.mTargetTriple) != .Linux)
+				return;
+
+			if (options.mToolsetType == .GNU)
+			{
+				bool wantsLTO = false;
+				for (let project in mWorkspace.mProjects)
+				{
+					let projectOptions = GetCurProjectOptions(project);
+					if ((projectOptions != null) &&
+						(projectOptions.mBeefOptions.mLTOType.GetValueOrDefault(options.mLTOType) != .None))
+						wantsLTO = true;
+				}
+				if (wantsLTO)
+					OutputLineSmart("WARNING: Linux ThinLTO requires the LLVM toolset; building with the selected GNU toolset and LTO disabled.");
+				return;
+			}
+			if (options.mToolsetType != .LLVM)
+				return;
+
+			String missing = scope .();
+			void CheckTool(String name, String outPath, bool requireLLVM22)
+			{
+				if (BuildContext.FindLinuxLLVMTool(name, outPath, requireLLVM22) case .Err)
+				{
+					if (!missing.IsEmpty)
+						missing.Append(", ");
+					missing.Append(name);
+				}
+			}
+			CheckTool("clang++", mLinuxClangPath, false);
+			CheckTool("ld.lld", mLinuxLLDPath, true);
+			CheckTool("llvm-ar", mLinuxArPath, true);
+			if (!missing.IsEmpty)
+			{
+				mLinuxLLVMFallback = true;
+				OutputLineSmart("WARNING: Linux LLVM tools missing or incompatible: {}. Building with the GNU toolset and LTO disabled for all projects. Install clang-22, lld-22, and llvm-22 to enable ThinLTO.", missing);
+			}
+		}
+
 		public Workspace.Options GetCurWorkspaceOptions()
 		{
 			return mWorkspace.GetOptions(mConfigName, mPlatformName);
@@ -10167,7 +10642,7 @@ namespace IDE
 				return null;
 
 			Workspace.ConfigSelection configSelection;
-			workspaceOptions.mConfigSelections.TryGetValue(project, out configSelection);
+			workspaceOptions.mConfigSelections.TryGetValue(project.mProjectName, out configSelection);
 			if ((configSelection == null) || (!configSelection.mEnabled))
 				return null;
 
@@ -10250,6 +10725,7 @@ namespace IDE
 			AddMacros(options.mBeefOptions.mPreprocessorMacros);
 			AddMacros(mWorkspace.mBeefGlobalOptions.mPreprocessorMacros);
 			AddMacros(workspaceOptions.mPreprocessorMacros);
+			AddMacros(mExtraWorkspacePreprocessorMacros);
 			GetBeefPreprocessorMacros(preprocessorMacros);
 
 			var optimizationLevel = workspaceOptions.mBfOptimizationLevel;
@@ -10272,9 +10748,7 @@ namespace IDE
 
 			if (!bfCompiler.mIsResolveOnly)
 			{
-				ltoType = workspaceOptions.mLTOType;
-				if (options.mBeefOptions.mLTOType != null)
-					ltoType = options.mBeefOptions.mLTOType.Value;
+				ltoType = GetBuildLTOType(workspaceOptions, options);
 			}
 
 			var targetType = project.mGeneralOptions.mTargetType;
@@ -10291,7 +10765,7 @@ namespace IDE
 					if (workspaceOptions.mBuildKind == .Test)
 					{
 						targetType = .BeefTest;
-						if (mTestManager != null)
+						if ((mTestManager != null) && (mTestManager.WantsTestProject(project)))
 						{
 							String workingDirRel = scope String();
 							ResolveConfigString(mPlatformName, workspaceOptions, project, options, "$(WorkingDir)", "debug working directory", workingDirRel);
@@ -10336,6 +10810,13 @@ namespace IDE
 				optimizationLevel, ltoType, relocType, options.mBeefOptions.mPICLevel,
 				options.mBeefOptions.mMergeFunctions, options.mBeefOptions.mCombineLoads,
 				options.mBeefOptions.mVectorizeLoops, options.mBeefOptions.mVectorizeSLP);
+			bfProject.SetCodeGenOptions(options.mBeefOptions.mSIMDSetting,
+				options.mBeefOptions.mFloatingPointMode, options.mBeefOptions.mFMASetting);
+			let effectiveSIMDSetting = options.mBeefOptions.mSIMDSetting ?? workspaceOptions.mBfSIMDSetting;
+			let effectiveFloatingPointMode = options.mBeefOptions.mFloatingPointMode ?? workspaceOptions.mBfFloatingPointMode;
+			let effectiveFMASetting = options.mBeefOptions.mFMASetting ?? workspaceOptions.mBfFMASetting;
+			CompilerLog("IDEApp.SetupBeefProjectSettings Project='{}' SIMD={} FloatingPointMode={} FMA={} TargetCPU='{}'",
+				project.mProjectName, effectiveSIMDSetting, effectiveFloatingPointMode, effectiveFMASetting, workspaceOptions.mTargetCPU);
 
 			List<Project> depProjectList = scope List<Project>();
 			if (!GetDependentProjectList(project, depProjectList))
@@ -10471,6 +10952,20 @@ namespace IDE
 				}
 			}
 
+			for (var config in mWorkspace.mConfigs.Values)
+			{
+				for (var platform in config.mPlatforms.Values)
+				{
+					for (var platformProjectName in platform.mConfigSelections.Keys)
+					{
+						if (platformProjectName == project.mProjectName)
+						{
+							platformProjectName.Set(newName);
+						}
+					}
+				}
+			}
+
 			project.mProjectName.Set(newName);
 			if (project.mProjectNameDecl != project.mProjectName)
 				delete project.mProjectNameDecl;
@@ -10573,6 +11068,11 @@ namespace IDE
 			BfPassInstance passInstance = bfSystem.CreatePassInstance();
 			bfCompiler.QueueSetPassInstance(passInstance);
 
+			bool previousFallback = mLinuxLLVMFallback;
+			String previousTools = scope $"{mLinuxClangPath}\n{mLinuxLLDPath}\n{mLinuxArPath}";
+			CheckLinuxBuildTools();
+			bool linuxToolsChanged = (previousFallback != mLinuxLLVMFallback) ||
+				(previousTools != scope $"{mLinuxClangPath}\n{mLinuxLLDPath}\n{mLinuxArPath}");
 			bfCompiler.QueueSetWorkspaceOptions(hotProject, hotIdx);
 
 			Workspace.Options workspaceOptions = GetCurWorkspaceOptions();
@@ -10611,6 +11111,12 @@ namespace IDE
 					doCompile = true;
 					mWorkspace.mHadHotCompileSinceLastFullCompile = false;
 				}
+			}
+
+			if (linuxToolsChanged)
+			{
+				tryQueueFiles = true;
+				doCompile = true;
 			}
 
 			if (mWorkspace.mForceNextCompile)
@@ -10678,7 +11184,7 @@ namespace IDE
 			return passInstance;
 		}
 
-		public bool DoResolveConfigString(String platformName, Workspace.Options workspaceOptions, Project project, Project.Options options, StringView configString, String error, String result)
+		public bool DoResolveConfigString(String platformName, Workspace.Options workspaceOptions, Project project, Project.Options options, StringView configString, String error, String result, ScriptManager.Context scriptContext = null)
 		{
 			int startIdx = result.Length;
 			int i = startIdx;
@@ -10774,8 +11280,52 @@ namespace IDE
 									}
 									else
 										cmdErr = "Invalid number of arguments";
+								case "WSLPath":
+									if (args.Count == 1)
+									{
+										newString = scope:ReplaceBlock .();
+										newString.Set(args[0]);
+										IDEUtils.WSLPathFix(newString);
+									}
+									else
+										cmdErr = "Invalid number of arguments";
 								case "Var":
-									break ReplaceBlock;
+									if ((scriptContext != null) && (args.Count > 0))
+									{
+										if (scriptContext.mVars.TryGetValueAlt(args[0], var value))
+										{
+											if (value.VariantType == typeof(String))
+												newString = scope:ReplaceBlock .(value.Get<String>());
+										}
+									}
+									else
+										break ReplaceBlock;
+								case "Env":
+									if (args.Count == 1)
+									{
+										String env = scope:ReplaceBlock .();
+										switch (Environment.GetEnvironmentVariable(args[0], env))
+										{
+										case .Err:
+											newString = "";
+											cmdErr = scope:ReplaceBlock $"No such environment variable: {args[0]}";
+										case .Ok:
+											newString = env;
+										}
+									}
+									else if (args.Count == 2)
+									{
+										String env = scope:ReplaceBlock .();
+										switch (Environment.GetEnvironmentVariable(args[0], env))
+										{
+										case .Err:
+											newString = args[1];
+										case .Ok:
+											newString = env;
+										}
+									}
+									else
+										cmdErr = "Invalid number of arguments";
 								case "Arguments",
 									"BuildDir",
 									"LinkFlags",
@@ -10947,12 +11497,8 @@ namespace IDE
 										case .Wasm:
 											newString.Append("\"");
 											newString.Append(mInstallDir);
-											newString.Append("Beef", IDEApp.sRTVersionStr, "RT");
-											newString.Append((Workspace.PlatformType.GetPtrSizeByName(gApp.mPlatformName) == 4) ? "32" : "64");
-											newString.Append("_wasm");
-											if (project.mWasmOptions.mEnableThreads)
-												newString.Append("_pthread");
-											newString.Append(".a\"");
+											BuildContext.GetWasmRtLibName(project, options, newString);
+											newString.Append("\"");
 										default:
 										}
 									}
@@ -10970,7 +11516,7 @@ namespace IDE
 									IDEUtils.FixFilePath(newString);
 								case "EmccPath":
 									newString = scope:ReplaceBlock String();
-									newString.AppendF($"{gApp.mSettings.mEmscriptenPath}/upstream/emscripten/emcc.bat");
+									newString.AppendF($"{gApp.mSettings.mEmscriptenPath}/upstream/emscripten/emcc.exe");
 								}
 							}
 
@@ -11005,6 +11551,15 @@ namespace IDE
 									}
 								case "BeefPath":
 									newString = gApp.mInstallDir;
+								case "TargetTriple":
+									if (workspaceOptions.mTargetTriple.IsWhiteSpace)
+									{
+										newString = scope:ReplaceBlock String();
+										if (!Workspace.PlatformType.GetTargetTripleByName(mPlatformName, workspaceOptions.mToolsetType, newString))
+											newString.Append(mPlatformName);
+									}
+									else
+										newString = workspaceOptions.mTargetTriple;
 								default:
 									// Check if any custom properties match the string.
 									if (CustomBuildProperties.Contains(replaceStr))
@@ -11127,10 +11682,10 @@ namespace IDE
 			}
 		}
 
-		public bool ResolveConfigString(String platformName, Workspace.Options workspaceOptions, Project project, Project.Options options, StringView configString, String errorContext, String outResult)
+		public bool ResolveConfigString(String platformName, Workspace.Options workspaceOptions, Project project, Project.Options options, StringView configString, String errorContext, String outResult, ScriptManager.Context scriptContext = null)
 		{
 			String errorString = scope String();
-			if (!DoResolveConfigString(platformName, workspaceOptions, project, options, configString, errorString, outResult))
+			if (!DoResolveConfigString(platformName, workspaceOptions, project, options, configString, errorString, outResult, scriptContext))
 			{
 				OutputErrorLine("Invalid macro in {0}: {1}", errorContext, errorString);
 				return false;
@@ -11164,6 +11719,8 @@ namespace IDE
 		public void GetClangBuildString(Project project, Project.Options options, Workspace.Options workspaceOptions, bool isC, String clangOptions)
 		{
 			bool isClang = options.mCOptions.mCompilerType == Project.CCompilerType.Clang;
+			bool useMicrosoftToolset = (Workspace.PlatformType.GetFromName(mPlatformName, workspaceOptions.mTargetTriple) == .Windows) &&
+				(workspaceOptions.mToolsetType != .GNU);
 
 			if (options.mCOptions.mEmitDebugInfo)
 			{
@@ -11171,7 +11728,7 @@ namespace IDE
 				{
 					clangOptions.Append("-g -fstandalone-debug ");
 
-					if (workspaceOptions.mToolsetType != .GNU)
+					if (useMicrosoftToolset)
 						clangOptions.Append("-gcodeview ");
 				}
 				else
@@ -11200,11 +11757,17 @@ namespace IDE
 			case .SSE41:
 				clangOptions.Append("-msse4.1 ");
 				break;
+			case .SSE42:
+				clangOptions.Append("-msse4.2 ");
+				break;
 			case .AVX:
 				clangOptions.Append("-mavx ");
 				break;
 			case .AVX2:
 				clangOptions.Append("-mavx2 ");
+				break;
+			case .AVX512:
+				clangOptions.Append("-mavx512 ");
 				break;
 			default:
 			}
@@ -11254,11 +11817,7 @@ namespace IDE
 					Workspace.PlatformType.GetTargetTripleByName(gApp.mPlatformName, workspaceOptions.mToolsetType, clangOptions);
 				clangOptions.Append(" ");
 
-				if (workspaceOptions.mToolsetType == .GNU)
-				{
-					//
-				}
-				else
+				if (useMicrosoftToolset)
 				{
 					clangOptions.Append("-I\"C:\\Program Files (x86)\\Microsoft Visual Studio 14.0\\VC\\include\" ");
 					clangOptions.Append("-I\"C:\\Program Files (x86)\\Microsoft Visual Studio 14.0\\VC\\atlmfc\\include\" ");
@@ -11646,6 +12205,104 @@ namespace IDE
 			}
 		}
 
+		void FlushDeferredCompilerText(bool flushAll)
+		{
+			if (mDeferredCompilerText.IsEmpty)
+				return;
+
+			for (var line in mDeferredCompilerText.Split('\n'))
+			{
+				if ((!flushAll) && (!@line.HasMore))
+				{
+					if (line.Length < mDeferredCompilerText.Length)
+					{
+						// Put fragment back
+						mDeferredCompilerText.Set(line);
+					}
+					return;
+				}
+
+				mOutputPanel.WriteColoredTextLine(line, .BuildText);
+			}
+			mDeferredCompilerText.Clear();
+		}
+
+		void ShowBeefCompileMessages(BfPassInstance passInstance)
+		{
+			while (true)
+			{
+				String str = scope String();
+				if (!passInstance.PopOutString(str))
+					break;
+
+				if (mVerbosity == .Quiet)
+					continue;
+
+				if (str.StartsWith(":mark "))
+				{
+					int crPos = str.IndexOf('\n');
+					if (crPos != -1)
+					{
+						var sv = str.Substring(":mark ".Length, crPos - ":mark ".Length);
+						int32 markId = int32.Parse(sv).GetValueOrDefault();
+						mOutputPanel?.Mark(markId);
+					}
+					str.Remove(0, crPos + 1);
+				}
+				else if (str.StartsWith(":mark_undo "))
+				{
+					int crPos = str.IndexOf('\n');
+					if (crPos != -1)
+					{
+						var sv = str.Substring(":mark_undo ".Length, crPos - ":mark_undo ".Length);
+						int32 markId = int32.Parse(sv).GetValueOrDefault();
+						mOutputPanel?.MarkUndo(markId);
+					}
+					str.Remove(0, crPos + 1);
+				}
+
+				if (str.StartsWith(":"))
+				{
+					int spacePos = str.IndexOf(' ');
+					if (spacePos > 0)
+					{
+						bool wantsDisp = true;
+						StringView msgType = StringView(str, 0, spacePos);
+						if (msgType == ":warn")
+						{
+							mLastCompileHadMessages = true;
+							wantsDisp = mVerbosity >= .Minimal;
+						}
+						else if (msgType == ":error")
+						{
+							mLastCompileHadMessages = true;
+						}
+						else if (msgType == ":low")
+							wantsDisp = mVerbosity >= .Detailed;
+						else if (msgType == ":med")
+							wantsDisp = mVerbosity >= .Normal;
+						else if ((msgType == ":text") || (msgType == ":text_line"))
+						{
+							mDeferredCompilerText.Append(str.Substring(spacePos + 1));
+							FlushDeferredCompilerText(msgType == ":text_line");
+							continue;
+						}
+
+						if (!wantsDisp)
+							continue;
+
+						str.Remove(0, spacePos + 1);
+					}
+				}
+
+				FlushDeferredCompilerText(true);
+
+				str.Append("\n");
+				OutputSmart(str);
+				//OutputLine(str);
+			}
+		}
+
 		void ProcessBeefCompileResults(BfPassInstance passInstance, CompileKind compileKind, Project hotProject, Stopwatch startStopWatch)
 		{
 			bool didCompileSucceed = true;
@@ -11654,46 +12311,7 @@ namespace IDE
 				if (mProfileCompileProfileId != 0)
 					mProfileCompileProfileId.Dispose();
 
-				while (true)
-				{
-					String str = scope String();
-					if (!passInstance.PopOutString(str))
-						break;
-
-					if (mVerbosity == .Quiet)
-						continue;
-
-					if (str.StartsWith(":"))
-					{
-						int spacePos = str.IndexOf(' ');
-						if (spacePos > 0)
-						{
-							bool wantsDisp = true;
-							StringView msgType = StringView(str, 0, spacePos);
-							if (msgType == ":warn")
-							{
-								mLastCompileHadMessages = true;
-								wantsDisp = mVerbosity >= .Minimal;
-							}
-							else if (msgType == ":error")
-							{
-								mLastCompileHadMessages = true;
-							}
-							else if (msgType == ":low")
-								wantsDisp = mVerbosity >= .Detailed;
-							else if (msgType == ":med")
-								wantsDisp = mVerbosity >= .Normal;
-							if (!wantsDisp)
-								continue;
-
-							str.Remove(0, spacePos + 1);
-						}
-					}
-
-					str.Append("\n");
-					OutputSmart(str);
-					//OutputLine(str);
-				}
+				ShowBeefCompileMessages(passInstance);
 
 				if ((passInstance.mFailed) && (passInstance.mCompileSucceeded))
 				{
@@ -11803,8 +12421,8 @@ namespace IDE
 
 				//
 
-				mBfBuildCompiler.HotCommit();
-				mDebugger.HotLoad(entries, mWorkspace.HotCompileIdx);
+				if (mDebugger.HotLoad(entries, mWorkspace.HotCompileIdx))
+					mBfBuildCompiler.HotCommit();
 				/*if (mDebugger.IsPaused())
 					PCChanged();*/
 
@@ -11844,7 +12462,7 @@ namespace IDE
 			mExecutionQueue.Add(completedCompileCmd);
 		}
 
-		bool CompileAndRun(bool debug)
+		protected bool CompileAndRun(bool debug)
 		{
 			if (AreTestsRunning())
 				return false;
@@ -11864,7 +12482,8 @@ namespace IDE
 			if (mInitialized)
 				DeleteAndNullify!(mLaunchData);
 
-			mOutputPanel.Clear();
+			if (mOutputPanel != null)
+				mOutputPanel.Clear();
 			OutputLine("Compiling...");
 			if (!Compile(debug ? .DebugAfter : .RunAfter, null))
 				return false;
@@ -11886,6 +12505,14 @@ namespace IDE
 			}
 		}
 
+		// A host with unsaved state in the running process can ask before Stop Debugging. False: it took
+		// `proceed` and calls it once the user agrees.
+		protected virtual bool ConfirmStopRunning(delegate void() proceed)
+		{
+			delete proceed;
+			return true;
+		}
+
 		[IDECommand]
 		void StopRunning()
 		{
@@ -11894,11 +12521,13 @@ namespace IDE
 				mTestManager.Stop();
 				return;
 			}
+			if (!ConfirmStopRunning(new => StopRunning))
+				return;
 
 			bool hasTempFiles = false;
 			WithTabs(scope [&] (tabButton) =>
 				{
-					if (var svTabButton = tabButton as SourceViewTabButton)
+					if (var svTabButton = tabButton as ContentTabButton)
 					{
 						if (svTabButton.mIsTemp)
 							hasTempFiles = true;
@@ -11911,10 +12540,10 @@ namespace IDE
 					"Do you want to close temporary files opened from the debugger?");
 				dialog.mDefaultButton = dialog.AddButton("Yes", new (evt) =>
 					{
-						List<SourceViewTabButton> closeTabs = scope .();
+						List<ContentTabButton> closeTabs = scope .();
 						WithTabs(scope [&] (tabButton) =>
 							{
-								if (var svTabButton = tabButton as SourceViewTabButton)
+								if (var svTabButton = tabButton as ContentTabButton)
 								{
 									if (svTabButton.mIsTemp)
 										closeTabs.Add(svTabButton);
@@ -12041,7 +12670,7 @@ namespace IDE
 			}
 		}
 
-		protected bool Compile(CompileKind compileKind, Project hotProject)
+		protected virtual bool Compile(CompileKind compileKind, Project hotProject)
 		{
 			Debug.Assert(mBuildContext == null);
 
@@ -12072,7 +12701,11 @@ namespace IDE
 
 			if ((compileKind != .Test) && (mWorkspace.mStartupProject != null) && (mWorkspace.mStartupProject.mGeneralOptions.mTargetType == .BeefTest))
 			{
+#if CLI
+				OutputErrorLine("Test project '{}' has been selected as the Startup Project. Use '-test' to run tests.", mWorkspace.mStartupProject.mProjectName);
+#else
 				OutputErrorLine("Test project '{}' has been selected as the Startup Project. Use the 'Test' menu to run or debug tests.", mWorkspace.mStartupProject.mProjectName);
+#endif
 				return false;
 			}
 
@@ -12109,6 +12742,8 @@ namespace IDE
 				if (hostPlatform == .Windows)
 					canCompile = true; // Use WSL
 			case .Wasm:
+				canCompile = true;
+			case .None:
 				canCompile = true;
 			default:
 			}
@@ -12227,7 +12862,7 @@ namespace IDE
 						Beef requires the Microsoft C++ build tools for Visual Studio 2013 or later, but they don't seem to be installed.
 
 						Install just Microsoft Visual C++ Build Tools or the entire Visual Studio suite from:
-						    https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022
+						    https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026
 						""";
 
 #if CLI
@@ -12238,7 +12873,7 @@ namespace IDE
 					dlg.AddOkCancelButtons(new (dlg) =>
 						{
 							ProcessStartInfo psi = scope ProcessStartInfo();
-							psi.SetFileName("https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022");
+							psi.SetFileName("https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2026");
 							psi.UseShellExecute = true;
 							psi.SetVerb("Open");
 							var process = scope SpawnedProcess();
@@ -12257,6 +12892,37 @@ namespace IDE
 			if (mProfileCompile)
 				mProfileCompileProfileId = Profiler.StartSampling("Compile");
 
+			var compilerCacheFilePath = scope String();
+			GetWorkspaceBuildDir(compilerCacheFilePath);
+			Directory.CreateDirectory(compilerCacheFilePath).IgnoreError();
+			compilerCacheFilePath.Append("/cache.dat");
+
+			// Validate compiler cache - perform a clean build if a different compiler instance modified the files in the workspace build directory
+			const uint64 cacheMagic = 0xBEEF0001;
+			(uint64 magic, uint64 id) cacheData = default;
+			int32 cacheSize = sizeof(decltype(cacheData));
+			if ((workspaceOptions.mIncrementalBuild) && (mCompileSinceCleanCount > 0))
+			{
+				bool cacheValid = false;
+				List<uint8> fileData = scope .();
+				File.ReadAll(compilerCacheFilePath, fileData).IgnoreError();
+				if (fileData.Count == cacheSize)
+				{
+					Internal.MemCpy(&cacheData, fileData.Ptr, cacheSize);
+					if ((cacheData.magic == cacheMagic) && (cacheData.id == mCompilerId))
+						cacheValid = true;
+				}
+
+				if (!cacheValid)
+				{
+					OutputLine("Compiler cache invalid, performing clean rebuild");
+					mWantsBeefClean = true;
+				}
+			}
+			cacheData.magic = cacheMagic;
+			cacheData.id = mCompilerId;
+			File.WriteAll(compilerCacheFilePath, .((uint8*)(void*)&cacheData, cacheSize)).IgnoreError();
+			
 			if (mWantsBeefClean)
 			{
 				// We must finish cleaning before we can compile
@@ -12378,11 +13044,22 @@ namespace IDE
 					}
 				});
 
+			dbgVis.AppendF($"\n{mInstallDir}");
+			for (var project in mWorkspace.mProjects)
+			{
+				dbgVis.AppendF($"\n{project.mProjectDir}{IDE.IDEUtils.cNativeSlash}");
+			}
+
 			mDebugger.LoadDebugVisualizers(dbgVis);
 			//mDebugger.LoadDebugVisualizers(scope String(mInstallDir, "BeefDbgVis.toml"));
 		}
 
-		bool StartupProject(bool doDebug, bool wasCompiled)
+		protected virtual void StartupProject_SetupEnvVars(Dictionary<String, String> envVars)
+		{
+
+		}
+
+		public virtual bool StartupProject(bool doDebug, bool wasCompiled, DebugManager.OpenFileFlags debugFlags = .None)
 		{
 			mProfilePanel.Clear();
 
@@ -12406,6 +13083,8 @@ namespace IDE
 			mTargetHadFirstBreak = false;
 
 			//options.mDebugOptions.mCommand
+
+			var platformType = Workspace.PlatformType.GetFromName(mPlatformName, workspaceOptions.mTargetTriple);
 
 			String launchPathRel = scope String();
 			ResolveConfigString(mPlatformName, workspaceOptions, project, options, options.mDebugOptions.mCommand, "debug command", launchPathRel);
@@ -12463,6 +13142,8 @@ namespace IDE
 				}
 			}
 
+			StartupProject_SetupEnvVars(envVars);
+
 			var envBlock = scope List<char8>();
 			Environment.EncodeEnvironmentVariables(envVars, envBlock);
 
@@ -12492,10 +13173,25 @@ namespace IDE
 				ShowImmediatePanel();
 			}
 
-			DebugManager.OpenFileFlags openFileFlags = .None;
+			DebugManager.OpenFileFlags openFileFlags = debugFlags;
 
 			if ((mSettings.mDebugConsoleKind == .RedirectToImmediate) || (mSettings.mDebugConsoleKind == .RedirectToOutput))
 				openFileFlags |= .RedirectStdOutput | .RedirectStdError;
+
+			//
+
+			if (platformType.IsWSL)
+			{
+				//IDEUtils.WSLPathFix(launchPath);
+				launchPath.Append("@gdb_wsl");
+			}
+			else if (!launchPath.Contains('@'))
+			{
+				if (mSettings.mDebuggerSettings.mDebuggerKind == .GDB)
+					launchPath.Append("@gdb");
+				else if (mSettings.mDebuggerSettings.mDebuggerKind == .LLDB)
+					launchPath.Append("@lldb");
+			}
 
 			if (!mDebugger.OpenFile(launchPath, targetPath, arguments, workingDir, envBlock, wasCompiled, workspaceOptions.mAllowHotSwapping, openFileFlags))
 			{
@@ -12584,6 +13280,109 @@ namespace IDE
 				});
 		}
 
+		public virtual Panel GetPanel(StringView name)
+		{
+			if (name == "CallStackPanel")
+			    return gApp.mCallStackPanel;
+			else if (name == "BreakpointPanel")
+			    return gApp.mBreakpointPanel;
+			else if (name == "ProfilePanel")
+				return gApp.mProfilePanel;
+			else if (name == "OutputPanel")
+			{                
+			    return gApp.mOutputPanel;
+			}
+			else if (name == "TerminalPanel")
+			{
+#if BF_PLATFORM_WINDOWS
+			    return gApp.mTerminalPanel;
+#endif
+			}
+			else if (name == "ImmediatePanel")
+			{                
+			    return gApp.mImmediatePanel;
+			}
+			else if (name == "ErrorsPanel")
+			{                
+			    return gApp.mErrorsPanel;
+			}
+			else if (name == "FindResultsPanel")
+			{                
+			    return gApp.mFindResultsPanel;
+			}
+			else if (name == "ProjectPanel")
+			{             
+			    return gApp.mProjectPanel;
+			}
+			else if (name == "ClassViewPanel")
+			{             
+			    return gApp.mClassViewPanel;
+			}
+			else if (name == "PropertiesPanel")
+			{                
+			    return gApp.mPropertiesPanel;
+			}
+			else if (name == "SourceViewPanel")
+			{
+			    return new SourceViewPanel();
+			}
+			else if (name == "BinaryDataPanel")
+			{
+			    return new BinaryDataPanel();
+			}
+			else if (name == "DisassemblyPanel")
+			{
+			    var disassemblyPanel = new DisassemblyPanel();
+			    disassemblyPanel.mIsInitialized = true;
+			    return disassemblyPanel;
+			}
+			else if (name == "ThreadPanel")
+			{
+			    return gApp.mThreadPanel;
+			}
+			else if (name == "WatchPanel")
+			{
+			    return gApp.mWatchPanel;
+			}
+			else if (name == "AutoWatchPanel")
+			{
+			    return gApp.mAutoWatchPanel;
+			}
+			else if (name == "MemoryPanel")
+			{
+			    return gApp.mMemoryPanel;
+			}
+			else if (name == "DiagnosticsPanel")
+			{
+			    return gApp.mDiagnosticsPanel;
+			}
+			else if (name == "AutoCompletePanel")
+			{
+			    return gApp.mAutoCompletePanel;
+			}
+			else if (name == "ModulePanel")
+			{
+			    return gApp.mModulePanel;
+			}
+			else if (name == "BookmarksPanel")
+			{                
+			    return gApp.mBookmarksPanel;
+			}
+			else if (name == "TerminalPanel")
+			{
+#if BF_PLATFORM_WINDOWS
+			    return gApp.mTerminalPanel;
+#endif
+			}
+			else if (name == "ConsolePanel")
+			{
+#if BF_PLATFORM_WINDOWS
+			    return gApp.mConsolePanel;
+#endif
+			}
+			return null;
+		}
+
 		void ShowStartupFile()
 		{
 			bool hasSourceShown = false;
@@ -12613,7 +13412,7 @@ namespace IDE
 			}
 		}
 
-		public void CreateDefaultLayout(bool allowSavedLayout = true)
+		public virtual void CreateDefaultLayout(bool allowSavedLayout = true)
 		{
 			//TODO:
 			//mConfigName.Set("Dbg");
@@ -12687,6 +13486,16 @@ namespace IDE
 #endif
 		}
 
+		/// Feeds Compiler.CompilerPath / CompilerVersion / CompilerBuildDate, using the same version and
+		///  build time reported by the 'IDE Started' line
+		public void SetCompilerInfo(BfCompiler compiler)
+		{
+			GetVersionInfo(var exeDate);
+			String exeFilePath = scope .();
+			Environment.GetExecutableFilePath(exeFilePath);
+			compiler.SetCompilerInfo(exeFilePath, mVersionInfo.FileVersion ?? cVersion, mExeDateUtc.Ticks);
+		}
+
 		void UpdateTitle(StringView titleOverride = default)
 		{
 			String title = scope String();
@@ -12700,7 +13509,7 @@ namespace IDE
 				title.Append(titleOverride);
 				title.Append(" - ");
 			}
-			title.Append("Beef IDE");
+			title.Append(sTitle);
 
 			String extraStr = scope .();
 
@@ -12721,6 +13530,9 @@ namespace IDE
 
 			if (!extraStr.IsEmpty)
 				title.AppendF(" [{}]", extraStr);
+
+			if (mMCPServer != null)
+				title.Append(mMCPClientActive ? " (MCP Control)" : " (MCP Waiting)");
 
 			mMainWindow.SetTitle(title);
 		}
@@ -12749,111 +13561,28 @@ namespace IDE
 				if (!String.IsNullOrEmpty(mVersionInfo.FileVersion))
 					Debug.Assert(mVersionInfo.FileVersion.StartsWith(cVersion));
 #if BF_PLATFORM_WINDOWS
-				exeTime = File.GetLastWriteTime(exeFilePath).GetValueOrDefault();
+				mExeDateUtc = File.GetLastWriteTimeUtc(exeFilePath).GetValueOrDefault();
+#else
+				const DateTime COMPILE_TIME = DateTime.UtcNow;
+				mExeDateUtc = COMPILE_TIME;
 #endif
 			}
+			// Cached - previously only the first caller got a date, and BuildApp.Init already consumed it
+			exeTime = mExeDateUtc.ToLocalTime();
 			return mVersionInfo;
 		}
 
-#if !CLI
-		public override void Init()
+		protected void InitUserDataDir()
 		{
-			scope AutoBeefPerf("IDEApp.Init");
-			//int zag = 123;
-
-			if (mVerbosity == .Default)
-				mVerbosity = .Detailed;
-
-			mStartedWithTestScript = mRunningTestScript;
-
-			mCommands.Init();
-			EnableGCCollect = mEnableGCCollect;
-
-			if (mConfigName.IsEmpty)
-				mConfigName.Set("Debug");
-			if (mPlatformName.IsEmpty)
-				mPlatformName.Set(sPlatform64Name ?? sPlatform32Name);
-
-			Directory.GetCurrentDirectory(mInitialCWD);
-
-#if DEBUG
-			//mColorMatrix = Matrix4.Identity;
+#if BF_PLATFORM_LINUX && LINUX_PACKAGE
+			delete mUserDataDir;
+			mUserDataDir = new $"{Environment.GetEnvironmentVariable("HOME", .. scope .())}/.config/beeflang/";
 #endif
+		}
 
-			base.Init();
-			mSettings.Apply();
-
-			mGitManager.Init();
-
-			//Yoop();
-
-			/*for (int i = 0; i < 100*1024*1024; i++)
-			{
-				mTestString.Append("Hey, this is a test string!");
-			}*/
-
-			mAutoDirty = false;
-			WidgetWindow.sOnWindowClosed.Add(new => HandleWindowClosed);
-
-			//mProjectDir = BFApp.mApp.mInstallDir + "../../";
-
-			if (!mRunningTestScript)
-			{
-				// User setting can affect automated testing, so use default settings
-				if (!mIsFirstRun)
-					mSettings.Load();
-				mSettings.Apply();
-				mIsFirstRun = !mSettings.mLoadedSettings;
-#if !CLI && BF_PLATFORM_WINDOWS
-				if (!mSettings.mTutorialsFinished.mRanDebug)
-				{
-					let exePath = scope String();
-					Environment.GetExecutableFilePath(exePath);
-					if (exePath.EndsWith("_d.exe", .OrdinalIgnoreCase))
-					{
-						if (Windows.MessageBoxA(default, "Are you sure you want to run the debug build of the Beef IDE? This is useful for debugging Beef issues but execution speed will be much slower.", "RUN DEBUG?",
-							Windows.MB_ICONQUESTION | Windows.MB_YESNO) != Windows.IDYES)
-						{
-							Stop();
-							return;
-						}
-
-					}
-					mSettings.mTutorialsFinished.mRanDebug = true;
-				}
-#endif
-			}
-
-			Font.AddFontFailEntry("Segoe UI", scope String()..AppendF("{}fonts/NotoSans-Regular.ttf", mInstallDir));
-
-			DarkTheme aTheme = new DarkTheme();
-			mSettings.mUISettings.Apply(); // Apply again to set actual theme
-			aTheme.Init();
-			ThemeFactory.mDefault = aTheme;
-
-			mTinyCodeFont = new Font();
-			mCodeFont = new Font();
-			mTermFont = new Font();
-
-			//mCodeFont = Font.LoadFromFile(BFApp.sApp.mInstallDir + "fonts/SourceCodePro32.fnt");
-
-			//mCodeFont = Font.LoadFromFile(BFApp.sApp.mInstallDir + "fonts/SegoeUI24.fnt");
-
-			mMainFrame = new MainFrame();
-			mDockingFrame = mMainFrame.mDockingFrame;
-
-			mSquiggleImage = Image.LoadFromFile(scope String(mInstallDir, "images/Squiggle.png"));
-			mCircleImage = Image.LoadFromFile(scope String(mInstallDir, "images/Circle.png"));
-
-			RehupScale();
-
-			CreateBfSystems();
-			if (mWantsClean)
-			{
-				mBfBuildCompiler.ClearBuildCache();
-				mWantsClean = false;
-			}
-
+#if !CLI
+		public virtual void CreatePanels()
+		{
 			mProjectPanel = new ProjectPanel();
 			mProjectPanel.mAutoDelete = false;
 			mClassViewPanel = new ClassViewPanel();
@@ -12898,6 +13627,109 @@ namespace IDE
 			mAutoCompletePanel.mAutoDelete = false;
 			mBookmarksPanel = new BookmarksPanel();
 			mBookmarksPanel.mAutoDelete = false;
+		}
+
+		public override void Init()
+		{
+			scope AutoBeefPerf("IDEApp.Init");
+			//int zag = 123;
+
+			if (mVerbosity == .Default)
+				mVerbosity = .Detailed;
+
+			mStartedWithTestScript = mRunningTestScript;
+
+			mCommands.Init();
+			EnableGCCollect = mEnableGCCollect;
+
+			if (mConfigName.IsEmpty)
+				mConfigName.Set("Debug");
+			if (mPlatformName.IsEmpty)
+				mPlatformName.Set(sPlatform64Name ?? sPlatform32Name);
+
+			Directory.GetCurrentDirectory(mInitialCWD);
+
+#if DEBUG
+			//mColorMatrix = Matrix4.Identity;
+#endif
+
+			base.Init();
+			mSettings.Apply();
+
+			mGitManager.Init();
+			InitUserDataDir();
+
+			//Yoop();
+
+			/*for (int i = 0; i < 100*1024*1024; i++)
+			{
+				mTestString.Append("Hey, this is a test string!");
+			}*/
+
+			mAutoDirty = false;
+			WidgetWindow.sOnWindowClosed.Add(new => HandleWindowClosed);
+
+			//mProjectDir = BFApp.mApp.mInstallDir + "../../";
+
+			if (!mRunningTestScript)
+			{
+				// User setting can affect automated testing, so use default settings
+				if (!mIsFirstRun)
+					mSettings.Load();
+				mSettings.Apply();
+				mIsFirstRun = !mSettings.mLoadedSettings;
+#if !CLI && BF_PLATFORM_WINDOWS
+				if (!mSettings.mTutorialsFinished.mRanDebug)
+				{
+					let exePath = scope String();
+					Environment.GetExecutableFilePath(exePath);
+					if (exePath.EndsWith("_d.exe", .OrdinalIgnoreCase))
+					{
+						if (Windows.MessageBoxA(default, "Are you sure you want to run the debug build of the Beef IDE? This is useful for debugging Beef issues but execution speed will be much slower.", "RUN DEBUG?",
+							Windows.MB_ICONQUESTION | Windows.MB_YESNO) != Windows.IDYES)
+						{
+							Stop();
+							return;
+						}
+
+					}
+					mSettings.mTutorialsFinished.mRanDebug = true;
+				}
+#endif
+			}
+
+			Font.AddFontFailEntry("Segoe UI", scope $"Noto Sans\0{mInstallDir}fonts/NotoSans-Regular.ttf");
+			Font.AddFontFailEntry("Segoe UI Bold", scope $"Noto Sans Bold\0{mInstallDir}fonts/NotoSans-Bold.ttf");
+
+			DarkTheme aTheme = new DarkTheme();
+			mSettings.mUISettings.Apply(); // Apply again to set actual theme
+			aTheme.Init();
+			ThemeFactory.mDefault = aTheme;
+
+			mTinyCodeFont = new Font();
+			mCodeFont = new Font();
+			mTermFont = new Font();
+
+			//mCodeFont = Font.LoadFromFile(BFApp.sApp.mInstallDir + "fonts/SourceCodePro32.fnt");
+
+			//mCodeFont = Font.LoadFromFile(BFApp.sApp.mInstallDir + "fonts/SegoeUI24.fnt");
+
+			mMainFrame = new MainFrame();
+			mDockingFrame = mMainFrame.mDockingFrame;
+
+			mSquiggleImage = Image.LoadFromFile(scope String(mInstallDir, "images/Squiggle.png"));
+			mCircleImage = Image.LoadFromFile(scope String(mInstallDir, "images/Circle.png"));
+
+			RehupScale();
+
+			CreateBfSystems();
+			if (mWantsClean)
+			{
+				mBfBuildCompiler.ClearBuildCache();
+				mWantsClean = false;
+			}
+
+			CreatePanels();
 
 			GetVersionInfo(var exeDate);
 			let localExeDate = exeDate.ToLocalTime();
@@ -12907,7 +13739,7 @@ namespace IDE
 			exeDateStr.Append(" at ");
 			localExeDate.ToShortTimeString(exeDateStr);
 
-			OutputLine("IDE Started. Version {} built {}.", mVersionInfo.FileVersion, exeDateStr);
+			OutputLine("IDE Started. Version {} built {}.", (mVersionInfo.FileVersion ?? cVersion), exeDateStr);
 
 			/*if (!mRunningTestScript)
 			{
@@ -12969,17 +13801,25 @@ namespace IDE
 			{
 				BFWindow.Flags flags = .Border | .ThickFrame | .Resizable | .SysMenu |
 					.Caption | .Minimize | .Maximize | .QuitOnClose | .Menu | .PopupPosition | .AcceptFiles;
-				if (mRunningTestScript)
+				// Automated runs come up behind whatever the user is working in: shown without
+				// activation, and not maximized, since a maximized placement activates regardless.
+				bool background = (mRunningTestScript) || (mMCPPort >= 0);
+				if (background)
 					flags |= .NoActivate;
 
-				if (mRequestedShowKind == .Maximized || mRequestedShowKind == .ShowMaximized)
+				if (((mRequestedShowKind == .Maximized) || (mRequestedShowKind == .ShowMaximized)) && (mMCPPort < 0))
 					flags |= .ShowMaximized;
 
 				scope AutoBeefPerf("IDEApp.Init:CreateMainWindow");
-				mMainWindow = new WidgetWindow(null, "Beef IDE", (int32)mRequestedWindowRect.mX,
+				mMainWindow = new WidgetWindow(null, sTitle, (int32)mRequestedWindowRect.mX,
 					(int32)mRequestedWindowRect.mY, (int32)mRequestedWindowRect.mWidth, (int32)mRequestedWindowRect.mHeight,
 					flags, mMainFrame);
 			}
+
+#if BF_PLATFORM_LINUX || BF_PLATFORM_MACOS
+			let icon = (Span<uint8>)cAppIcon;
+			BFApp_RegisterAppIcon(icon.Ptr, icon.Length);
+#endif
 
 			if (mIsFirstRun)
 			{
@@ -13063,7 +13903,18 @@ namespace IDE
 						CompileAndRun(true);
 				}
 				else
+				{
+					switch (mLaunchData.mKind)
+					{
+					case .GDB:
+						mLaunchData.mTargetPath.Append("@gdb");
+					case .GDB_WSL:
+						mLaunchData.mTargetPath.Append("@gdb_wsl");
+					default:
+					}
+					
 					LaunchDialog.DoLaunch(null, mLaunchData.mTargetPath, mLaunchData.mArgs ?? "", mLaunchData.mWorkingDir ?? "", "", mLaunchData.mPaused, true);
+				}
 			}
 
 			mInitialized = true;
@@ -13110,8 +13961,57 @@ namespace IDE
 
 			if ((mSettings.mUISettings.mShowStartupPanel) && (!mIsFirstRun) && (!mWorkspace.IsInitialized))
 				ShowStartup();
+
+			StartMCPServer();
 		}
 #endif
+
+		// A derived IDE overrides this to add its own tool sets after the standard ones
+		protected virtual void RegisterMCPTools(MCPServer server)
+		{
+#if !CLI
+			server.AddToolSet(new IDECoreToolSet());
+			server.AddToolSet(new UIToolSet());
+			server.AddToolSet(new IDEEditorToolSet());
+			server.AddToolSet(new IDEWorkspaceToolSet());
+			server.AddToolSet(new IDEEditToolSet());
+			server.AddToolSet(new IDEBuildToolSet());
+			server.AddToolSet(new IDEDebugToolSet());
+#endif
+		}
+
+		void StartMCPServer()
+		{
+			if (mMCPPort < 0)
+				return;
+
+			int32 port = (mMCPPort == 0) ? cDefaultMCPPort : mMCPPort;
+			mMCPServer = new MCPServer(port);
+			mMCPServer.mServerName.Set("beefide");
+			RegisterMCPTools(mMCPServer);
+			if (mMCPServer.Start() case .Err)
+			{
+				// MCP was asked for on the command line and can't be served -- most often another IDE
+				// already holds the port. Quit with a failure code: a window nothing can drive is worse
+				// than none, and the caller's next connect would fail with no explanation.
+				String failMsg = scope $"MCP: failed to listen on port {port}";
+				OutputErrorLine(failMsg);
+				Console.Error.WriteLine(failMsg);
+				DeleteAndNullify!(mMCPServer);
+				mFailed = true;
+				Stop();
+				return;
+			}
+			OutputLine(scope $"MCP: listening on http://127.0.0.1:{port}/mcp");
+			// The driving agent's own window is normally the OS foreground; without this, popups
+			// would close the moment they opened and keys would go nowhere
+			SetVirtualFocus(true);
+			// No modal crash dialog with nobody to click it: the MCP server records asserts and
+			// fatal errors (status.lastRuntimeError, mcp_last_error.txt beside the exe)
+			Runtime.SetCrashReportKind(.PrintOnly);
+			UpdateTitle();
+		}
+
 		void ShowWelcome()
 		{
 			WelcomePanel welcomePanel = new .();
@@ -13418,6 +14318,11 @@ namespace IDE
 			}
 		}
 
+		public virtual void HotCompileDone(bool success)
+		{
+
+		}
+
 		void FinishPendingHotResolve()
 		{
 			List<uint8> typeData = scope .();
@@ -13471,6 +14376,8 @@ namespace IDE
 					var compileInstance = mWorkspace.mCompileInstanceList.Back;
 					Debug.Assert(compileInstance.mCompileResult == .PendingHotLoad);
 					compileInstance.mCompileResult = .Failure;
+					// The compile did not take: the program still runs the old code
+					mLastCompileFailed = true;
 				}
 			}
 
@@ -13480,6 +14387,7 @@ namespace IDE
 				if (compileInstance.mCompileResult == .PendingHotLoad)
 					compileInstance.mCompileResult = .Success;
 			}
+			HotCompileDone(true);
 		}
 
 		void QueueProjectItems(Project project)
@@ -13624,7 +14532,7 @@ namespace IDE
 						((mBfResolveCompiler == null) || (!mBfResolveCompiler.HasQueuedCommands())))
 					{
 						didClean = true;
-						OutputLine("Cleaned Beef.");
+						OutputLine("Cleaned Beef");
 
 						if (mErrorsPanel != null)
 							mErrorsPanel.ClearParserErrors(null);
@@ -13636,7 +14544,9 @@ namespace IDE
 						DeleteAndNullify!(mBfBuildSystem);
 
 						///
+#if BF_PLATFORM_WINDOWS
 						mDebugger.FullReportMemory();
+#endif
 
 						var workspaceBuildDir = scope String();
 						GetWorkspaceBuildDir(workspaceBuildDir);
@@ -14470,7 +15380,7 @@ namespace IDE
 			Debug.Assert(numOverWidgets <= 1);
 		}*/
 
-		public void FileRenamed(ProjectFileItem projectFileItem, String oldPath, String newPath)
+		public virtual void FileRenamed(ProjectFileItem projectFileItem, String oldPath, String newPath)
 		{
 			String newFileName = scope String();
 			Path.GetFileName(newPath, newFileName);
@@ -14494,7 +15404,7 @@ namespace IDE
 					{
 						if (Path.Equals(sourceViewPanel.mFilePath, oldPath))
 						{
-							var sourceViewTab = (IDEApp.SourceViewTabButton)tab;
+							var sourceViewTab = (IDEApp.ContentTabButton)tab;
 
 							sourceViewPanel.PathChanged(newPath);
 							tab.Label = newFileName;
@@ -14503,6 +15413,26 @@ namespace IDE
 							{
 								tab.mWantWidth = newWidth;
 								tab.mTabbedView.mNeedResizeTabs = true;
+							}
+						}
+						return;
+					}
+
+					if (let contentPanel = tab.mContent as ContentPanel)
+					{
+						if ((contentPanel.mFilePath != null) && (Path.Equals(contentPanel.mFilePath, oldPath)))
+						{
+							contentPanel.HandleFileRenamed(newPath);
+
+							if (let contentTab = tab as IDEApp.ContentTabButton)
+							{
+								tab.Label = newFileName;
+								float newWidth = contentTab.GetWantWidth();
+								if (newWidth != tab.mWantWidth)
+								{
+									tab.mWantWidth = newWidth;
+									tab.mTabbedView.mNeedResizeTabs = true;
+								}
 							}
 						}
 					}
@@ -14536,7 +15466,7 @@ namespace IDE
 			}
 		}
 
-		public void OnWatchedFileChanged(ProjectItem projectItem, WatcherChangeTypes changeType, String newPath)
+		public virtual void OnWatchedFileChanged(ProjectItem projectItem, WatcherChangeTypes changeType, String newPath)
 		{
 			CompilerLog("IDEApp.OnWatchedFileChanged {} {} {}", projectItem.mName, changeType, newPath);
 
@@ -14561,10 +15491,16 @@ namespace IDE
 
 					String oldPath = scope String();
 					projectFileItem.GetFullImportPath(oldPath);
-					projectFileItem.Rename(newName);
-
-					FileRenamed(projectFileItem, oldPath, newPath);
-					mProjectPanel?.SortItem((ProjectListViewItem)listViewItem.mParentItem);
+					if (projectFileItem.Rename(newName))
+					{
+						FileRenamed(projectFileItem, oldPath, newPath);
+						mProjectPanel?.SortItem((ProjectListViewItem)listViewItem.mParentItem);
+					}
+					else
+					{
+						// Duplicate
+						mProjectPanel?.DoDeleteItem(listViewItem, null, .ForceRemove);
+					}
 				}
 			}
 			else if (changeType == .Deleted)
@@ -14577,7 +15513,7 @@ namespace IDE
 			else if (changeType == .FileCreated)
 			{
 				let projectFolder = projectItem as ProjectFolder;
-				if (projectFolder.IsAutoInclude())
+				if ((projectFolder.IsAutoInclude()) && (projectFolder.CheckAddFile(newPath)))
 				{
 					if (!projectFolder.mChildMap.ContainsKey(newName))
 					{
@@ -14684,7 +15620,38 @@ namespace IDE
 			}
 		}
 
-		void UpdateWorkspace()
+		public void MarkFileChanged(StringView path)
+		{
+			mHaveSourcesChangedExternallySinceLastCompile = true;
+			var useFilePath = IDEUtils.FixFilePath(.. scope .(path));
+			if (var projectSource = FindProjectSourceItem(useFilePath))
+			{
+				projectSource.HasChangedSinceLastCompile = true;
+			}
+
+			var pathStr = scope String(path);
+			if (var projectItem = FindProjectSourceItem(pathStr))
+			{
+				using (mFileWatcher.mMonitor.Enter())
+				{
+					// Queue this up right away instead of waiting for file system.
+					// We can call UpdateChangedFiles(true) now to force edit data reload.
+					mFileWatcher.AddChangedDependency(projectItem);
+				}
+			}
+		}
+
+		public virtual bool WantsFileChangeDialog(ContentPanel panel)
+		{
+			return true;
+		}
+
+		protected void UpdateWorkspace()
+		{
+			UpdateChangedFiles(false);
+		}
+
+		protected void UpdateChangedFiles(bool forceFocus = false)
 		{
 			mFileWatcher.Update();
 #if !CLI
@@ -14732,7 +15699,7 @@ namespace IDE
 			}
 			mAppHasFocus = appHasFocus;
 
-			if (mRunningTestScript)
+			if ((mRunningTestScript) || (forceFocus))
 				appHasFocus = true;
 
 			// Is this enough to get the behavior we want?
@@ -14820,6 +15787,54 @@ namespace IDE
 #endif
 
 				FileChanged(fileName);
+
+				// Non-source ContentPanels don't use the EditData/ProjectSource machinery below.
+				ContentPanel matchedContentPanel = null;
+				WithTabs(scope [&] (tabButton) =>
+					{
+						if (matchedContentPanel != null)
+							return;
+						if ((tabButton.mContent is SourceViewPanel))
+							return;
+						if (let contentPanel = tabButton.mContent as ContentPanel)
+						{
+							if (contentPanel.FileNameMatches(fileName))
+								matchedContentPanel = contentPanel;
+						}
+					});
+
+				if ((matchedContentPanel != null) && (WantsFileChangeDialog(matchedContentPanel)))
+				{
+					FileChangedDialog.DialogKind dialogKind = File.Exists(fileName) ? .Changed : .Deleted;
+
+					if ((matchedContentPanel.HasUnsavedChanges()) || (dialogKind == .Deleted))
+					{
+						if ((mFileChangedDialog != null) && (mFileChangedDialog.mApplyAllResult[(int)dialogKind].HasValue))
+						{
+							bool doIt = mFileChangedDialog.mApplyAllResult[(int)dialogKind].Value;
+							if (doIt)
+							{
+								if (dialogKind == .Deleted)
+									matchedContentPanel.HandleFileDeleted();
+								else
+									matchedContentPanel.Reload();
+							}
+							continue;
+						}
+						else
+						{
+							mFileChangedDialog = new FileChangedDialog();
+							mFileChangedDialog.Show(matchedContentPanel);
+						}
+						break;
+					}
+					else
+					{
+						matchedContentPanel.Reload();
+					}
+					continue;
+				}
+
 				var editData = GetEditData(fileName, false, false);
 				if (editData == null)
 					continue;
@@ -14857,7 +15872,7 @@ namespace IDE
 				}
 
 				var sourceViewPanel = FindSourceViewPanel(fileName);
-				if (sourceViewPanel != null)
+				if ((sourceViewPanel != null) && (WantsFileChangeDialog(sourceViewPanel)))
 				{
 					FileChangedDialog.DialogKind dialogKind = File.Exists(fileName) ? .Changed : .Deleted;
 
@@ -15160,6 +16175,53 @@ namespace IDE
 				});
 		}
 
+		// Advances the build pipeline between frames so each queued step doesn't wait out a whole update tick
+		public override bool IdleUpdate()
+		{
+			if (mExecutionQueue.IsEmpty)
+			{
+				// A running target (Run without debugging) can sit here for its whole lifetime
+				if ((mExecutionInstances.IsEmpty) || (mExecutionInstances[0].mIsTargetRun))
+					return false;
+			}
+			// Debug starts depend on debugger state that Update refreshes first
+			if ((!mExecutionQueue.IsEmpty) && (mExecutionQueue[0] is StartDebugCmd))
+				return false;
+
+			scope AutoBeefPerf("IDEApp.IdleUpdate");
+			let stopwatch = scope Stopwatch(true);
+			let msg = scope String();
+			while (true)
+			{
+				int prevQueueCount = mExecutionQueue.Count;
+				int prevInstanceCount = mExecutionInstances.Count;
+
+				if (mBfBuildCompiler != null)
+				{
+					mBfBuildCompiler.Update();
+					while (true)
+					{
+#if CLI
+						if (mCompilingBeef)
+							break;
+#endif
+						msg.Clear();
+						if (!mBfBuildCompiler.PopMessage(msg))
+							break;
+						OutputLineSmart(msg);
+					}
+				}
+				mBuildContext?.mScriptManager?.Update();
+				UpdateExecution();
+
+				if ((mExecutionQueue.Count == prevQueueCount) && (mExecutionInstances.Count == prevInstanceCount))
+					break;
+				if ((stopwatch.ElapsedMilliseconds >= 2) || (mExecutionQueue.IsEmpty))
+					break;
+			}
+			return true;
+		}
+
 		public override void Update(bool batchStart)
 		{
 			scope AutoBeefPerf("IDEApp.Update");
@@ -15284,6 +16346,16 @@ namespace IDE
 			mDiagnosticsPanel?.UpdateStats();
 			if (mScriptManager != null)
 				mScriptManager.Update();
+			if (mMCPServer != null)
+			{
+				mMCPServer.Update();
+				bool mcpClientActive = mMCPServer.IsClientActive;
+				if (mcpClientActive != mMCPClientActive)
+				{
+					mMCPClientActive = mcpClientActive;
+					UpdateTitle();
+				}
+			}
 
 #if BF_PLATFORM_WINDOWS
 			if (mConsolePanel != null)

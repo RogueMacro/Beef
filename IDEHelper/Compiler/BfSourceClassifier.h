@@ -17,6 +17,7 @@ enum BfSourceElementType
 	BfSourceElementType_Local,
 	BfSourceElementType_Parameter,
 	BfSourceElementType_Member,
+	BfSourceElementType_Static,
 	BfSourceElementType_Method,
 	BfSourceElementType_Type,
 	BfSourceElementType_PrimitiveType,
@@ -120,6 +121,7 @@ public:
 	virtual void Visit(BfTagTypeRef* typeRef) override;
 	virtual void Visit(BfGenericInstanceTypeRef* typeRef) override;
 	virtual void Visit(BfVariableDeclaration* varDecl) override;
+	virtual void Visit(BfForEachStatement* forEachStmt) override;
 	virtual void Visit(BfLambdaBindExpression* lambdaBindExpr) override;
 	virtual void Visit(BfLocalMethodDeclaration* methodDecl) override;
 	virtual void Visit(BfLiteralExpression* literalExpr) override;

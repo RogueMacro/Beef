@@ -9,6 +9,7 @@ NS_BF_BEGIN;
 
 class Texture;
 class Shader;
+class ComputeShader;
 class ShaderPass;
 class BFApp;
 
@@ -145,18 +146,40 @@ enum CullMode : int8
 	CullMode_Back
 };
 
+enum FrontFace : int8
+{
+	FrontFace_Clockwise,
+	FrontFace_CounterClockwise
+};
+
 enum Topology3D : int8
 {
 	Topology3D_TriangleList,
-	Topology3D_LineLine
+	Topology3D_LineLine,
+	// Points, drawn non-indexed: every vertex of a batch rasterizes exactly once (see DXDrawBatch::Render).
+	Topology3D_PointList
 };
 
-enum TextureFlag : int8
+// Nearest always clamps (there's no "nearest + wrap" combination in use).
+enum SamplerKind : int8
+{
+	SamplerKind_Wrap,
+	SamplerKind_Clamp,
+	SamplerKind_Nearest
+};
+
+enum TextureFlag : int32
 {
 	TextureFlag_Additive = 1,
 	TextureFlag_NoPremult = 2,
 	TextureFlag_AllowRead = 4,
-	TextureFlag_HasTransFollowing = 8
+	TextureFlag_HasTransFollowing = 8,
+	TextureFlag_Mipmaps = 0x10,
+	// Color data: store sRGB-encoded, sample hardware-decoded to linear.
+	TextureFlag_Srgb = 0x20,
+	TextureFlag_UseLoadCache = 0x40,
+	// Keep the uploaded pixels in system memory. Readback needs no copy (it stages from the GPU).
+	TextureFlag_KeepPixels = 0x80
 };
 
 struct VertexDefData
@@ -171,12 +194,16 @@ class VertexDefinition
 public:
 	VertexDefData* mElementData;
 	int mNumElements;
+	// Element that an instanced draw feeds from a per-instance stream instead of the vertex (-1 = none).
+	// Shaders built on this definition get a second input layout for it (see DXShader::mD3DInstLayout).
+	int mInstanceElementIdx;
 
 public:
 	VertexDefinition()
 	{
 		mElementData = NULL;
 		mNumElements = 0;
+		mInstanceElementIdx = -1;
 	}
 
 	VertexDefinition(VertexDefinition* src)
@@ -184,6 +211,7 @@ public:
 		mElementData = new VertexDefData[src->mNumElements];
 		mNumElements = src->mNumElements;
 		memcpy(mElementData, src->mElementData, sizeof(VertexDefData) * mNumElements);
+		mInstanceElementIdx = src->mInstanceElementIdx;
 	}
 
 	virtual ~VertexDefinition()
@@ -192,31 +220,80 @@ public:
 	}
 };
 
+// GPU-resident geometry uploaded once (see RenderDevice::CreateStaticMesh), drawn instanced through
+// DrawLayer::DrawStaticMeshInstanced.
+class StaticMesh
+{
+public:
+	int mVtxSize;
+	int mVtxCount;
+	int mIdxCount;
+	bool mIdx32;
+
+public:
+	StaticMesh()
+	{
+		mVtxSize = 0;
+		mVtxCount = 0;
+		mIdxCount = 0;
+		mIdx32 = false;
+	}
+	virtual ~StaticMesh() {}
+};
+
+// One timed GPU region (see RenderDevice::GpuTimerSpanBegin): mTag is whatever the caller last set
+// with GpuTimerSetTag, so the consumer can attribute the time to its own profiler section.
+struct GpuTimerSpan
+{
+	int mTag;
+	int64 mNanos;
+};
+
+enum StencilMode
+{
+	StencilMode_Disabled,
+	StencilMode_ShadowVolume,
+	StencilMode_NotEqualZero
+};
+
 class RenderState
 {
 public:
 	Shader*					mShader;
 	bool					mWriteDepthBuffer;
-	DepthFunc				mDepthFunc;	
+	DepthFunc				mDepthFunc;
+	StencilMode				mStencilMode;
 	bool					mClipped;
-	bool					mTexWrap;
+	SamplerKind				mSamplerKind;
 	bool					mWireframe;
 	RectF					mClipRect;
 	CullMode				mCullMode;
-	Topology3D				mTopology;
+	FrontFace				mFrontFace;
+	Topology3D				mTopology;	
+	bool					mDisablePixelShader;
+	bool					mDisableRenderTarget;
+	bool					mDisableBlend;
+	bool					mAlphaToCoverage;
 
 public:
 	RenderState();
 	virtual ~RenderState() {}
 
 	virtual void SetShader(Shader* shader) { mShader = shader; }
-	virtual void SetTexWrap(bool wrap) { mTexWrap = wrap; }
+	virtual void SetSamplerKind(SamplerKind samplerKind) { mSamplerKind = samplerKind; }
 	virtual void SetWireframe(bool wireframe) { mWireframe = wireframe; }
 	virtual void SetClipped(bool clipped) { mClipped = clipped; }
 	virtual void SetClipRect(const RectF& rect) { mClipRect = rect; }
 	virtual void SetWriteDepthBuffer(bool writeDepthBuffer) { mWriteDepthBuffer = writeDepthBuffer; }
 	virtual void SetDepthFunc(DepthFunc depthFunc) { mDepthFunc = depthFunc; }
+	virtual void SetStencilMode(StencilMode mode) { mStencilMode = mode; }
 	virtual void SetTopology(Topology3D topology) { mTopology = topology; }
+	virtual void SetCullMode(CullMode cullMode) { mCullMode = cullMode; }
+	virtual void SetFrontFace(FrontFace frontFace) { mFrontFace = frontFace; }
+	virtual void SetDisablePixelShader(bool disable) { mDisablePixelShader = disable; }
+	virtual void SetDisableRenderTarget(bool disable) { mDisableRenderTarget = disable; }
+	virtual void SetDisableBlend(bool disable) { mDisableBlend = disable; }
+	virtual void SetAlphaToCoverage(bool enabled) { mAlphaToCoverage = enabled; }
 };
 
 class PoolData
@@ -268,14 +345,26 @@ enum ModelCreateFlags
 	ModelCreateFlags_NoSetRenderState = 1
 };
 
+// Search directories for shader #include resolution, tried after the including file's own
+// directory. The shader cache's include hash walk uses the same list.
+void AddShaderIncludeDir(const StringImpl& dir);
+const Array<String>& GetShaderIncludeDirs();
+
 class RenderDevice
 {
-public:	
-	Array<DrawBatch*>		mDrawBatchPool;	
+public:
+	int mStatsCategory = 0;
+	int64 mSubmissionStats[3][3] = {};
+	void RecordSubmission(int category, Topology3D topology, int indexCount, int instanceCount);
+
+	Array<DrawBatch*>		mDrawBatchPool;
 	
 	BFApp*					mApp;
 	RenderWindow*			mPhysRenderWindow;
 	RenderState*			mPhysRenderState;
+	// Sample count for window swapchains/backbuffers (blt-model MSAA, resolved by Present) -- must
+	// be set before window creation; validated against hardware support there.
+	int						mWindowMsaaSampleCount;
 	int						mResizeCount;
 	Array<RenderWindow*>	mRenderWindowList;
 	RenderTarget*			mCurRenderTarget;
@@ -283,6 +372,8 @@ public:
 
 	RenderState*			mDefaultRenderState;
 	RenderState*			mCurRenderState;	
+	// Settings of a released mPhysRenderState, which the device still has bound
+	RenderState				mReleasedPhysRenderState;
 
 	MemoryPool				mPooledIndexBuffers;
 	MemoryPool				mPooledVertexBuffers;
@@ -291,6 +382,9 @@ public:
 public:	
 	virtual void			PhysSetRenderState(RenderState* renderState) = 0;
 	virtual void			PhysSetRenderTarget(Texture* renderTarget) = 0;
+	// Restricts rasterization of the current target to a pixel rect (reset by the next target set);
+	// `clear` clears just that rect first (color + depth).
+	virtual void			PhysSetViewportRect(int x, int y, int width, int height, bool clear) {}
 
 public:
 	RenderDevice();
@@ -298,10 +392,39 @@ public:
 	virtual bool			Init(BFApp* app) = 0;
 	virtual void			AddRenderWindow(RenderWindow* renderWindow);
 	virtual void			RemoveRenderWindow(RenderWindow* renderWindow);
+	virtual void			NotifyOffscreenRender(RenderWindow* window, bool allowInstall) {}
 	
 	virtual RenderState*	CreateRenderState(RenderState* srcRenderState);
+	virtual void			ReleaseRenderState(RenderState* renderState);
+
 	virtual ModelInstance*	CreateModelInstance(ModelDef* modelDef, ModelCreateFlags flags) { return NULL; }
+	virtual void			DeleteModelInstance(ModelInstance* modelInstance);
 	virtual VertexDefinition* CreateVertexDefinition(VertexDefData* elementData, int numElements);	
+
+	// GPU timing. Spans are bracketed around actual submissions (layer flushes, resolves) rather than
+	// around caller code, since queued draws don't execute where they were recorded. A tag set while a
+	// layer is being recorded also goes into that layer as a GpuTagCmd, so the draws recorded after it
+	// count toward it when the layer executes. Results are read back a few frames later
+	// (GpuTimerFetch), never waited on.
+	virtual void			GpuTimerSetEnabled(bool enabled) {}
+	virtual bool			GpuTimerBeginFrame(int64 frameId) { return false; }
+	virtual void			GpuTimerSetTag(int tag) {}
+	virtual int				GpuTimerSpanBegin() { return -1; }
+	virtual void			GpuTimerSpanRetag(int tag) {}
+	virtual void			GpuTimerSpanEnd(int spanId) {}
+	virtual void			GpuTimerEndFrame() {}
+	// -1 = the oldest frame's results aren't ready yet; otherwise the span count for *outFrameId.
+	virtual int				GpuTimerFetch(int64* outFrameId, GpuTimerSpan* outSpans, int maxSpans) { return -1; }
+	// idxData is uint16 or uint32 per idx32. Delete the mesh only after every layer that queued draws of it has flushed.
+	virtual StaticMesh*		CreateStaticMesh(int vertexSize, void* vtxData, int vtxCount, void* idxData, int idxCount, bool idx32) { return NULL; }
+	// The compact position+bones stream for a mesh already created (see DX_DEPTH_VERTEX_SIZE).
+	virtual void			SetStaticMeshDepthStream(StaticMesh* mesh, void* data, int vtxCount) {}
+	virtual int64			GetStaticMeshBytes(StaticMesh* mesh) { return 0; }
+	// Diagnostics: one line per live texture and buffer (columns in the DX implementation), and the
+	// free of everything retired since the last frame end, what FrameEnd does, for a caller that
+	// ends its own frames.
+	virtual void			GetTextureStats(String& outStats) {}
+	virtual void			ProcessRetired() {}
 
 	virtual void			FrameStart() = 0;
 	virtual void			FrameEnd();
@@ -309,9 +432,31 @@ public:
 	virtual Texture*		LoadTexture(ImageData* imageData, int flags) = 0;
 	virtual Texture*		CreateDynTexture(int width, int height) = 0;
 	virtual Texture*		LoadTexture(const StringImpl& fileName, int flags);
-	virtual Texture*		CreateRenderTarget(int width, int height, bool destAlpha) = 0;
+	// NULL when the file can't be read or decoded.
+	ImageData*				DecodeImage(const StringImpl& fileName, int flags);
+	// Safe off the main thread: decodes and creates through the device only, registering nothing. NULL when this
+	// file can't be loaded that way. RegisterTexture, on the main thread, makes the result live.
+	virtual Texture*		LoadTextureDetached(const StringImpl& fileName, int flags) { return NULL; }
+	// The same from decoded pixels, which it may premultiply in place.
+	virtual Texture*		CreateTextureDetached(ImageData* imageData, int flags) { return NULL; }
+	virtual void			RegisterTexture(Texture* texture) {}
+	virtual Texture*		CreateRenderTarget(int width, int height, int flags, int sampleCount) = 0;
+	// Depth-only target: no color plane; the depth buffer itself is the sampleable resource.
+	virtual Texture*		CreateDepthTarget(int width, int height, bool is16Bit) { return NULL; }
+	// GPU structured buffer (StructuredBuffer<T> in HLSL) bound through the texture slots. Flags:
+	// 1 = GPU-writable (RWStructuredBuffer via a compute UAV; SetBufferData uploads instead of maps).
+	// 2 = CPU-updatable in place (default usage, Texture::UpdateBufferRange writes sub-ranges immediately).
+	virtual Texture*		CreateStructuredBuffer(int stride, int count, int flags = 0) { return NULL; }
+	// Volume texture with a UAV per mip (RWTexture3D); flags share CreateRenderTarget's format bits.
+	virtual Texture*		CreateTexture3D(int width, int height, int depth, int flags) { return NULL; }
+	virtual Texture*		OpenSharedRenderTarget(void* handle, int width, int height) { return NULL; }
 	
-	virtual Shader*			LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition) = 0;
+	// entrySuffix compiles alternate entry points ("VS"+suffix / "PS"+suffix) from the same file --
+	// how one surface-shader source yields its per-pass variants.
+	virtual Shader*			LoadShader(const StringImpl& fileName, VertexDefinition* vertexDefinition, const StringImpl& entrySuffix, int shaderFlags) = 0;
+	virtual void			ReleaseShader(Shader* shader);
+	virtual ComputeShader*	LoadComputeShader(const StringImpl& fileName, const StringImpl& entry) { return NULL; }
+	virtual void			ReleaseComputeShader(ComputeShader* shader);
 		
 	virtual void			SetRenderState(RenderState* renderState) = 0;
 };

@@ -134,11 +134,16 @@ namespace System
 		}
 	}
 
-    [AttributeUsage(.Method | .Constructor |  .Invocation)]
-    public struct InlineAttribute : Attribute
-    {
-        
-    }
+	[AttributeUsage(.Method | .Constructor | .Invocation)]
+	public struct InlineAttribute : Attribute
+	{
+		public bool OptimizedOnly { set { } }
+	}
+
+	[AttributeUsage(.Method | .Constructor | .Invocation)]
+	public struct NoInlineAttribute : Attribute
+	{
+	}
 
 	[AttributeUsage(.Invocation)]
 	public struct UnboundAttribute : Attribute
@@ -509,7 +514,7 @@ namespace System
 	{
 	}
 
-	[AttributeUsage(.Method | .Constructor | .Class | .Struct | .Alias | .Interface | .Property)]
+	[AttributeUsage(.Module | .Class | .Struct | .Enum | .Constructor | .Method | .Property | .Field | .StaticField | .Interface | .Parameter | .Delegate | .Function | .GenericParameter | .Alias)]
 	public struct ObsoleteAttribute : Attribute
 	{
 		public this()
@@ -539,7 +544,7 @@ namespace System
 
 	}
 
-	[AttributeUsage(.Method | .Constructor | .Class | .Struct | .Alias | .Property | .Field)]
+	[AttributeUsage(.Method | .Constructor | .Class | .Struct | .Alias | .Property | .Field | .StaticField)]
 	public struct ErrorAttribute : Attribute
 	{
 		public this(String error)
@@ -548,7 +553,7 @@ namespace System
 		}
 	}
 
-	[AttributeUsage(.Method | .Constructor | .Class | .Struct | .Alias | .Property | .Field)]
+	[AttributeUsage(.Method | .Constructor | .Class | .Struct | .Alias | .Property | .Field | .StaticField)]
 	public struct WarnAttribute : Attribute
 	{
 		public this(String error)

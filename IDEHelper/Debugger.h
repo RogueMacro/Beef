@@ -205,7 +205,8 @@ enum DbgOpenFileFlags : uint8
 	DbgOpenFileFlag_None = 0,
 	DbgOpenFileFlag_RedirectStdInput = 1,
 	DbgOpenFileFlag_RedirectStdOutput = 2,
-	DbgOpenFileFlag_RedirectStdError = 4
+	DbgOpenFileFlag_RedirectStdError = 4,
+	DbgOpenFileFlag_Minimized = 8
 };
 
 class DbgModuleMemoryCache
@@ -280,6 +281,7 @@ public:
 	virtual void Run() = 0;
 	virtual bool HasLoadedTargetBinary() { return true; }
 	virtual void HotLoad(const Array<String>& objectFiles, int hotIdx) = 0;
+	virtual bool WasHotLoadApplied() { return true; }
 	virtual void InitiateHotResolve(DbgHotResolveFlags flags) = 0;
 	virtual intptr GetDbgAllocHeapSize() = 0;
 	virtual String GetDbgAllocInfo() = 0;
@@ -348,6 +350,7 @@ public:
 	virtual String FindCodeAddresses(const StringImpl& fileName, int line, int column, bool allowAutoResolve) = 0;
 	virtual String GetAddressSourceLocation(intptr address) = 0;
 	virtual String GetAddressSymbolName(intptr address, bool demangle) = 0;
+	virtual intptr GetSymbolAddress(const StringImpl& sym) { return 0; }
 	virtual String DisassembleAtRaw(intptr address) = 0;
 	virtual String DisassembleAt(intptr address) = 0;
 	virtual String FindLineCallAddresses(intptr address) = 0;

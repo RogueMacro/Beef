@@ -107,6 +107,10 @@ namespace System
 		[CallingConvention(.Stdcall), CLink]
 		public static extern void BfpSystem_GetEnvironmentStrings(char8* outStr, int32* inOutStrSize, BfpSystemResult* outResult);
 		[CallingConvention(.Stdcall), CLink]
+		public static extern void BfpSystem_GetEnvironmentVariable(char8* varName, char8* outStr, int32* inOutStrSize, BfpSystemResult* outResult);
+		[CallingConvention(.Stdcall), CLink]
+		public static extern void BfpSystem_SetEnvironmentVariable(char8* varName, char8* value, BfpSystemResult* outResult);
+		[CallingConvention(.Stdcall), CLink]
 		public static extern int32 BfpSystem_GetNumLogicalCPUs(BfpSystemResult* outResult);
 		[CallingConvention(.Stdcall), CLink]
 		public static extern int64 BfpSystem_GetCPUTick();
@@ -164,6 +168,10 @@ namespace System
 		public static void BfpSystem_GetExecutablePath(char8* outStr, int32* inOutStrSize, BfpSystemResult* outResult) => Runtime.NotImplemented();
 		
 		public static void BfpSystem_GetEnvironmentStrings(char8* outStr, int32* inOutStrSize, BfpSystemResult* outResult) => Runtime.NotImplemented();
+
+		public static void BfpSystem_GetEnvironmentVariable(char8* varName, char8* outStr, int32* inOutStrSize, BfpSystemResult* outResult) => Runtime.NotImplemented();
+
+		public static void BfpSystem_SetEnvironmentVariable(char8* varName, char8* value, BfpSystemResult* outResult) => Runtime.NotImplemented();
 		
 		public static int32 BfpSystem_GetNumLogicalCPUs(BfpSystemResult* outResult) => Runtime.NotImplemented();
 		
@@ -256,7 +264,9 @@ namespace System
 		
 		public static int32 BfpProcess_GetProcessId(BfpProcess* process) => Runtime.NotImplemented();
 
-		public static int BfpSpawn_GetProcessId(BfpSpawn* spawn) => Runtime.NotImplemented();;
+		public static int BfpSpawn_GetProcessId(BfpSpawn* spawn) => Runtime.NotImplemented();
+
+		public static bool BfpProcess_WaitFor(BfpProcess* process, int waitMS, int* outExitCode, BfpProcessResult* outResult) => Runtime.NotImplemented();
 #endif
 
 		public enum BfpSpawnFlags : int32

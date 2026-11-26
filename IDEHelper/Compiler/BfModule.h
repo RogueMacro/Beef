@@ -94,6 +94,7 @@ enum BfEvalExprFlags : int64
 	BfEvalExprFlags_NameOf = 0x100000000LL,
 	BfEvalExprFlags_NameOfSuccess = 0x200000000LL,
 	BfEvalExprFlags_InParamsExpr = 0x400000000LL,
+	BfEvalExprFlags_AllowNoValue = 0x800000000LL,
 
 	BfEvalExprFlags_InheritFlags = BfEvalExprFlags_NoAutoComplete | BfEvalExprFlags_Comptime | BfEvalExprFlags_DeclType
 };
@@ -171,7 +172,7 @@ struct BfCreateTypeDataContext
 class BfLocalVariable
 {
 public:
-	int64 mUnassignedFieldFlags;
+	BitSet mUnassignedFieldFlags;
 	BfType* mResolvedType;
 	BfIdentifierNode* mNameNode;
 	String mName;
@@ -209,8 +210,7 @@ public:
 
 public:
 	BfLocalVariable()
-	{
-		mUnassignedFieldFlags = 0;
+	{		
 		mResolvedType = NULL;
 		mNameNode = NULL;
 		mLocalVarIdx = -1;
@@ -255,6 +255,7 @@ class BfLocalMethod
 {
 public:
 	BfSystem* mSystem;
+	BfContext* mContext;
 	BfModule* mModule;
 	BfSource* mSource;
 	BfMethodDeclaration* mMethodDeclaration;
@@ -269,6 +270,7 @@ public:
 	BfIRMDNode mDeclDIScope;
 	BfMixinState* mDeclMixinState;
 	OwnedVector<BfDirectTypeReference> mDirectTypeRefs;
+	OwnedVector<BfParameterDeclaration> mParamDecls;
 	bool mDeclOnly;
 	bool mDidBodyErrorPass;
 	BfLocalMethod* mNextWithSameName;
@@ -278,6 +280,7 @@ public:
 	{
 		mModule = NULL;
 		mSystem = NULL;
+		mContext = NULL;
 		mSource = NULL;
 		mMethodDeclaration = NULL;
 		mMethodDef = NULL;
@@ -706,6 +709,9 @@ public:
 	BfIRBlock mIRFallthroughBlock;
 	BfIRValue mInnerValueScopeStart;
 	bool mHadBreak;
+	// When set, each break that can execute and targets this block itself intersects what's assigned at that point into
+	//  this. It starts with mLeftBlockUncond set (the intersection identity), which stays set if no such break occurs.
+	BfDeferredLocalAssignData* mBreakLocalAssignData;
 
 public:
 	BfBreakData()
@@ -713,6 +719,7 @@ public:
 		mPrevBreakData = NULL;
 		mScope = NULL;
 		mHadBreak = false;
+		mBreakLocalAssignData = NULL;
 	}
 };
 
@@ -802,7 +809,7 @@ public:
 	BfIRBlock mPrevBB;
 	BfIRBlock mCheckBB;
 	BfIRBlock mDoneBB;
-	SizedArray<BfIRBlock, 4> mNotNullBBs;
+	SizedArray<BfIRBlock, 4> mNullBranchBBs; // Blocks that branch to mDoneBB, one per null check
 };
 
 class BfAttributeState
@@ -1337,12 +1344,16 @@ struct BfModuleOptions
 {
 public:
 	BfSIMDSetting mSIMDSetting;
+	BfFloatingPointMode mFloatingPointMode;
+	BfFMASetting mFMASetting;
 	int mEmitDebugInfo;
 	BfOptLevel mOptLevel;
 
 	bool operator==(const BfModuleOptions& other)
 	{
 		return (mSIMDSetting == other.mSIMDSetting) &&
+			(mFloatingPointMode == other.mFloatingPointMode) &&
+			(mFMASetting == other.mFMASetting) &&
 			(mEmitDebugInfo == other.mEmitDebugInfo) &&
 			(mOptLevel == other.mOptLevel);
 	}
@@ -1355,6 +1366,8 @@ public:
 	BfModuleOptions()
 	{
 		mSIMDSetting = BfSIMDSetting_None;
+		mFloatingPointMode = BfFloatingPointMode_Precise;
+		mFMASetting = BfFMASetting_TargetDefault;
 		mEmitDebugInfo = false;
 		mOptLevel = BfOptLevel_NotSet;
 	}
@@ -1504,6 +1517,20 @@ public:
 	}
 };
 
+// One per (type, virtual slot) whose implementation can vary by executable. Keyed by declaring
+//  method rather than vtable index, since indices get renumbered between compiles.
+class BfDevirtThunkEntry
+{
+public:
+	BfTypeInstance* mTypeInstance;
+	BfNonGenericMethodRef mDeclaringMethod;
+
+	bool operator==(const BfDevirtThunkEntry& rhs)
+	{
+		return ((mTypeInstance == rhs.mTypeInstance) && (mDeclaringMethod == rhs.mDeclaringMethod));
+	}
+};
+
 #define BFMODULE_FATAL(module, msg) (module)->FatalError((msg), __FILE__, __LINE__)
 
 struct BfCEParseContext
@@ -1572,6 +1599,7 @@ public:
 	Dictionary<BfTypeInstance*, BfIRValue> mInterfaceSlotRefs;
 	Dictionary<BfTypeInstance*, BfIRValue> mClassVDataRefs;
 	Dictionary<BfVDataExtEntry, BfIRValue> mClassVDataExtRefs;
+	Dictionary<BfDevirtThunkEntry, BfIRValue> mDevirtThunkRefs;
 	Dictionary<BfType*, BfIRValue> mTypeDataRefs;
 	Dictionary<BfType*, BfIRValue> mDbgRawAllocDataRefs;
 	Dictionary<BfMethodInstance*, BfDeferredMethodCallData*> mDeferredMethodCallData;
@@ -1587,10 +1615,12 @@ public:
 	int mOnDemandMethodCount;
 	int mLastModuleWrittenRevision;
 	int mCurLocalMethodId;
-	int16 mUsedSlotCount; // -1 = not used, 0 = awaiting
+	int16 mUsedSlotCount; // Interface slot count we were built with. -1 = not finished, 0 = awaiting
+	bool mHadSlotCountDependency; // Our generated code depends on the interface slot count. Survives Init
 	bool mAddedToCount;
 	bool mHasForceLinkMarker;
 	bool mIsReified;
+	bool mNoReify; // Resolve compile-time dependencies without requesting runtime type reification
 	bool mGeneratesCode;
 	bool mReifyQueued;
 	bool mWantsIRIgnoreWrites;
@@ -1715,7 +1745,7 @@ public:
 	void AddBasicBlock(BfIRBlock bb, bool activate = true);
 	void VisitEmbeddedStatement(BfAstNode* stmt, BfExprEvaluator* exprEvaluator = NULL, BfEmbeddedStatementFlags flags = BfEmbeddedStatementFlags_None);
 	void VisitCodeBlock(BfBlock* block);
-	void VisitCodeBlock(BfBlock* block, BfIRBlock continueBlock, BfIRBlock breakBlock, BfIRBlock fallthroughBlock, bool defaultBreak, bool* hadReturn = NULL, BfLabelNode* labelNode = NULL, bool closeScope = false, BfEmbeddedStatementFlags flags = BfEmbeddedStatementFlags_None);
+	void VisitCodeBlock(BfBlock* block, BfIRBlock continueBlock, BfIRBlock breakBlock, BfIRBlock fallthroughBlock, bool defaultBreak, bool* hadReturn = NULL, BfLabelNode* labelNode = NULL, bool closeScope = false, BfEmbeddedStatementFlags flags = BfEmbeddedStatementFlags_None, BfDeferredLocalAssignData* breakLocalAssignData = NULL);
 	void DoForLess(BfForEachStatement* forEachStmt);
 
 	// Util
@@ -1873,7 +1903,10 @@ public:
 	bool ApplyTypeOptionMethodFilters(bool includeMethod, BfMethodDef* methodDef, BfTypeOptions* typeOptions);
 	int GenerateTypeOptions(BfCustomAttributes* customAttributes, BfTypeInstance* typeInstance, bool checkTypeName);
 	void SetTypeOptions(BfTypeInstance* typeInstance);
-	BfModuleOptions GetModuleOptions();
+	BfModuleOptions GetModuleOptions(BfTypeInstance* typeInst = NULL);
+	BfModuleOptions GetMethodModuleOptions(BfMethodInstance* methodInstance);
+	void ApplyMethodModuleOptions(BfMethodInstance* methodInstance, BfModuleOptions& options);
+	void SetupIRMethodOptions(BfMethodInstance* methodInstance, BfIRFunction func);
 	BfCheckedKind GetDefaultCheckedKind();
 	void FinishCEParseContext(BfAstNode* refNode, BfTypeInstance* typeInstance, BfCEParseContext* ceParseContext);
 	BfCEParseContext CEEmitParse(BfTypeInstance* typeInstance, BfTypeDef* declaringType, const StringImpl& src, BfAstNode* refNode, BfCeTypeEmitSourceKind emitSourceKind);
@@ -1896,7 +1929,7 @@ public:
 	BfFieldInstance* GetFieldByName(BfTypeInstance* typeInstance, const StringImpl& fieldName, bool isRequired = true, BfAstNode* refNode = NULL);
 	void CreateStaticField(BfFieldInstance* fieldInstance, bool isThreadLocal = false);
 	void ResolveConstField(BfTypeInstance* typeInst, BfFieldInstance* fieldInstance, BfFieldDef* field, bool forceResolve = false);
-	BfTypedValue GetFieldInitializerValue(BfFieldInstance* fieldInstance, BfExpression* initializer = NULL, BfFieldDef* fieldDef = NULL, BfType* fieldType = NULL, bool doStore = false);
+	BfTypedValue GetFieldInitializerValue(BfFieldInstance* fieldInstance, BfExpression* initializer = NULL, BfFieldDef* fieldDef = NULL, BfType* fieldType = NULL, bool doStore = false, BfTypedValue receivingValue = BfTypedValue());
 	bool TryGetAppendedObjectInfo(BfFieldInstance* fieldInstance, int& dataSize, int& alignSize);
 	void AppendedObjectInit(BfFieldInstance* fieldInstance);
 	void MarkFieldInitialized(BfFieldInstance* fieldInstance);
@@ -1932,7 +1965,7 @@ public:
 	BfType* ResolveType(BfType* lookupType, BfPopulateType populateType = BfPopulateType_Data, BfResolveTypeRefFlags resolveFlags = BfResolveTypeRefFlag_None);
 	void ResolveGenericParamConstraints(BfGenericParamInstance* genericParamInstance, bool isUnspecialized, Array<BfTypeReference*>* deferredResolveTypes = NULL);
 	String GenericParamSourceToString(const BfGenericParamSource& genericParamSource);
-	bool CheckGenericConstraints(const BfGenericParamSource& genericParamSource, BfType* checkArgType, BfAstNode* checkArgTypeRef, BfGenericParamInstance* genericParamInst, BfTypeVector* methodGenericArgs = NULL, BfError** errorOut = NULL);
+	bool CheckGenericConstraints(const BfGenericParamSource& genericParamSource, BfType* checkArgType, BfAstNode* checkArgTypeRef, BfGenericParamInstance* genericParamInst, BfTypeVector* methodGenericArgs = NULL, BfError** errorOut = NULL, BfTypeVector* typeGenericArgs = NULL);
 	BfIRValue AllocLocalVariable(BfType* type, const StringImpl& name, bool doLifetimeEnd = true);
 	BfTypedValue CreateOutVariable(BfAstNode* refNode, BfVariableDeclaration* variableDeclaration, BfAstNode* paramNameNode, BfType* variableType, BfTypedValue initValue);
 	void MoveLocalToParentScope(BfLocalVariable* localVar);
@@ -2099,6 +2132,8 @@ public:
 	void SetMethodDependency(BfMethodInstance* methodInstance);
 	BfModuleMethodInstance ReferenceExternalMethodInstance(BfMethodInstance* methodInstance, BfGetMethodInstanceFlags flags = BfGetMethodInstanceFlag_None);
 	BfModule* GetOrCreateMethodModule(BfMethodInstance* methodInstance);
+	BfInlineKind GetInlineKind(BfCustomAttributes* attributes, BfTypeInstance* owner);
+	BfModuleMethodInstance GetMethodInstanceRaw(BfTypeInstance* typeInst, BfMethodDef* methodDef, const BfTypeVector& methodGenericArguments, BfGetMethodInstanceFlags flags, BfTypeInstance* foreignType, BfModule* referencingModule);
 	BfModuleMethodInstance GetMethodInstance(BfTypeInstance* typeInst, BfMethodDef* methodDef, const BfTypeVector& methodGenericArguments, BfGetMethodInstanceFlags flags = BfGetMethodInstanceFlag_None, BfTypeInstance* foreignType = NULL, BfModule* referencingModule = NULL);
 	BfModuleMethodInstance GetMethodInstance(BfMethodInstance* methodInstance, BfGetMethodInstanceFlags flags = BfGetMethodInstanceFlag_None);
 	BfMethodInstance* GetOuterMethodInstance(BfMethodInstance* methodInstance); // Only useful for local methods
@@ -2109,6 +2144,13 @@ public:
 	BfIRValue CreateClassVDataGlobal(BfTypeInstance* typeInstance, int* outNumElements = NULL, String* outMangledName = NULL);
 	BfIRValue GetClassVDataPtr(BfTypeInstance* typeInstance);
 	BfIRValue CreateClassVDataExtGlobal(BfTypeInstance* declTypeInst, BfTypeInstance* implTypeInst, int startVirtIdx);
+	Array<BfVirtualMethodEntry> ReslotVTableForProject(BfTypeInstance* typeInstance);
+	bool VirtualSlotNeedsDevirtThunk(BfTypeInstance* typeInstance, int virtIdx);
+	void PopulateDevirtThunkTypes(BfMethodInstance* declaringMethodInstance);
+	void GetDevirtThunkName(StringImpl& name, BfTypeInstance* typeInstance, BfMethodInstance* declaringMethodInstance);
+	BfIRValue TryGetDevirtThunk(BfTypeInstance* typeInstance, BfMethodInstance* methodInstance);
+	void CreateDevirtThunks(BfTypeInstance* typeInstance);
+	void CheckExtensionOverrideConflicts(BfTypeInstance* typeInstance);
 	BfIRValue CreateTypeDataRef(BfType* type, bool forceConstant = false);
 	void EncodeAttributeData(BfTypeInstance* typeInstance, BfType* argType, BfIRValue arg, SizedArrayImpl<uint8>& data, Dictionary<int, int>& usedStringIdMap);
 	BfIRValue CreateFieldData(BfFieldInstance* fieldInstance, int customAttrIdx);
@@ -2196,6 +2238,15 @@ namespace std
 		size_t operator()(const Beefy::BfVDataExtEntry& val) const
 		{
 			return ((size_t)(val.mDeclTypeInst) * 17) ^ (size_t)(val.mDeclTypeInst);
+		}
+	};
+
+	template<>
+	struct hash<Beefy::BfDevirtThunkEntry>
+	{
+		size_t operator()(const Beefy::BfDevirtThunkEntry& val) const
+		{
+			return ((size_t)(val.mTypeInstance) * 17) ^ ((size_t)(val.mDeclaringMethod.mTypeInstance) ^ (val.mDeclaringMethod.mMethodNum << 10));
 		}
 	};
 

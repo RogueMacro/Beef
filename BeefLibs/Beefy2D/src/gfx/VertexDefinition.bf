@@ -9,9 +9,11 @@ namespace Beefy.gfx
 {
     public class VertexDefinition
     {
-        enum VertexElementFormat
+        public enum VertexElementFormat
         {
-            Float,
+			// Values past None are the native VertexElementFormat enum's, in order.
+			None = -1,
+            Float = 0,
             Vector2,
             Vector3,
             Vector4,
@@ -40,6 +42,9 @@ namespace Beefy.gfx
         [CallingConvention(.Stdcall), CLink]
         static extern void Gfx_VertexDefinition_Delete(void* nativeVertexDefinition);
 
+		[CallingConvention(.Stdcall), CLink]
+		static extern void Gfx_VertexDefinition_SetInstanceElement(void* nativeVertexDefinition, int32 elementIdx);
+
         public void* mNativeVertexDefinition;
 #else
         public IPCProxy<IStudioVertexDefinition> mStudioVertexDefinition;
@@ -47,6 +52,9 @@ namespace Beefy.gfx
 
         public int32 mVertexSize;
         public int32 mPosition2DOffset = -1;
+		// The [VertexMember(perInstance: true)] element: its index and byte offset (-1 = none).
+		public int32 mInstanceElementIdx = -1;
+		public int32 mInstanceElementOffset = -1;
 
         public static void FindPrimitives(Type type, List<Type> primitives)
         {
@@ -124,8 +132,20 @@ namespace Beefy.gfx
 
                 if (memberAttribute.mElementUsage == VertexElementUsage.Position2D)
                     mPosition2DOffset = field.MemberOffset;
+				if (memberAttribute.mPerInstance)
+				{
+					Debug.Assert(mInstanceElementIdx == -1);
+					mInstanceElementIdx = fieldIdx;
+					mInstanceElementOffset = (int32)field.MemberOffset;
+				}
 
-                if (floats != 0)
+				// An explicit format wins: inference below only knows float/uint16/uint32, so a packed
+				// member (bone weights as a uint64 of 4 unorm shorts) has no other way to be described.
+				if (memberAttribute.mFormat != .None)
+				{
+					vertexDefData.mFormat = memberAttribute.mFormat;
+				}
+                else if (floats != 0)
                 {
                     Debug.Assert(floats == primitives.Count);
                     Debug.Assert(floats <= 4);
@@ -146,13 +166,19 @@ namespace Beefy.gfx
                         vertexDefData.mFormat = VertexElementFormat.Color;
                     else
                         Runtime.FatalError("Invalid color count");
-                }                
+                }
+				else
+				{
+					Runtime.FatalError(scope $"No vertex format for {type.GetName(.. scope .())}.{field.Name} ({field.FieldType.GetName(.. scope .())}) -- pass one to VertexMember");
+				}
 
                 vertexDefDataArray[fieldIdx++] = vertexDefData;
             }
 
 #if !STUDIO_CLIENT
             mNativeVertexDefinition = Gfx_CreateVertexDefinition(vertexDefDataArray.CArray(), fieldIdx);
+			if (mInstanceElementIdx >= 0)
+				Gfx_VertexDefinition_SetInstanceElement(mNativeVertexDefinition, mInstanceElementIdx);
 #else
             fixed (VertexDefData* vertexDefData = vertexDefDataArray)
             {

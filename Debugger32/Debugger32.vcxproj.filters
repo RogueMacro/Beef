@@ -56,6 +56,9 @@
     <ClInclude Include="..\IDEHelper\DbgEvalPool.h">
       <Filter>Source Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\IDEHelper\DbgTargetHost.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\IDEHelper\DbgTypeMap.h">
       <Filter>Source Files</Filter>
     </ClInclude>
@@ -64,6 +67,9 @@
     </ClInclude>
     <ClInclude Include="..\IDEHelper\DbgSymSrv.h" />
     <ClInclude Include="..\IDEHelper\HotScanner.h" />
+    <ClInclude Include="..\IDEHelper\LLDBDebugger.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\IDEHelper\DbgExprEvaluator.cpp">
@@ -93,6 +99,12 @@
     <ClCompile Include="..\IDEHelper\DbgEvalPool.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\IDEHelper\DbgEvalSupport.cpp">
+    <ClCompile Include="..\IDEHelper\DbgSymbolSupport.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\IDEHelper\DbgTypeMap.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -103,6 +115,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\IDEHelper\HotScanner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="..\IDEHelper\LLDBDebugger.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

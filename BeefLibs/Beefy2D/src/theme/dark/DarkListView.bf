@@ -45,8 +45,11 @@ namespace Beefy.theme.dark
             bool wasOpen = mIsOpen;
             base.MouseDown(x, y, btn, btnCount);
             if (wasOpen == mIsOpen)
-                Open(!mIsOpen, false);
-        }        
+            {
+                // Through the item's virtual, so Open overrides see arrow clicks too
+                mItem.Open(!mIsOpen, false);
+            }
+        }
 
         public void Open(bool open, bool immediate)
         {
@@ -106,7 +109,9 @@ namespace Beefy.theme.dark
         public uint32? mTextColor;
         public uint32 mFocusColor = DarkTheme.COLOR_MENU_FOCUSED;
         public uint32 mSelectColor = DarkTheme.COLOR_MENU_SELECTED;
-        public float mTextAreaLengthOffset;        
+        public float mTextAreaLengthOffset;
+		// Space kept clear at the cell's right (eg for buttons): a longer label ends in an ellipsis before it.
+		public float mLabelRightInset;
 
         public DragEvent mCurDragEvent ~ delete _;
         public DragHelper mDragHelper ~ delete _;
@@ -297,6 +302,9 @@ namespace Beefy.theme.dark
                 }
                 calcWidth += mListView.mColumns[i].mWidth;
             }
+			// The last cell stretches to the end of the row (see ListViewItem.ResizeComponents).
+			if ((nextContentColumn == -1) && (mColumnIdx > 0))
+				calcWidth = Math.Max(calcWidth, mWidth);
 
             if (Selected)
             {
@@ -341,14 +349,16 @@ namespace Beefy.theme.dark
 					wantWidth = mListView.mWidth - labelX - mX;
 					if (listView.mInsets != null)
 						wantWidth -= listView.mInsets.mRight;
-				}							 
+				}
+				if (mLabelRightInset > 0)
+					wantWidth = Math.Min(wantWidth, mWidth - mLabelRightInset - labelX);
 
                 using (g.PushColor(mTextColor ?? DarkTheme.COLOR_TEXT))
 				{
-					FontOverflowMode overflowMode = ((nextContentColumn != -1) || (listView.mEndInEllipsis)) ? .Ellipsis : .Overflow;
+					FontOverflowMode overflowMode = ((nextContentColumn != -1) || (listView.mEndInEllipsis) || (mLabelRightInset > 0)) ? .Ellipsis : .Overflow;
 					if (listView.mWordWrap)
 						overflowMode = .Wrap;
-                    g.DrawString(mLabel, labelX, 0, .Left, wantWidth, overflowMode);
+                    g.DrawString(mLabel, labelX, listView.mLabelY, .Left, wantWidth, overflowMode);
 				}
 
 				if (mOpenButton != null)
@@ -361,7 +371,7 @@ namespace Beefy.theme.dark
             base.MouseDown(x, y, btn, btnCount);
 
             if ((btn == 0) && (btnCount > 1) && (mOpenOnDoubleClick) && (mOpenButton != null))
-                mOpenButton.Open(!mOpenButton.mIsOpen, false);
+                Open(!mOpenButton.mIsOpen, false); // via the virtual, so Open overrides see this too
         }
 
         public override void MakeParent()
@@ -747,6 +757,13 @@ namespace Beefy.theme.dark
                     g.Draw(img, mWidth / 2 - img.mWidth / 2, mHeight - img.mHeight);*/
                 }
             }*/
+
+			/*if ((mColumnIdx == 0) && (mParentItem != null))
+			{
+				//TODO: Debugging
+				using (g.PushColor(0x20FF0000))
+					g.FillRect(1, 1, mWidth - 2, mHeight - 2);
+			}*/
         }
 
         public override bool Open(bool open, bool immediate = false)
@@ -799,18 +816,26 @@ namespace Beefy.theme.dark
                 SelfToRootTranslate(x, y, out aX, out aY);
                 Widget foundWidget = mWidgetWindow.mRootWidget.FindWidgetByCoords(aX, aY);
 
+				mDragKind = .None;
+				mDragTarget = null;
+				if (mCurDragEvent != null)
+					mCurDragEvent.mDragKind = .None;
+
                 if (foundWidget == null)
                 {                                        
                     return;
                 }
 
                 var root = mListView.GetRoot();
-                if ((foundWidget is ListView) || (foundWidget == root))
+				if ((foundWidget == listView) || (foundWidget == root))
                 {                    
+					if (root.mChildItems.IsEmpty)
+						return;
+
                     var lastItem = root.mChildItems[root.mChildItems.Count - 1];
                     float lastWindowX;
                     float lastWindowY;
-                    lastItem.SelfToRootTranslate(lastItem.mSelfHeight + lastItem.mChildAreaHeight + lastItem.mBottomPadding, 0, out lastWindowX, out lastWindowY);
+					lastItem.SelfToRootTranslate(0, lastItem.mSelfHeight + lastItem.mChildAreaHeight + lastItem.mBottomPadding, out lastWindowX, out lastWindowY);
                     if (aY > lastWindowY)
                     {
                         // After last item
@@ -980,9 +1005,23 @@ namespace Beefy.theme.dark
         public bool mShowGridLines;
 		public Color mGridLinesColor;
         public bool mShowHeader = true;
+        bool mDrawBox;
+
+        public bool DrawBox
+        {
+            get => mDrawBox;
+            set
+            {
+                if (mDrawBox == value)
+                    return;
+                mDrawBox = value;
+                MarkDirty();
+            }
+        }
 		public bool mEndInEllipsis;
 		public bool mWordWrap;
-        public float mLabelX = DarkTheme.sUnitSize;        
+        public float mLabelX = DarkTheme.sUnitSize;
+		public float mLabelY = 0;
         public float mChildIndent = DarkTheme.sUnitSize;
         public float mOpenButtonX = 0;
         public float mIconX = GS!(4);
@@ -1117,9 +1156,19 @@ namespace Beefy.theme.dark
 			if (mWidth <= GS!(3))
 				return;
 
+            if (mDrawBox)
+            {
+                g.DrawBox(DarkTheme.sDarkTheme.GetImage(DarkTheme.ImageIdx.EditBox), 0, 0, mWidth, mHeight);
+                if (mHasFocus)
+                {
+                    using (g.PushColor(DarkTheme.COLOR_SELECTED_OUTLINE))
+                        g.DrawBox(DarkTheme.sDarkTheme.GetImage(DarkTheme.ImageIdx.Outline), 0, 0, mWidth, mHeight);
+                }
+            }
+
             if (mShowHeader)
             {
-                if (mHeaderImageIdx < DarkTheme.ImageIdx.COUNT)
+                if (mHeaderImageIdx < (.)DarkTheme.sDarkTheme.mImages.Count)
                     g.DrawButton(DarkTheme.sDarkTheme.GetImage(mHeaderImageIdx), 0, 0, mWidth);
             
                 using (g.PushClip(1, 0, mWidth - GS!(2), mHeight))

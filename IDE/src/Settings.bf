@@ -141,6 +141,13 @@ namespace IDE
 
 		public class DebuggerSettings
 		{
+			public enum DebuggerKind
+			{
+				Default,
+				GDB,
+				LLDB
+			}
+
 			public enum SymbolServerKind
 			{
 				Yes,
@@ -148,6 +155,7 @@ namespace IDE
 				Ask
 			}
 
+			public DebuggerKind mDebuggerKind = .Default;
 			public SymbolServerKind mUseSymbolServers = .Yes;
 			public String mSymCachePath = new .("C:\\SymCache") ~ delete _;
 			public List<String> mSymbolSearchPath = new .() ~ DeleteContainerAndItems!(_);
@@ -158,6 +166,7 @@ namespace IDE
 
 			public void Serialize(StructuredData sd)
 			{
+				sd.Add("Debugger", mDebuggerKind);
 				sd.Add("UseSymbolServers", mUseSymbolServers);
 				sd.Add("SymCachePath", mSymCachePath);
 				using (sd.CreateArray("SymbolSearchPath"))
@@ -201,6 +210,7 @@ namespace IDE
 
 			public void Deserialize(StructuredData sd)
 			{
+				sd.Get("Debugger", ref mDebuggerKind);
 				sd.Get("UseSymbolServers", ref mUseSymbolServers);
 				sd.Get("SymCachePath", mSymCachePath);
 				ClearAndDeleteItems(mSymbolSearchPath);
@@ -338,6 +348,7 @@ namespace IDE
 			public Color mLocal = 0xFFFFFFFF;
 			public Color mParameter = 0xFFFFFFFF;
 			public Color mMember = 0xFFFFFFFF;
+			public Color mStatic = 0xFFFFFFFF;
 			public Color mMethod = 0xFFA6E22A;
 			public Color mType = 0xFF66D9EF;
 			public Color mPrimitiveType = 0xFF66D9EF;
@@ -349,6 +360,7 @@ namespace IDE
 			public Color mDisassemblyText = 0xFFB0B0B0;
 			public Color mDisassemblyFileName = 0XFFFF0000;
 			public Color mError = 0xFFFF0000;
+			public Color mBuildText = 0xFF808080;
 			public Color mBuildError = 0xFFFF8080;
 			public Color mBuildWarning = 0xFFFFFF80;
 			public Color mBuildSuccess = 0xFF80FF80;
@@ -399,6 +411,8 @@ namespace IDE
 				GetColor("Parameter", ref mParameter);
 				mMember = mIdentifier;
 				GetColor("Member", ref mMember);
+				mStatic = mMember;
+				GetColor("Static", ref mStatic);
 				mMethod = mMember;
 				GetColor("Method", ref mMethod);
 				GetColor("Comment", ref mComment);
@@ -425,6 +439,7 @@ namespace IDE
 				GetColor("DisassemblyText", ref mDisassemblyText);
 				GetColor("DisassemblyFileName", ref mDisassemblyFileName);
 				GetColor("Error", ref mError);
+				GetColor("BuildText", ref mBuildText);
 				GetColor("BuildError", ref mBuildError);
 				GetColor("BuildWarning", ref mBuildWarning);
 				GetColor("BuildSuccess", ref mBuildSuccess);
@@ -446,6 +461,7 @@ namespace IDE
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Local] = mLocal;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Parameter] = mParameter;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Member] = mMember;
+				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Static] = mStatic;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Method] = mMethod;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Type] = mType;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.PrimitiveType] = mPrimitiveType;
@@ -457,6 +473,7 @@ namespace IDE
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Disassembly_Text] = mDisassemblyText;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Disassembly_FileName] = mDisassemblyFileName;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.Error] = mError;
+				SourceEditWidgetContent.sTextColors[(.)SourceElementType.BuildText] = mBuildText;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.BuildError] = mBuildError;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.BuildWarning] = mBuildWarning;
 				SourceEditWidgetContent.sTextColors[(.)SourceElementType.BuildSuccess] = mBuildSuccess;
@@ -529,12 +546,19 @@ namespace IDE
 						mColors.Deserialize(sd);
 				}
 
-				String imgCreatePath = scope String(gApp.mInstallDir, "images/ImgCreate.exe");
+				const String EXECUTABLE_PATH = 
+#if BF_PLATFORM_WINDOWS
+					"images/ImgCreate.exe";
+#else
+					"images/ImgCreate";
+#endif
+
+				String imgCreatePath = scope String(gApp.mInstallDir, EXECUTABLE_PATH);
 				let imgCreateExeTime = File.GetLastWriteTime(imgCreatePath).GetValueOrDefault();
 
 				for (let theme in mTheme)
 				{
-					String relPath = scope .()..Append(gApp.mInstallDir, "themes/");
+					String relPath = scope .()..Append(gApp.mUserDataDir, "themes/");
 					String absPath = scope .();
 					Path.GetAbsolutePath(theme, relPath, absPath);
 
@@ -713,7 +737,6 @@ namespace IDE
 			public LockWhileDebuggingKind mLockEditingWhenDebugging = .WhenNotHotSwappable;// Only applicable for
 			public CompilerKind mEmitCompiler;
 			// non-Beef sources
-			public bool mPerforceAutoCheckout = true;
 			public bool mSpellCheckEnabled = true;
 			public bool mShowLineNumbers = true;
 			public bool mFreeCursorMovement;
@@ -747,7 +770,6 @@ namespace IDE
 				sd.Add("LockEditing", mLockEditing);
 				sd.Add("LockEditingWhenDebugging", mLockEditingWhenDebugging);
 				sd.Add("EmitCompiler", mEmitCompiler);
-				sd.Add("PerforceAutoCheckout", mPerforceAutoCheckout);
 				sd.Add("SpellCheckEnabled", mSpellCheckEnabled);
 				sd.Add("ShowLineNumbers", mShowLineNumbers);
 				sd.Add("FreeCursorMovement", mFreeCursorMovement);
@@ -785,7 +807,6 @@ namespace IDE
 				sd.Get("LockEditing", ref mLockEditing);
 				sd.Get("LockEditingWhenDebugging", ref mLockEditingWhenDebugging);
 				sd.Get("EmitCompiler", ref mEmitCompiler);
-				sd.Get("PerforceAutoCheckout", ref mPerforceAutoCheckout);
 				sd.Get("SpellCheckEnabled", ref mSpellCheckEnabled);
 				sd.Get("ShowLineNumbers", ref mShowLineNumbers);
 				sd.Get("FreeCursorMovement", ref mFreeCursorMovement);
@@ -857,7 +878,7 @@ namespace IDE
 				mEntries.Add(entry);
 			}
 
-			public void SetDefaults()
+			public virtual void SetDefaults()
 			{
 				Add("Add Cursor Above", "Ctrl+Alt+Up");
 				Add("Add Cursor Below", "Ctrl+Alt+Down");
@@ -1208,6 +1229,7 @@ namespace IDE
 		public bool mEmscriptenPendingInstall;
 		public bool mEnableDevMode;
 		public TutorialsFinished mTutorialsFinished = .();
+		public String mWSLBeefBinPath = new .() ~ delete _;
 
 		public this()
 		{
@@ -1239,7 +1261,7 @@ namespace IDE
 
 		void GetSettingsPath(String outPath)
 		{
-			outPath.Append(gApp.mInstallDir, "/BeefSettings.toml");
+			outPath.Append(gApp.mUserDataDir, "/BeefSettings.toml");
 		}
 
 		public void Save()
@@ -1294,6 +1316,7 @@ namespace IDE
 				sd.Add("WakaTimeKey", mWakaTimeKey);
 				sd.Add("EnableDevMode", mEnableDevMode);
 				sd.Add("DebugMultiCursor", DarkEditWidgetContent.sDebugMultiCursor);
+				sd.Add("WSLBeefBinPath", mWSLBeefBinPath);
 			}
 
 			using (sd.CreateObject("TutorialsFinished"))
@@ -1431,6 +1454,7 @@ namespace IDE
 				sd.Get("WakaTimeKey", mWakaTimeKey);
 				sd.Get("EnableDevMode", ref mEnableDevMode);
 				sd.Get("DebugMultiCursor", ref DarkEditWidgetContent.sDebugMultiCursor);
+				sd.Get("WSLBeefBinPath", mWSLBeefBinPath);
 			}
 
 			using (sd.Open("TutorialsFinished"))

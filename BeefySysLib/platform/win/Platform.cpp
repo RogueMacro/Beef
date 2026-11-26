@@ -294,8 +294,10 @@ uint64 Beefy::BFGetTickCountMicroFast()
 		int processorCount = (int) ::GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
 #endif
 
+		// Pinned to one core only while sampling: a thread left pinned can't escape a busy core.
+		int prevPriority = ::GetThreadPriority(::GetCurrentThread());
 		::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-		::SetThreadAffinityMask(::GetCurrentThread(), (int64)1 << (windowsSharedInfo->mThreadAcc % processorCount));
+		DWORD_PTR prevAffinity = ::SetThreadAffinityMask(::GetCurrentThread(), (int64)1 << (windowsSharedInfo->mThreadAcc % processorCount));
 
 		uint64 deltaMicro = 0;
 
@@ -334,7 +336,9 @@ uint64 Beefy::BFGetTickCountMicroFast()
 		//gTimerDivisor = *gTimingSet.rbegin();
 		OutputDebugStrF("BFGetTickCountMicro divisor: %d\n", gTimerDivisor);
 
-		::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+		if (prevAffinity != 0)
+			::SetThreadAffinityMask(::GetCurrentThread(), prevAffinity);
+		::SetThreadPriority(::GetCurrentThread(), prevPriority);
 
 		uint32 outEndMS = timeGetTime();
 		uint64 endMicroA = __rdtsc();
@@ -577,22 +581,60 @@ struct OverlappedReadResult : OVERLAPPED
 	}
 };
 
+struct OverlappedWriteResult : OVERLAPPED
+{
+	BfpFile* mFile;
+	intptr mBytesRead;
+	DWORD mErrorCode;
+	bool mPending;
+	bool mAttemptedRead;
+	void* mData;
+
+	OverlappedWriteResult()
+	{
+		memset(this, 0, sizeof(OVERLAPPED));
+		mFile = NULL;
+		mBytesRead = 0;
+		mErrorCode = 0;
+		mPending = false;
+		mAttemptedRead = false;
+		mData = NULL;
+	}	
+
+	~OverlappedWriteResult()
+	{
+		free(mData);
+	}
+};
+
 struct BfpAsyncData
 {	
 	BfpFile* mFile;
 	Array<uint8> mQueuedData;	
 	HANDLE mEvent;	
-	OverlappedReadResult mOverlappedResult;	
+	OverlappedReadResult* mOverlappedResult;		
 
 	BfpAsyncData(BfpFile* file)
 	{		
 		mFile = file;
 		mEvent = ::CreateEvent(NULL, TRUE, FALSE, NULL);
+		mOverlappedResult = new OverlappedReadResult();
 	}
 
 	~BfpAsyncData()
 	{
-		::CloseHandle(mEvent);		
+		::CloseHandle(mEvent);	
+
+		AutoCrit autoCrit(gBfpCritSect);
+		if (mOverlappedResult->mPending)
+		{
+			// Delete mOverlappedResult in callback
+			mOverlappedResult->mFile = NULL;
+		}
+		else
+		{
+			delete mOverlappedResult;
+		}
 	}
 
 	void SetEvent()
@@ -622,7 +664,7 @@ struct BfpAsyncData
 		
 		if (mQueuedData.mSize == 0)
 		{	
-			if (mOverlappedResult.mPending)
+			if (mOverlappedResult->mPending)
 			{
 				gBfpCritSect.Unlock();
 				WaitAndResetEvent(timeoutMS);
@@ -647,47 +689,52 @@ struct BfpAsyncData
 	void HandleResult(uint32 errorCode, uint32 bytesRead)
 	{
 		AutoCrit autoCrit(gBfpCritSect);
-		BF_ASSERT(mOverlappedResult.mPending);
-		mOverlappedResult.mPending = false;
-		mOverlappedResult.mErrorCode = errorCode;
-		mOverlappedResult.mBytesRead = bytesRead;
-		if (mOverlappedResult.mAttemptedRead) // Already tried to read and failed
+		BF_ASSERT(mOverlappedResult->mPending);
+		mOverlappedResult->mPending = false;
+		mOverlappedResult->mErrorCode = errorCode;
+		mOverlappedResult->mBytesRead = bytesRead;
+		if (mOverlappedResult->mAttemptedRead) // Already tried to read and failed
 		{
-			mQueuedData.Insert(mQueuedData.mSize, (uint8*)mOverlappedResult.GetPtr(), bytesRead);
-			mOverlappedResult.mData.Clear();
+			mQueuedData.Insert(mQueuedData.mSize, (uint8*)mOverlappedResult->GetPtr(), bytesRead);
+			mOverlappedResult->mData.Clear();
 		}
 		SetEvent();
+	}
+
+	void HandleWriteResult(uint32 errorCode, uint32 bytesWritten)
+	{
+		//
 	}
 
 	void AbortOverlapped()
 	{
 		AutoCrit autoCrit(gBfpCritSect);
-		BF_ASSERT(mOverlappedResult.mPending);
-		mOverlappedResult.mPending = false;
-		mOverlappedResult.mData.Clear();
+		BF_ASSERT(mOverlappedResult->mPending);
+		mOverlappedResult->mPending = false;
+		mOverlappedResult->mData.Clear();
 	}
 
 	int FinishRead(void* buffer, int size, DWORD& errorCode)
 	{
 		AutoCrit autoCrit(gBfpCritSect);
-		BF_ASSERT(!mOverlappedResult.mAttemptedRead);
-		mOverlappedResult.mAttemptedRead = true;
-		if (mOverlappedResult.mPending)
+		BF_ASSERT(!mOverlappedResult->mAttemptedRead);
+		mOverlappedResult->mAttemptedRead = true;
+		if (mOverlappedResult->mPending)
 		{		
 			return -2; // Still executing
 		}
 		
-		if ((mOverlappedResult.mErrorCode != 0) && (mOverlappedResult.mBytesRead == 0))
+		if ((mOverlappedResult->mErrorCode != 0) && (mOverlappedResult->mBytesRead == 0))
 		{
-			mOverlappedResult.mData.Clear();
-			errorCode = mOverlappedResult.mErrorCode;
+			mOverlappedResult->mData.Clear();
+			errorCode = mOverlappedResult->mErrorCode;
 			return -1;
 		}
 
-		BF_ASSERT(size >= mOverlappedResult.mBytesRead);
-		memcpy(buffer, mOverlappedResult.GetPtr(), mOverlappedResult.mBytesRead);
-		int bytesRead = (int)mOverlappedResult.mBytesRead;
-		mOverlappedResult.mData.Clear();
+		BF_ASSERT(size >= mOverlappedResult->mBytesRead);
+		memcpy(buffer, mOverlappedResult->GetPtr(), mOverlappedResult->mBytesRead);
+		int bytesRead = (int)mOverlappedResult->mBytesRead;
+		mOverlappedResult->mData.Clear();
 		return bytesRead;
 	}
 
@@ -695,17 +742,17 @@ struct BfpAsyncData
 	{		
 		AutoCrit autoCrit(gBfpCritSect);
 
-		BF_ASSERT(!mOverlappedResult.mPending);
-		BF_ASSERT(mOverlappedResult.mData.IsEmpty());
+		BF_ASSERT(!mOverlappedResult->mPending);
+		BF_ASSERT(mOverlappedResult->mData.IsEmpty());
 
-		memset(&mOverlappedResult, 0, sizeof(OVERLAPPED));
-		mOverlappedResult.mFile = mFile;
-		mOverlappedResult.mBytesRead = 0;
-		mOverlappedResult.mPending = true;
-		mOverlappedResult.mAttemptedRead = false;
-		mOverlappedResult.mErrorCode = -1;
-		mOverlappedResult.mData.Resize(size);		
-		return &mOverlappedResult;
+		memset(mOverlappedResult, 0, sizeof(OVERLAPPED));
+		mOverlappedResult->mFile = mFile;
+		mOverlappedResult->mBytesRead = 0;
+		mOverlappedResult->mPending = true;
+		mOverlappedResult->mAttemptedRead = false;
+		mOverlappedResult->mErrorCode = -1;
+		mOverlappedResult->mData.Resize(size);
+		return mOverlappedResult;
 	}
 };
 
@@ -741,7 +788,23 @@ struct BfpFile
 static void WINAPI OverlappedReadComplete(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
 {		
 	OverlappedReadResult* readResult = (OverlappedReadResult*)lpOverlapped;	
-	readResult->mFile->mAsyncData->HandleResult(dwErrorCode, dwNumberOfBytesTransfered);
+
+	AutoCrit autoCrit(gBfpCritSect);
+	if (readResult->mFile != NULL)
+	{
+		readResult->mFile->mAsyncData->HandleResult(dwErrorCode, dwNumberOfBytesTransfered);
+	}
+	else
+	{
+		// File already deleted, clean up ourselves
+		delete readResult;
+	}
+}
+
+static void WINAPI OverlappedWriteComplete(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED lpOverlapped)
+{
+	OverlappedWriteResult* writeResult = (OverlappedWriteResult*)lpOverlapped;
+	delete writeResult;
 }
 
 struct BfpFileWatcher : public BfpOverlapped
@@ -1057,11 +1120,22 @@ static void Crash_Error(const char* msg)
 	PIMAGE_DOS_HEADER pDosHdr = (PIMAGE_DOS_HEADER)hMod;
 	PIMAGE_NT_HEADERS pNtHdr = (PIMAGE_NT_HEADERS)((uint8*)hMod + pDosHdr->e_lfanew);
 	bool isCLI = pNtHdr->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI;
+	// The report kind is process-wide (CrashCatcher::Get shares one instance across modules), so a
+	// quiet kind set by the runtime applies here too even though this module never installed the
+	// catcher. abort() under a debug CRT raises a modal box regardless of subsystem.
+	// GetCrashReportKind reads it without constructing a catcher, which would link the whole crash handler.
+	BfpCrashReportKind reportKind = CrashCatcher::GetCrashReportKind();
+	bool quiet = (reportKind == BfpCrashReportKind_PrintOnly) || (reportKind == BfpCrashReportKind_None);
 
-	if (isCLI)
+	if (isCLI || quiet)
 		fprintf(stderr, "**** FATAL APPLICATION ERROR ****\n%s\n", msg);
 	else
 		::MessageBoxA(NULL, msg, "FATAL ERROR", MB_ICONSTOP);
+	if (quiet)
+	{
+		fflush(stderr);
+		::TerminateProcess(::GetCurrentProcess(), 1);
+	}
 	_set_purecall_handler(nullptr);
 	_set_invalid_parameter_handler(nullptr);
 	signal(SIGABRT, sOldSIGABRTHandler);
@@ -1304,6 +1378,27 @@ BFP_EXPORT void BFP_CALLTYPE BfpSystem_GetEnvironmentStrings(char* outStr, int* 
 	::FreeEnvironmentStringsW(ptr);
 
 	TryStringOut(env, outStr, inOutStrSize, (BfpResult*)outResult);
+}
+
+BFP_EXPORT void BFP_CALLTYPE BfpSystem_GetEnvironmentVariable(const char* var, char* outStr, int* inOutStrSize, BfpSystemResult* outResult)
+{
+	int bufferSize = *inOutStrSize;
+	int valueSize = ::GetEnvironmentVariableA(var, outStr, *inOutStrSize);
+	*inOutStrSize = valueSize + 1;
+	if (valueSize == 0)
+		OUTRESULT((BfpSystemResult)(int)BfpResult_NoResults);
+	else if (valueSize <= bufferSize)
+		OUTRESULT(BfpSystemResult_Ok);
+	else
+		OUTRESULT(BfpSystemResult_PartialData);
+}
+
+BFP_EXPORT void BFP_CALLTYPE BfpSystem_SetEnvironmentVariable(const char* var, const char* value, BfpSystemResult* outResult)
+{
+	if (::SetEnvironmentVariableA(var, value))
+		OUTRESULT(BfpSystemResult_Ok);
+	else
+		OUTRESULT((BfpSystemResult)(int)BfpResult_UnknownError);
 }
 
 BFP_EXPORT int BFP_CALLTYPE BfpSystem_GetNumLogicalCPUs(BfpSystemResult* outResult)
@@ -1746,6 +1841,7 @@ public:
 	bool CreatePipe(HANDLE& parentHandle, HANDLE& childHandle, bool parentInputs)
 	{
 		SECURITY_ATTRIBUTES securityAttributesParent = { 0 };
+		securityAttributesParent.nLength = sizeof(SECURITY_ATTRIBUTES); // bInheritHandle is ignored without this
 		securityAttributesParent.bInheritHandle = 1;
 
 		HANDLE hTmp = INVALID_HANDLE_VALUE;
@@ -1819,6 +1915,7 @@ public:
 		}
 
 		STARTUPINFOW startupInfo = { 0 };
+		startupInfo.cb = sizeof(STARTUPINFOW); // CreateProcess ignores the struct without this
 		PROCESS_INFORMATION processInfo = { 0 };
 
 		bool retVal;
@@ -3122,7 +3219,7 @@ BFP_EXPORT BfpFile* BFP_CALLTYPE BfpFile_Create(const char* path, BfpFileCreateK
 	}
 	else
 	{
-		creationDisposition = OPEN_EXISTING;
+		creationDisposition = ((createFlags & BfpFileCreateFlag_Truncate) != 0) ? TRUNCATE_EXISTING : OPEN_EXISTING;
 	}
 
 	DWORD attributes = 0;
@@ -3242,6 +3339,31 @@ BFP_EXPORT void BFP_CALLTYPE BfpFile_Close(BfpFile* file, BfpFileResult* outResu
 
 BFP_EXPORT intptr BFP_CALLTYPE BfpFile_Write(BfpFile* file, const void* buffer, intptr size, int timeoutMS, BfpFileResult* outResult)
 {
+	if (timeoutMS != -1)
+	{	
+		OverlappedWriteResult* overlappedWriteResult = new OverlappedWriteResult();
+		overlappedWriteResult->mFile = file;
+		overlappedWriteResult->mData = malloc(size);
+		memcpy(overlappedWriteResult->mData, buffer, size);
+
+		if (::WriteFileEx(file->mHandle, overlappedWriteResult->mData, (uint32)size, overlappedWriteResult, OverlappedWriteComplete))
+		{
+			return size;
+		}
+
+		if (outResult != NULL)
+		{
+			int lastError = GetLastError();
+			switch (lastError)
+			{
+			default:
+				*outResult = BfpFileResult_UnknownError;
+				break;
+			}
+		}
+		return 0;
+	}
+
 	DWORD bytesWritten = 0;
 	if (::WriteFile(file->mHandle, buffer, (uint32)size, &bytesWritten, NULL))
 	{

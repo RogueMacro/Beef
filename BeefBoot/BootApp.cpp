@@ -12,6 +12,8 @@
 
 #ifdef BF_PLATFORM_WINDOWS
 #include <direct.h>
+#else
+#include <dirent.h>
 #endif
 
 BF_IMPORT void BF_CALLTYPE Targets_Create();
@@ -168,9 +170,17 @@ BootApp::BootApp()
 #ifdef BF_PLATFORM_WINDOWS
 	mTargetTriple = "x86_64-pc-windows-msvc";
 #elif defined BF_PLATFORM_MACOS
-	mTargetTriple = "x86_64-apple-macosx10.8.0";
+	#if defined(__aarch64__) || defined(__arm64__)
+		mTargetTriple = "aarch64-apple-macosx11.0.0";
+	#else
+		mTargetTriple = "x86_64-apple-macosx10.8.0";
+	#endif
 #else
-	mTargetTriple = "x86_64-unknown-linux-gnu";
+	#if defined(__aarch64__) || defined(__arm64__)
+		mTargetTriple = "aarch64-unknown-linux-gnu";
+	#else
+		mTargetTriple = "x86_64-unknown-linux-gnu";
+	#endif
 #endif
 	
 	GetConsoleColor(gConsoleFGColor, gConsoleBGColor);
@@ -425,7 +435,7 @@ void BootApp::QueueFile(const StringImpl& path, void* project)
 		worked &= BfParser_Reduce(bfParser, mPassInstance);
 		worked &= BfParser_BuildDefs(bfParser, mPassInstance, NULL, false);
 		
-		delete data;
+		delete[] data;
 	}
 }
 
@@ -683,7 +693,7 @@ void BootApp::DoLinkMS()
 		if (nextBr == -1)
 			nextBr = (int)fileNamesStr.length();
 		linkLine.Append(fileNamesStr.substr(curIdx + 1, nextBr - curIdx - 1));
-		linkLine.Append(" ");
+		linkLine.Append("\n");
 		curIdx = nextBr;
 	}
 
@@ -734,15 +744,42 @@ void BootApp::DoLinkMS()
 
 	auto runCmd = QueueRun(linkerPath, linkLine, mWorkingDir, flags);
 }
-#endif
+
+#else
 
 void BootApp::DoLinkGNU()
 {
-    String linkerPath;
-    if (FileExists("/usr/bin/clang++"))
-    	linkerPath = "/usr/bin/clang++";
-    else
-    	linkerPath = "/usr/bin/c++";
+	StringView PATH(getenv("PATH"));
+	String linkerPath;
+	{
+		String pathNullTerm;
+		for (auto path : PATH.Split(':'))
+		{
+			pathNullTerm = path;
+			DIR* dir = opendir(pathNullTerm.c_str());
+			if (dir == NULL) continue;
+			while (dirent* entry = readdir(dir))
+			{
+				if (entry->d_type == DT_DIR) continue;
+				StringView name(entry->d_name);
+				if (name == "clang++")
+				{
+					linkerPath = path + "/" + name;
+					goto resolved;
+				}
+				if (name == "c++")
+				{
+					linkerPath = path + "/" + name;
+					//goto resolved;
+				}
+			}
+		}
+	}
+	if (linkerPath.IsEmpty())
+		linkerPath = "/usr/bin/c++";
+	if (!BfpFile_Exists(linkerPath.c_str()))
+		Fail("Failed to resolve executable: c++");
+	resolved:;
 
     String linkLine;
 
@@ -781,6 +818,7 @@ void BootApp::DoLinkGNU()
 
     auto runCmd = QueueRun(linkerPath, linkLine, mWorkingDir, BfpSpawnFlag_UseArgsFile);
 }
+#endif
 
 bool BootApp::Compile()
 {
@@ -813,6 +851,12 @@ bool BootApp::Compile()
 	mDefines.Append("\nBF_LITTLE_ENDIAN");
 	mDefines.Append("\n");
 	mDefines.Append(BF_PLATFORM_NAME);
+
+#if defined(__aarch64__) || defined(__arm64__) || defined (_M_ARM64)
+	mDefines.Append("\nBF_MACHINE_AARCH64");
+#else
+	mDefines.Append("\nBF_MACHINE_X64");
+#endif
 
 	int ltoType = 0;
 	BfProjectFlags flags = BfProjectFlags_None;
@@ -908,6 +952,19 @@ bool BootApp::Compile()
 		const char* msg = BfPassInstance_PopOutString(mPassInstance);
 		if (msg == NULL)
 			break;
+
+		// The compiler prepends an IDE output mark to the first message (or an
+		// undo mark when replaying diagnostics). Consume it before interpreting
+		// the message's severity/verbosity prefix.
+		if ((strncmp(msg, ":mark ", 6) == 0) || (strncmp(msg, ":mark_undo ", 11) == 0))
+		{
+			const char* newline = strchr(msg, '\n');
+			if (newline == NULL)
+				continue;
+			msg = newline + 1;
+			if (msg[0] == '\0')
+				continue;
+		}
 
 		if ((strncmp(msg, ":warn ", 6) == 0))
 		{

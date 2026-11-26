@@ -72,6 +72,12 @@ public:
 			return *this;
 		}
 
+		iterator& operator-=(intptr offset) 
+		{
+			mPtr -= offset;
+			return *this;
+		}
+
 		bool operator!=(const iterator& itr) const
 		{
 			return itr.mPtr != mPtr;
@@ -107,6 +113,12 @@ public:
 		T* operator->() const
 		{
 			return mPtr;
+		}
+
+		// Required by modern libc++ std::sort (random-access iterator conformance)
+		T& operator[](intptr offset) const
+		{
+			return mPtr[offset];
 		}
 
 		bool operator<(const iterator& val2)
@@ -186,6 +198,12 @@ public:
 		const T* operator->()
 		{
 			return mPtr;
+		}
+
+		// Required by modern libc++ std::sort (random-access iterator conformance)
+		const T& operator[](intptr offset) const
+		{
+			return mPtr[offset];
 		}
 
 		bool operator<(const const_iterator& val2)

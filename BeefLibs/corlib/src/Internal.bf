@@ -32,7 +32,7 @@ namespace System
 	[CRepr]
 	struct VarArgs
 	{
-#if BF_PLATFORM_WINDOWS || BF_PLATFORM_WASM
+#if BF_PLATFORM_WINDOWS || BF_PLATFORM_WASM || (BF_PLATFORM_MACOS && BF_MACHINE_AARCH64)
 		void* mVAList;
 #else
 		int[5] mVAList; // Conservative size for va_list
@@ -67,7 +67,7 @@ namespace System
 
 		public void* ToVAList() mut
 		{
-#if BF_PLATFORM_WINDOWS || BF_PLATFORM_WASM
+#if BF_PLATFORM_WINDOWS || BF_PLATFORM_WASM || (BF_PLATFORM_MACOS && BF_MACHINE_AARCH64)
 			return mVAList;
 #else
 			return &mVAList;
@@ -762,20 +762,8 @@ namespace System
 		[Error("Cannot be called directly"), SkipCall]
 		static extern void SetDeletedArray(void* dest, int size, int32 align, int arrayCount);
 
-		public static int MemCmp(void* memA, void* memB, int length)
-		{
-			uint8* p0 = (uint8*)memA;
-			uint8* p1 = (uint8*)memB;
-
-			uint8* end0 = p0 + length;
-			while (p0 < end0)
-			{
-				int diff = *(p0++) - *(p1++);
-				if (diff != 0)
-					return diff;
-			}
-			return 0;
-		}
+		[Intrinsic("memcmp")]
+		public static extern int MemCmp(void* memA, void* memB, int length);
 
 		[Inline]
 		public static int GetArraySize<T>(int length)

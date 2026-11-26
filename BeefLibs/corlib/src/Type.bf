@@ -179,18 +179,27 @@ namespace System
 			return false;
 		}
 
-		public bool HasDeclaredMethod(StringView fieldName)
+		public bool HasDeclaredMethod(StringView methodName)
 		{
 			if (Compiler.IsComptime)
-				return Type.[Friend]Comptime_Type_HasDeclaredMember((.)mTypeId, 1, fieldName);
+				return Type.[Friend]Comptime_Type_HasDeclaredMember((.)mTypeId, 1, methodName);
 			return false;
 		}
 
-		public bool HasDeclaredProperty(StringView fieldName)
+		public bool HasDeclaredProperty(StringView propName)
 		{
 			if (Compiler.IsComptime)
-				return Type.[Friend]Comptime_Type_HasDeclaredMember((.)mTypeId, 2, fieldName);
+				return Type.[Friend]Comptime_Type_HasDeclaredMember((.)mTypeId, 2, propName);
 			return false;
+		}
+
+		/// Returns the declaration text of every method named 'methodName', each preceded by a
+		///  '#line <line> "<file>"' directive. Empty if there are no matches, null outside comptime.
+		public String GetMethodDeclarationText(StringView methodName)
+		{
+			if (Compiler.IsComptime)
+				return Type.[Friend]Comptime_Type_GetMethodDeclarationText((.)mTypeId, methodName);
+			return null;
 		}
 	}
 
@@ -210,7 +219,7 @@ namespace System
 		extern const Type* sTypes;
 		extern static int32 sTypeCount;
 
-		protected const BindingFlags cDefaultLookup = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public;
+		protected const BindingFlags cDefaultLookup = .Instance | .Static | .Public | .NonPublic;
 
 		protected int32 mSize;
 		protected TypeId mTypeId;
@@ -779,6 +788,7 @@ namespace System
 		static extern TypeDeclaration Comptime_GetNextTypeDeclaration(int32 lastTypeId);
 		static extern int32 Comptime_Type_GetBaseType(int32 typeId);
 		static extern bool Comptime_Type_HasDeclaredMember(int32 typeId, int32 kind, StringView name);
+		static extern String Comptime_Type_GetMethodDeclarationText(int32 typeId, StringView methodName);
 		static extern Type Comptime_GetTypeById(int32 typeId);
 		static extern Type Comptime_GetWrappedType(int32 typeId);
 		static extern Type Comptime_GetTypeByName(StringView name);
@@ -1068,15 +1078,22 @@ namespace System
 	    Float,
 	    Double,
 		Float2,
+		Float4,
+		Int32_4,
+		Bool2,
+		Bool4,
+		V128,
 	    Object,
 	    Interface,
 	    Struct,
 	    Enum,
 		TypeAlias,
 		Extension,
+		FloatX1,
 		FloatX2,
 		FloatX3,
 		FloatX4,
+		DoubleX1,
 		DoubleX2,
 		DoubleX3,
 		DoubleX4,
@@ -1141,7 +1158,9 @@ namespace System.Reflection
 			Splat = 1,
 			Implicit = 2,
 			AppendIdx = 4,
-			Params = 8
+			Params = 8,
+			/// Declared with a default value, so a call may leave it out
+			HasDefault = 16
 		}
 
 		[CRepr, AlwaysInclude]
@@ -1305,6 +1324,17 @@ namespace System.Reflection
 			return false;
 		}
 
+		/// A type id can name a type that was never emitted into the type table, so GetType
+		/// answers null for it. Composing a name out of such a reference wrote through that
+		/// null; it now reads as "???", the same placeholder an unresolvable outer type uses.
+		static void AppendTypeName(Type type, String strBuffer)
+		{
+			if (type == null)
+				strBuffer.Append("???");
+			else
+				type.GetFullName(strBuffer);
+		}
+
         public override void GetFullName(String strBuffer)
         {
 			if (mTypeFlags.HasFlag(TypeFlags.Tuple))
@@ -1317,7 +1347,7 @@ namespace System.Reflection
 						if (fieldIdx > 0)
 							strBuffer.Append(", ");
 						var fieldData = mFieldDataPtr[fieldIdx];
-						GetType(fieldData.[Friend]mFieldTypeId).GetFullName(strBuffer);
+						AppendTypeName(GetType(fieldData.[Friend]mFieldTypeId), strBuffer);
 						if (!fieldData.mName[0].IsNumber)
 						{
 							strBuffer.Append(' ');
@@ -1334,7 +1364,7 @@ namespace System.Reflection
 							break;
 						if (i > 0)
 							strBuffer.Append(", ");
-						GetType(splatData.mSplatTypes[i]).GetFullName(strBuffer);
+						AppendTypeName(GetType(splatData.mSplatTypes[i]), strBuffer);
 					}
 				}
 				strBuffer.Append(')');
@@ -1373,7 +1403,7 @@ namespace System.Reflection
 				else if (mBaseType != 0)
 				{
 					strBuffer.Append("derivative of ");
-					GetType(mBaseType).GetFullName(strBuffer);
+					AppendTypeName(GetType(mBaseType), strBuffer);
 				}
 			}
         }
@@ -1468,7 +1498,7 @@ namespace System.Reflection
 
 		public override void GetFullName(String strBuffer)
 		{
-			UnderlyingType.GetFullName(strBuffer);
+			TypeInstance.[Friend]AppendTypeName(UnderlyingType, strBuffer);
 			strBuffer.Append("*");
 		}
 	}
@@ -1507,7 +1537,7 @@ namespace System.Reflection
 			case .Mut: strBuffer.Append("mut ");
 			}
 
-			UnderlyingType.GetFullName(strBuffer);
+			TypeInstance.[Friend]AppendTypeName(UnderlyingType, strBuffer);
 		}
 	}
 
@@ -1547,7 +1577,7 @@ namespace System.Reflection
 					continue;
 				}
 
-				checkType.GetFullName(strBuffer);
+				TypeInstance.[Friend]AppendTypeName(checkType, strBuffer);
 				break;
 			}
 
@@ -1603,9 +1633,15 @@ namespace System.Reflection
 			case typeof(uint64), typeof(uint):
 				(*(uint64*)&mValue).ToString(strBuffer);
 			case typeof(String):
+				// GetById indexes the literal table UNCHECKED, so an id beyond the table
+				// still reads out of bounds; only a null entry inside it is caught here.
+				// Catching the rest needs a count emitted beside the table.
 				int32 stringId = *(int32*)&mValue;
 				String str = String.GetById(stringId);
-				str.Quote(strBuffer);
+				if (str == null)
+					strBuffer.Append("???");
+				else
+					str.Quote(strBuffer);
 			default:
 				mValue.ToString(strBuffer);
 			}
@@ -1668,8 +1704,10 @@ namespace System.Reflection
 		public override void GetFullName(String strBuffer)
 		{
 			var unspecializedTypeG = Type.GetType(mUnspecializedType);
-			var unspecializedType = (UnspecializedGenericType)unspecializedTypeG;
+			var unspecializedType = unspecializedTypeG as UnspecializedGenericType;
 			base.GetFullName(strBuffer);
+			if (unspecializedType == null)
+				return; // no table entry for it: the bare name stands, without its arguments
 
 			int32 outerGenericCount = 0;
 			var outerType = OuterType;
@@ -1703,7 +1741,7 @@ namespace System.Reflection
 
 		public override void GetFullName(String strBuffer)
 		{
-			Type.GetType(mResolvedTypeRefs[0]).GetFullName(strBuffer);
+			TypeInstance.[Friend]AppendTypeName(Type.GetType(mResolvedTypeRefs[0]), strBuffer);
 			strBuffer.Append('[');
 			for (int commaNum < mRank - 1)
 				strBuffer.Append(',');

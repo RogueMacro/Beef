@@ -81,6 +81,7 @@ DebugManager::DebugManager()
 
 	mDebugger32 = NULL;
 	mDebugger64 = NULL;
+	mDebuggerGDB = NULL;
 	mNetManager = new NetManager();
 	mNetManager->mDebugManager = this;
 
@@ -107,6 +108,7 @@ DebugManager::~DebugManager()
 	}
 
 	delete mNetManager;
+	delete mDebuggerGDB;
 	delete mDebugger64;
 	delete mDebugger32;
 	/*for (auto stepFilter : mStepFilters)
@@ -654,17 +656,20 @@ BF_EXPORT void BF_CALLTYPE Debugger_Create()
 	//_CrtSetBreakAlloc(621);
 
 	gDebugManager = new DebugManager();
-#ifdef ENABLE_DBG_32
+#if defined(ENABLE_DBG_32) && defined(BF_PLATFORM_WINDOWS)
 	gDebugManager->mDebugger32 = CreateDebugger32(gDebugManager, NULL);
 #else
 	gDebugManager->mDebugger32 = NULL;
 #endif
 
-#ifdef BF32
+#if defined(BF32) || !defined(BF_PLATFORM_WINDOWS)
 	gDebugManager->mDebugger64 = NULL;
 #else
 	gDebugManager->mDebugger64 = CreateDebugger64(gDebugManager, NULL);
 #endif
+
+	gDebugManager->mDebuggerLLDB = CreateDebuggerLLDB(gDebugManager);
+	gDebugManager->mDebuggerGDB = CreateDebuggerGDB(gDebugManager);
 
 #ifdef BF_PLATFORM_WINDOWS
 	::AllowSetForegroundWindow(ASFW_ANY);
@@ -758,22 +763,51 @@ BF_EXPORT bool BF_CALLTYPE Debugger_OpenFile(const char* launchPath, const char*
 {
 	BF_ASSERT(gDebugger == NULL);
 
-	if (!FileExists(launchPath))
-	{
-		gDebugManager->mOutMessages.push_back(StrFormat("error Unable to locate specified launch target '%s'", launchPath));
-		return false;
-	}
-
 	DebuggerResult debuggerResult = DebuggerResult_Ok;
-	if ((gDebugManager->mDebugger64 != NULL) && (gDebugManager->mDebugger64->CanOpen(launchPath, &debuggerResult)))
-		gDebugger = gDebugManager->mDebugger64;
+
+	if ((strstr(launchPath, "@gdb") != NULL) || (strstr(launchPath, "gdb:") != NULL))
+	{
+		gDebugger = gDebugManager->mDebuggerGDB;
+	}
+	else if ((strstr(launchPath, "@lldb") != NULL) || (strstr(launchPath, "lldb:") != NULL))
+	{
+		gDebugger = gDebugManager->mDebuggerLLDB;
+		if (gDebugger == NULL)
+		{
+			gDebugManager->mOutMessages.push_back("error LLDB is not enabled in this BeefIDE build");
+			return false;
+		}
+	}
 	else
-		gDebugger = gDebugManager->mDebugger32;
+	{
+		if (!FileExists(launchPath))
+		{
+			gDebugManager->mOutMessages.push_back(StrFormat("error Unable to locate specified launch target '%s'", launchPath));
+			return false;
+		}
+
+		if (gDebugManager->mDebugger64 != NULL)
+		{
+			if (gDebugManager->mDebugger64->CanOpen(launchPath, &debuggerResult))
+				gDebugger = gDebugManager->mDebugger64;
+			else
+				gDebugger = gDebugManager->mDebugger32;
+		}
+		else if (gDebugManager->mDebuggerLLDB != NULL)
+		{
+			// Without WinDebugger, prefer LLDB - it supports hot compiling - when this build has it
+			gDebugger = gDebugManager->mDebuggerLLDB;
+		}
+		else
+			gDebugger = gDebugManager->mDebuggerGDB;
+	}
 
 	if (gDebugger == NULL)
 	{
 		if (debuggerResult == DebuggerResult_WrongBitSize)
 			gDebugManager->mOutMessages.push_back(StrFormat("error The file 32-bit file '%s' cannot be debugged because 32-bit debugger has been disabled", launchPath));
+		else
+			gDebugManager->mOutMessages.push_back("error Failed to start a debugger");
 		return false;
 	}
 
@@ -896,6 +930,17 @@ BF_EXPORT bool BF_CALLTYPE Debugger_Attach(int processId, BfDbgAttachFlags attac
 {
 	BF_ASSERT(gDebugger == NULL);
 
+	if (gDebugManager->mDebugger64 == NULL)
+	{
+		Debugger* debugger = (gDebugManager->mDebuggerLLDB != NULL) ? gDebugManager->mDebuggerLLDB : gDebugManager->mDebuggerGDB;
+		if ((debugger != NULL) && (debugger->Attach(processId, attachFlags)))
+		{
+			gDebugger = debugger;
+			return true;
+		}
+		return false;
+	}
+
 	if (gDebugManager->mDebugger64->Attach(processId, attachFlags))
 	{
 		gDebugger = gDebugManager->mDebugger64;
@@ -951,7 +996,7 @@ BF_EXPORT bool BF_CALLTYPE Debugger_HotLoad(const char* fileNamesStr, int hotIdx
 
 	gDebugger->HotLoad(fileNames, hotIdx);
 
-	return true;
+	return gDebugger->WasHotLoadApplied();
 }
 
 BF_EXPORT bool BF_CALLTYPE Debugger_LoadDebugVisualizers(const char* fileName)
@@ -1304,7 +1349,8 @@ BF_EXPORT StringView BF_CALLTYPE Debugger_Evaluate(const char* expr, int callSta
 
 	String& outString = *gTLStrReturn.Get();
 	outString.clear();
-	outString = debugger->Evaluate(expr, callStackIdx, cursorPos, language, (DwEvalExpressionFlags)expressionFlags);
+	if (debugger != NULL)
+		outString = debugger->Evaluate(expr, callStackIdx, cursorPos, language, (DwEvalExpressionFlags)expressionFlags);
 #ifdef BF_WANTS_LOG_DBG
 	{
 		int crPos = (int)outString.IndexOf('\n');
@@ -1512,6 +1558,11 @@ BF_EXPORT const char* BF_CALLTYPE Debugger_GetAddressSourceLocation(intptr addre
 	else
 		outString = "";
 	return outString.c_str();
+}
+
+BF_EXPORT intptr BF_CALLTYPE Debugger_GetSymbolAddress(const char* sym)
+{
+	return gDebugger->GetSymbolAddress(sym);
 }
 
 BF_EXPORT const char* BF_CALLTYPE Debugger_GetAddressSymbolName(intptr address, bool demangle)

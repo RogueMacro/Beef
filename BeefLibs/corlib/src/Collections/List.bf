@@ -151,6 +151,7 @@ namespace System.Collections
 			set
 			{
 				Debug.Assert((uint)value <= (uint)SizeFlags);
+				Runtime.Assert(value >= mSize);
 				if (value != AllocSize)
 				{
 					T* oldAlloc = Realloc(value, true);
@@ -393,6 +394,8 @@ namespace System.Collections
 		/// Adds an item to the back of the list.
 		public void AddRange(Span<T> addSpan)
 		{
+			if (addSpan.IsEmpty)
+				return;
 			if (mSize + addSpan.Length > AllocSize)
 			{
 				let oldPtr = EnsureCapacity(mSize + addSpan.Length, false);
@@ -418,6 +421,18 @@ namespace System.Collections
 		{
 			for (let item in items.GetEnumerator())
 				Add(item);
+		}
+
+		public void AddRange<TEnumable, TItem>(TEnumable items) where T : operator implicit TItem where TEnumable : IEnumerable<TItem>
+		{
+			for (let item in items.GetEnumerator())
+				Add(item);
+		}
+
+		// The extra constraint makes this the better match, so span-convertible collections block copy
+		public void AddRange<TEnumable, TItem>(TEnumable items) where T : operator implicit TItem where TEnumable : IEnumerable<TItem> where Span<T> : operator implicit TEnumable
+		{
+			AddRange((Span<T>)items);
 		}
 
 		public Span<T> GetRange(int offset = 0)
@@ -1022,12 +1037,12 @@ namespace System.Collections
 
 		public struct Enumerator : IRefEnumerator<T*>, IEnumerator<T>, IResettable
 		{
-	        private List<T> mList;
-	        private int mIndex;
+	        protected List<T> mList;
+	        protected int mIndex;
 #if VERSION_LIST
 	        private int32 mVersion;
 #endif
-	        private T* mCurrent;
+	        protected T* mCurrent;
 
 	        public this(List<T> list)
 	        {
@@ -1063,7 +1078,7 @@ namespace System.Collections
 	            return MoveNextRare();
 	        }
 
-	        private bool MoveNextRare() mut
+	        protected bool MoveNextRare() mut
 	        {
 #if VERSION_LIST
 				CheckVersion();
@@ -1075,6 +1090,7 @@ namespace System.Collections
 
 	        public T Current
 	        {
+				[Inline]
 	            get
 	            {
 	                return *mCurrent;
@@ -1139,11 +1155,18 @@ namespace System.Collections
 	            mCurrent = null;
 	        }
 
+			[Inline(OptimizedOnly=true)]
 			public Result<T> GetNext() mut
 			{
-				if (!MoveNext())
+				List<T> localList = mList;
+				if ((uint(mIndex) < uint(localList.mSize)))
+				{
+				    mCurrent = &localList.mItems[mIndex];
+				    mIndex++;
+				}
+				else if (!MoveNextRare())
 					return .Err;
-				return Current;
+				return .Ok(*mCurrent);
 			}
 
 			public Result<T*> GetNextRef() mut

@@ -11,6 +11,11 @@
 #include "img/PVRData.h"
 #include "img/BFIData.h"
 
+#ifndef BF_PLATFORM_WINDOWS
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
+
 #pragma warning(disable:4190)
 
 USING_NS_BF;
@@ -165,6 +170,47 @@ BF_EXPORT StringView BF_CALLTYPE Res_JPEGCompress(uint32* bits, int width, int h
 	outString.Clear();
 	outString.Insert(0, (char*)jpegData.mSrcData, jpegData.mSrcDataLen);
 	return outString;
+}
+
+// Encodes bits (RGBA, width*height) as PNG into a thread-local buffer and returns it. The buffer
+// is only valid until the next Res_ call on this thread, so callers copy it out immediately.
+BF_EXPORT void* BF_CALLTYPE Res_EncodePNG(uint32* bits, int width, int height, int* outSize)
+{
+	String& outString = *gResLib_TLStrReturn.Get();
+	outString.Clear();
+
+	PNGData pngData;
+	pngData.mBits = bits;
+	pngData.mWidth = width;
+	pngData.mHeight = height;
+	bool result = pngData.WriteToMemory(outString);
+	pngData.mBits = NULL;
+
+	if (!result)
+	{
+		*outSize = 0;
+		return NULL;
+	}
+	*outSize = (int)outString.mLength;
+	return (void*)outString.c_str();
+}
+
+BF_EXPORT bool BF_CALLTYPE Res_SetLastWriteTime(const char* path, uint64 timestamp)
+{
+#ifdef BF_PLATFORM_WINDOWS
+	HANDLE file = ::CreateFileW(UTF8Decode(path).c_str(), FILE_WRITE_ATTRIBUTES,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	FILETIME fileTime = {(DWORD)timestamp, (DWORD)(timestamp >> 32)};
+	bool result = ::SetFileTime(file, NULL, NULL, &fileTime) != 0;
+	::CloseHandle(file);
+	return result;
+#else
+	// BfpFile_GetTime_LastWrite returns Unix seconds on POSIX.
+	struct timespec times[2] = {{0, UTIME_OMIT}, {(time_t)timestamp, 0}};
+	return utimensat(AT_FDCWD, path, times, 0) == 0;
+#endif
 }
 
 BF_EXPORT bool BF_CALLTYPE Res_WritePNG(uint32* bits, int width, int height, const char* filePath)

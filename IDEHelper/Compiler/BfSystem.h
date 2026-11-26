@@ -250,6 +250,7 @@ enum BfMethodFlags
 	BfMethodFlags_Virtual = 0x40,
 	BfMethodFlags_ReadOnly = 0x100,
 	BfMethodFlags_Mixin = 0x200,
+	BfMethodFlags_Abstract = 0x400,
 	BfMethodFlags_StdCall = 0x1000,
 	BfMethodFlags_FastCall = 0x2000,
 	BfMethodFlags_ThisCall = 0x3000,
@@ -337,6 +338,7 @@ enum BfToolsetType
 
 enum BfSIMDSetting
 {
+	BfSIMDSetting_NotSet = -1,
 	BfSIMDSetting_None,
 	BfSIMDSetting_MMX,
 	BfSIMDSetting_SSE,
@@ -344,8 +346,26 @@ enum BfSIMDSetting
 	BfSIMDSetting_SSE3,
 	BfSIMDSetting_SSE4,
 	BfSIMDSetting_SSE41,
+	BfSIMDSetting_SSE42,
 	BfSIMDSetting_AVX,
 	BfSIMDSetting_AVX2,
+	BfSIMDSetting_AVX512,
+};
+
+enum BfFloatingPointMode
+{
+	BfFloatingPointMode_NotSet = -1,
+	BfFloatingPointMode_Precise = 0,
+	BfFloatingPointMode_AllowFMA = 1,
+	BfFloatingPointMode_Fast = 2
+};
+
+enum BfFMASetting
+{
+	BfFMASetting_NotSet = -1,
+	BfFMASetting_TargetDefault = 0,
+	BfFMASetting_Enabled = 1,
+	BfFMASetting_Disabled = 2
 };
 
 enum BfAsmKind
@@ -417,6 +437,8 @@ struct BfCodeGenOptions
 	BfRelocType mRelocType;
 	BfPICLevel mPICLevel;
 	BfSIMDSetting mSIMDSetting;
+	BfFloatingPointMode mFloatingPointMode;
+	BfFMASetting mFMASetting;
 	BfOptLevel mOptLevel;
 	BfLTOType mLTOType;
 	int mSizeLevel;
@@ -471,6 +493,8 @@ struct BfCodeGenOptions
 		mRelocType = BfRelocType_NotSet;
 		mPICLevel = BfPICLevel_NotSet;
 		mSIMDSetting = BfSIMDSetting_None;
+		mFloatingPointMode = BfFloatingPointMode_Precise;
+		mFMASetting = BfFMASetting_TargetDefault;
 		mOptLevel = BfOptLevel_O0;
 		mLTOType = BfLTOType_None;
 		mSizeLevel = 0;
@@ -525,6 +549,8 @@ struct BfCodeGenOptions
 		hashCtx.Mixin(mRelocType);
 		hashCtx.Mixin(mPICLevel);
 		hashCtx.Mixin(mSIMDSetting);
+		hashCtx.Mixin(mFloatingPointMode);
+		hashCtx.Mixin(mFMASetting);
 		hashCtx.Mixin(mOptLevel);
 		hashCtx.Mixin(mLTOType);
 		hashCtx.Mixin(mSizeLevel);
@@ -932,7 +958,7 @@ public:
 	bool mWantsBody;
 	bool mCLink;
 	BfAllowAppendKind mAppendKind;
-	bool mAlwaysInline;
+	BfInlineKind mInlineKind;
 	bool mIsNoReturn;
 	bool mIsMutating;
 	bool mIsNoSplat;
@@ -986,7 +1012,7 @@ public:
 		mMethodType = BfMethodType_Normal;
 		mCallingConvention = BfCallingConvention_Unspecified;
 		mAppendKind = BfAllowAppendKind_No;
-		mAlwaysInline = false;
+		mInlineKind = BfInlineKind_NotSet;
 		mParamNameMap = NULL;
 		mNextWithSameName = NULL;
 	}
@@ -1465,6 +1491,7 @@ public:
 	bool ContainsReference(BfProject* refProject);
 	bool ReferencesOrReferencedBy(BfProject* refProject);
 	bool IsTestProject();
+	bool IsFinalProgramTarget();
 	bool HasDependency(BfProject* project);	
 	DependencyKind GetDependencyKind(BfProject* project);
 };
@@ -1612,6 +1639,7 @@ public:
 
 	BfSystem* mSystem;
 	BfCompiler* mCompiler;
+	CritSect mCritSect;
 	bool mTrimMessagesToCursor;
 	int mFailedIdx;
 	int mWarnIdx;
@@ -1622,7 +1650,10 @@ public:
 	int mIgnoreCount;
 	int mWarningCount;
 	int mDeferredErrorCount;
-	Deque<String> mOutStream;
+	int mOutputMarkId;
+	bool mDidMark;
+	int mReadIdx;
+	Array<String> mOutStream;
 	bool mLastWasDisplayed;
 	bool mLastWasAdded;
 	uint8 mClassifierPassId;
@@ -1630,22 +1661,7 @@ public:
 	bool mHadSignatureChanges;
 
 public:
-	BfPassInstance(BfSystem* bfSystem)
-	{
-		mTrimMessagesToCursor = false;
-		mFailedIdx = 0;
-		mWarnIdx = 0;
-		mSystem = bfSystem;
-		mCompiler = NULL;
-		mLastWasDisplayed = false;
-		mLastWasAdded = false;
-		mClassifierPassId = 0;
-		mWarningCount = 0;
-		mDeferredErrorCount = 0;
-		mIgnoreCount = 0;
-		mHadSignatureChanges = false;
-	}
-
+	BfPassInstance(BfSystem* bfSystem);
 	~BfPassInstance();
 
 	StateInfo GetState();
@@ -1759,6 +1775,8 @@ public:
 	Array<String> mAttributeFilters;
 	Array<int> mMatchedIndices;
 	int mSIMDSetting;
+	int mFloatingPointMode = BfFloatingPointMode_NotSet;
+	int mFMASetting = BfFMASetting_NotSet;
 	int mOptimizationLevel;
 	int mEmitDebugInfo;
 	BfOptionFlags mAndFlags;

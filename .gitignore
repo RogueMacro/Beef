@@ -21,6 +21,7 @@ lld-link.exe
 stats/
 bin/Git
 **/dist/*
+!**/dist/gdb
 BeefySysLib/third_party/*
 BeefTools/RandoCode/*
 jbuild*/
@@ -28,6 +29,8 @@ IDE/Tests/NewProject*/*
 *.csproj.user
 builds/*
 wasm/*
+!wasm/build_wasm.sh
+IDE/wasm/*
 BeefManaged/*
 BeefPerf.txt
 IDE/Tests/Rando
@@ -35,3 +38,5 @@ install/
 JEMalloc/
 .cache
 .vscode
+*_Done.txt
+extern/temp/

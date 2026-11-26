@@ -433,6 +433,7 @@ void BeInliner::Visit(BeCallInst* callInst)
 		destCallInst->mArgs.push_back(copiedArg);
 	}
 	destCallInst->mNoReturn = callInst->mNoReturn;
+	destCallInst->mNoInline = callInst->mNoInline;
 	destCallInst->mTailCall = callInst->mTailCall;
 }
 
@@ -570,12 +571,20 @@ BeType* BeGlobalVariable::GetType()
 	return mModule->mContext->GetPointerTo(mType);
 }
 
+int BeFunction::GetInstructionCount()
+{
+	int count = 0;
+	for (auto block : mBlocks)
+		count += block->mInstructions.mSize;
+	return count;
+}
+
 void BeFunction::HashContent(BeHashContext& hashCtx)
 {
 	hashCtx.Mixin(TypeId);
 	hashCtx.MixinStr(mName);
 	hashCtx.Mixin(mLinkageType);
-	hashCtx.Mixin(mAlwaysInline);
+	hashCtx.Mixin(mInlineKind);
 	hashCtx.Mixin(mNoUnwind);
 	hashCtx.Mixin(mUWTable);
 	hashCtx.Mixin(mNoReturn);
@@ -583,6 +592,9 @@ void BeFunction::HashContent(BeHashContext& hashCtx)
 	hashCtx.Mixin(mIsDLLExport);
 	hashCtx.Mixin(mIsDLLImport);
 	hashCtx.Mixin(mCallingConv);
+	hashCtx.Mixin(mFloatingPointMode);
+	hashCtx.Mixin(mSIMDSetting);
+	hashCtx.Mixin(mFMASetting);
 
 	for (auto block : mBlocks)
 		block->HashReference(hashCtx);
@@ -2178,8 +2190,10 @@ String BeModule::ToString(BeFunction* wantFunc)
 
 		str += ")";
 
-		if (func->mAlwaysInline)
+		if (func->mInlineKind == BfInlineKind_Always)
 			str += " AlwaysInline";
+		else if (func->mInlineKind == BfInlineKind_Never)
+			str += " noinline";
 		if (func->mNoUnwind)
 			str += " nounwind";
 		if (func->mUWTable)
@@ -2480,6 +2494,8 @@ String BeModule::ToString(BeFunction* wantFunc)
 						str += ")";
 						if (castedInst->mNoReturn)
 							str += " noreturn";
+						if (castedInst->mNoInline)
+							str += " noinline";
 					}
 					break;
 				case BePhiInst::TypeId:
@@ -2670,8 +2686,60 @@ void BeModule::DoInlining(BeFunction* func)
 
 	bool hadInlining = false;
 
-	std::function<void(int& blockIdx, BeBlock* endBlock, std::unordered_set<BeFunction*>& funcInlined)> _DoInlining;
-	_DoInlining = [&](int& blockIdx, BeBlock* endBlock, std::unordered_set<BeFunction*>& funcInlined)
+	// Phase 1: Pre-scan all call sites and pre-expand callees
+	struct InlineSite
+	{
+		BeCallInst* callInst;
+		BeFunction* inlineFunc;
+		int calleeInstCount;
+	};
+	Array<InlineSite> inlineSites;
+
+	for (auto beBlock : func->mBlocks)
+	{
+		for (auto inst : beBlock->mInstructions)
+		{
+			auto callInst = BeValueDynCast<BeCallInst>(inst);
+			if (callInst == NULL)
+				continue;
+			auto inlineFunc = BeValueDynCast<BeFunction>(callInst->mFunc);
+			if ((callInst->mNoInline) || (inlineFunc == NULL) || (inlineFunc == func) || (inlineFunc->mInlineKind != BfInlineKind_Always) || inlineFunc->mBlocks.empty())
+				continue;
+			DoInlining(inlineFunc);
+			InlineSite site;
+			site.callInst = callInst;
+			site.inlineFunc = inlineFunc;
+			site.calleeInstCount = inlineFunc->GetInstructionCount();
+			inlineSites.push_back(site);
+		}
+	}
+
+	// Sort smallest callee first to maximize how many can be inlined within the limit
+	inlineSites.Sort([](const InlineSite& a, const InlineSite& b) { return a.calleeInstCount < b.calleeInstCount; });
+
+	// Determine which sites to inline within the instruction limit
+	int maxInstructions = 100000;
+
+	//TODO:
+	/*if (func->mName.Contains("InlineTest"))
+		maxInstructions = 500;*/
+
+	HashSet<BeCallInst*> approvedSites;
+	int projectedCount = func->GetInstructionCount();
+	for (auto& site : inlineSites)
+	{
+		if ((projectedCount + site.calleeInstCount) <= maxInstructions)
+		{
+			approvedSites.Add(site.callInst);
+			projectedCount += site.calleeInstCount;
+		}
+	}
+
+	if (approvedSites.IsEmpty())
+		return;
+
+	std::function<void(int& blockIdx, BeBlock* endBlock, HashSet<BeFunction*>& funcInlined)> _DoInlining;
+	_DoInlining = [&](int& blockIdx, BeBlock* endBlock, HashSet<BeFunction*>& funcInlined)
 	{
 		for (; blockIdx < (int)func->mBlocks.size(); blockIdx++)
 		{
@@ -2775,7 +2843,7 @@ void BeModule::DoInlining(BeFunction* func)
 					continue;
 				if (inlineFunc == func)
 					continue;
-				if (!inlineFunc->mAlwaysInline)
+				if ((callInst->mNoInline) || (inlineFunc->mInlineKind != BfInlineKind_Always))
 					continue;
 
 				if (inlineFunc->mBlocks.empty())
@@ -2784,11 +2852,11 @@ void BeModule::DoInlining(BeFunction* func)
 					continue;
 				}
 
-				// It's more efficient to do depth-first inlining so nested inlines will be pre-expanded
-				DoInlining(inlineFunc);
+				if (!approvedSites.Contains(callInst))
+					continue;
 
 				//TODO: Not needed anymore, right?
-				if (funcInlined.find(inlineFunc) != funcInlined.end())
+				if (funcInlined.Contains(inlineFunc))
 					continue; // Don't recursively inline
 
 				// Incase we have multiple inlines from the same location, those need to have unique dbgLocs
@@ -2976,7 +3044,7 @@ void BeModule::DoInlining(BeFunction* func)
 				}*/
 
 				auto inlinedFuncInlined = funcInlined;
-				inlinedFuncInlined.insert(inlineFunc);
+				inlinedFuncInlined.Add(inlineFunc);
 				_DoInlining(blockIdx, returnBlock, inlinedFuncInlined);
 			}
 		}
@@ -2986,7 +3054,7 @@ void BeModule::DoInlining(BeFunction* func)
 	if (func->mDbgFunction != NULL)
 		prevDbgVars = (int)func->mDbgFunction->mVariables.size();*/
 
-	std::unordered_set<BeFunction*> newFuncSet;
+	HashSet<BeFunction*> newFuncSet;
 	_DoInlining(blockIdx, NULL, newFuncSet);
 
 	/*if ((func->mDbgFunction != NULL) && (prevDbgVars != (int)func->mDbgFunction->mVariables.size()))

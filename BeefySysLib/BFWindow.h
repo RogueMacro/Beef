@@ -22,10 +22,14 @@ typedef void (*BFWindow_MouseDown)(BFWindow* window, int x, int y, int btn, int 
 typedef void (*BFWindow_MouseUp)(BFWindow* window, int x, int y, int btn);
 typedef void (*BFWindow_MouseWheel)(BFWindow* window, int x, int y, float deltaX, float deltaY);
 typedef void (*BFWindow_MouseLeave)(BFWindow* window);
+// Fired instead of BFWindow_MouseMove while relative mouse mode is active -- dx/dy are raw deltas,
+// not tied to any screen/client position. See BFWindow::StartRelativeMouseMode.
+typedef void (*BFWindow_MouseDelta)(BFWindow* window, int dx, int dy);
+typedef void (*BFWindow_RelativeMouseModeAbortedFunc)(BFWindow* window);
 typedef void (*BFWindow_MenuItemSelectedFunc)(BFWindow* window, BFMenu* menu);
 typedef void (*BFWindow_DragDropFileFunc)(BFWindow* window, const char* filePath);
 
-enum
+enum : int64
 {
 	BFWINDOW_BORDER			= 0x000001,
 	BFWINDOW_THICKFRAME		= 0x000002,
@@ -57,8 +61,10 @@ enum
 	BFWINDOW_ALLOW_FULLSCREEN = 0x8000000,
 	BFWINDOW_ACCEPTFILES	= 0x10000000,
 	BFWINDOW_NOSHOW			= 0x20000000,
-	BFWINDOW_NO_MOUSE       = 0x40000000
-
+	BFWINDOW_NO_MOUSE       = 0x40000000,
+	BFWINDOW_TOOLTIP        = 0x80000000,
+	BFWINDOW_LOGICAL_COORDS	= 0x100000000,
+	BFWINDOW_NO_LAYERED		= 0x200000000
 };
 
 class RenderWindow;
@@ -112,7 +118,7 @@ public:
 public:
 	BFWindow*				mParent;
 	Array<BFWindow*>		mChildren;
-	int						mFlags;
+	int64					mFlags;
 	bool					mIsKeyDown[KEYCODE_MAX];
 	bool					mIsMouseDown[MOUSEBUTTON_MAX];
 	BFCoord					mMouseDownCoords[MOUSEBUTTON_MAX];
@@ -137,6 +143,8 @@ public:
 	BFWindow_MouseUp		mMouseUpFunc;
 	BFWindow_MouseWheel		mMouseWheelFunc;
 	BFWindow_MouseLeave		mMouseLeaveFunc;
+	BFWindow_MouseDelta		mMouseDeltaFunc;
+	BFWindow_RelativeMouseModeAbortedFunc mRelativeMouseModeAbortedFunc;
 	BFWindow_MenuItemSelectedFunc mMenuItemSelectedFunc;
 	BFWindow_DragDropFileFunc mDragDropFileFunc;
 
@@ -160,8 +168,21 @@ public:
 	virtual void			SetNonExclusiveMouseCapture() { mNonExclusiveMouseCapture = true; }
 	virtual void			CaptureMouse() {}
 	virtual bool			IsMouseCaptured() { return false; }
+	// Hides the cursor, restricts it to this window, and delivers raw movement as
+	// BFWindow_MouseDelta instead of BFWindow_MouseMove -- for a mouselook-style camera that
+	// shouldn't be limited by (or move) the actual screen cursor. EndRelativeMouseMode restores the
+	// cursor to wherever it was when Start was called. Also ended automatically on focus loss.
+	virtual void			StartRelativeMouseMode() {}
+	virtual void			EndRelativeMouseMode() {}
+	virtual bool			IsInRelativeMouseMode() { return false; }
+	// Covers the window's current monitor with no frame or caption, at the desktop's own display
+	// mode. Leaving restores the previous placement.
+	virtual void			SetBorderlessFullscreen(bool fullscreen) {}
+	virtual bool			IsBorderlessFullscreen() { return false; }
 	virtual void			LostFocus(BFWindow* newFocus) = 0;
 	virtual int				GetDPI() { return 0; }
+	virtual bool			CaptureClientBits(uint32* outBits, int width, int height) { return false; }
+	float					GetMonitorRefreshRate();
 
 	virtual BFMenu*			AddMenuItem(BFMenu* parent, int insertIdx, const char* text, const char* hotKey, BFSysBitmap* bitmap, bool enabled, int checkState, bool radioCheck) = 0;
 	virtual void			ModifyMenuItem(BFMenu* item, const char* text, const char* hotKey, BFSysBitmap* bitmap, bool enabled, int checkState, bool radioCheck) = 0;

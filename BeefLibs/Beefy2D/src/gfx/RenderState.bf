@@ -7,6 +7,8 @@ using Beefy.geom;
 
 namespace Beefy.gfx
 {
+	public enum StencilMode { Disabled, ShadowVolume, NotEqualZero }
+
     public enum DepthFunc
     {
         Never,
@@ -19,10 +21,38 @@ namespace Beefy.gfx
         Always
     }
 
+	// Ordinal order must match the native Topology3D enum (RenderDevice.h) exactly. PointList draws
+	// non-indexed, so a shared vertex rasterizes once rather than once per triangle.
 	public enum Topology
 	{
 		TriangleList,
-		LineList
+		LineList,
+		PointList
+	}
+
+	// Ordinal order must match the native CullMode enum (RenderDevice.h) exactly -- cast straight
+	// across, same convention as DepthFunc/Topology below.
+	public enum CullMode
+	{
+		None,
+		Front,
+		Back
+	}
+
+	// Ordinal order must match the native FrontFace enum (RenderDevice.h) exactly.
+	public enum FrontFace
+	{
+		Clockwise,
+		CounterClockwise
+	}
+
+	// Ordinal order must match the native SamplerKind enum (RenderDevice.h) exactly. Nearest always
+	// clamps -- there's no "nearest + wrap" combination in use.
+	public enum SamplerKind
+	{
+		Wrap,
+		Clamp,
+		Nearest
 	}
 
 #if !STUDIO_CLIENT
@@ -38,7 +68,7 @@ namespace Beefy.gfx
         static extern void RenderState_SetClip(void* renderState, float x, float y, float width, float height);
 
 		[CallingConvention(.Stdcall), CLink]
-		static extern void RenderState_SetTexWrap(void* renderState, bool texWrap);
+		static extern void RenderState_SetSamplerKind(void* renderState, int32 samplerKind);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void RenderState_SetWireframe(void* renderState, bool wireframe);
@@ -52,11 +82,32 @@ namespace Beefy.gfx
         [CallingConvention(.Stdcall), CLink]
         static extern void RenderState_SetDepthFunc(void* nativeRenderState, int32 depthFunc);
 
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetStencilMode(void* nativeRenderState, int32 mode);
+
         [CallingConvention(.Stdcall), CLink]
         static extern void RenderState_SetDepthWrite(void* nativeRenderState, int32 depthWrite);
 
 		[CallingConvention(.Stdcall), CLink]
 		static extern void RenderState_SetTopology(void* nativeRenderState, int32 topology);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetCullMode(void* nativeRenderState, int32 cullMode);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetFrontFace(void* nativeRenderState, int32 frontFace);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetDisablePixelShader(void* nativeRenderState, bool disable);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetDisableRenderTarget(void* nativeRenderState, bool disable);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetDisableBlend(void* nativeRenderState, bool disable);
+
+		[CallingConvention(.Stdcall), CLink]
+		static extern void RenderState_SetAlphaToCoverage(void* nativeRenderState, bool enabled);
 
         public void* mNativeRenderState;
         public bool mIsFromDefaultRenderState;
@@ -98,6 +149,11 @@ namespace Beefy.gfx
             }
         }
 
+		public StencilMode StencilMode
+		{
+			set { RenderState_SetStencilMode(mNativeRenderState, (int32)value); }
+		}
+
         public bool DepthWrite
         {
             set
@@ -120,11 +176,20 @@ namespace Beefy.gfx
             }
         }
 
+		public SamplerKind SamplerKind
+		{
+			set
+			{
+				RenderState_SetSamplerKind(mNativeRenderState, (int32)value);
+			}
+		}
+
+		// Kept for existing call sites; remaps onto SamplerKind (Wrap or Clamp -- never Nearest).
 		public bool TexWrap
 		{
 			set
 			{
-				RenderState_SetTexWrap(mNativeRenderState, value);
+				SamplerKind = value ? .Wrap : .Clamp;
 			}
 		}
 
@@ -141,6 +206,62 @@ namespace Beefy.gfx
 			set
 			{
 				RenderState_SetTopology(mNativeRenderState, (.)value);
+			}
+		}
+
+		public CullMode CullMode
+		{
+			set
+			{
+				RenderState_SetCullMode(mNativeRenderState, (.)value);
+			}
+		}
+
+		public FrontFace FrontFace
+		{
+			set
+			{
+				RenderState_SetFrontFace(mNativeRenderState, (.)value);
+			}
+		}
+
+		// Depth-only passes: skips running the pixel shader stage entirely (binds a NULL PS).
+		public bool DisablePixelShader
+		{
+			set
+			{
+				RenderState_SetDisablePixelShader(mNativeRenderState, value);
+			}
+		}
+
+		// Skips binding any color render target (keeps only the depth-stencil view bound), so
+		// nothing writes to color regardless of what the pixel shader -- if any is still running --
+		// would have produced.
+		public bool DisableRenderTarget
+		{
+			set
+			{
+				RenderState_SetDisableRenderTarget(mNativeRenderState, value);
+			}
+		}
+
+		// Overwrites the target instead of the default premultiplied-alpha blend -- for data render
+		// targets whose alpha channel carries payload rather than coverage.
+		public bool DisableBlend
+		{
+			set
+			{
+				RenderState_SetDisableBlend(mNativeRenderState, value);
+			}
+		}
+
+		// Output alpha becomes the MSAA coverage mask (no color blending) -- cutout edges resolve
+		// with fractional coverage instead of a hard per-pixel clip.
+		public bool AlphaToCoverage
+		{
+			set
+			{
+				RenderState_SetAlphaToCoverage(mNativeRenderState, value);
 			}
 		}
     }

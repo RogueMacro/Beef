@@ -193,7 +193,7 @@ namespace IDE
 
         public static int64 GetLastModifiedTime(String filePath)
         {
-            DateTime dt = File.GetLastWriteTime(filePath);
+            DateTime dt = File.GetLastWriteTime(filePath).GetValueOrDefault();
             //return dt.ToFileTime();
 
 			//ThrowUnimplemented();
@@ -403,6 +403,7 @@ namespace IDE
 			int chevronDepth = 0;
 			int parenDepth = 0;
 			bool hadParen = false;
+			bool foundFunctionName = false;
 
 			int lastTopStart = -1;
 			int lastTopEnd = -1;
@@ -589,6 +590,7 @@ namespace IDE
 						foundOpenParen = true;
 						if (lastTopStart != -1)
 						{
+							foundFunctionName = true;
 							char8* insertChars = label.CStr() + lastTopStart;
 							uint32 color = SourceEditWidgetContent.sTextColors[(int32)SourceElementType.Method];
 							*(uint32*)(insertChars + 1) = (color >> 1) & 0x7F7F7F7F;
@@ -608,6 +610,7 @@ namespace IDE
 							}
 							if (checkIdx >= 0)
 							{
+								foundFunctionName = true;
 		                        InsertColorChange(label, checkIdx, SourceEditWidgetContent.sTextColors[(int32)SourceElementType.Method]);
 								i += 5;
 							}
@@ -651,6 +654,15 @@ namespace IDE
 					chevronDepth--;
 			}
 
+			if (!foundFunctionName)
+			{
+				if (prevStart != -1)
+				{
+					InsertColorChange(label, prevStart, SourceEditWidgetContent.sTextColors[(int32)SourceElementType.Method]);
+					prevStart = label.Length;
+				}
+			}
+
 			if ((prevStart != -1) &&
 				((codeKind == .Type) || (!hadParen)))
 			{
@@ -659,6 +671,12 @@ namespace IDE
 				if (codeKind == .Callstack)
 					label.Append('\x02');
 			}
+		}
+
+		public static bool IsHexDigit(char8 c)
+		{
+			char8 lower = (char8)((uint8)c | 0x20);
+			return ((c >= '0') && (c <= '9')) || ((lower >= 'a') && (lower <= 'f'));
 		}
 
 		static String sHexUpperChars = "0123456789ABCDEF";
@@ -679,18 +697,284 @@ namespace IDE
 			}
 		}
 
-		public static void URLDecode(StringView inStr, String outStr)
+		/// Appends decoded bytes. On error, callers must discard any partial output.
+		public static Result<void> URLDecode(StringView inStr, String outStr)
 		{
-			for (int i < inStr.Length)
+			for (int i = 0; i < inStr.Length; i++)
 			{
 				char8 c = inStr[i];
-				if ((c == '%') && (i < inStr.Length-2))
+				if (c == '%')
 				{
-					c = (.)int32.Parse(inStr.Substring(i+1, 2), .HexNumber).GetValueOrDefault();
+					if (i + 2 >= inStr.Length)
+						return .Err;
+					let hi = Try!(BitConverter.FromHex(inStr[i + 1]));
+					let lo = Try!(BitConverter.FromHex(inStr[i + 2]));
+					c = (.)((hi << 4) | lo);
 					i += 2;
 				}
 				outStr.Append(c);
 			}
+			return .Ok;
+		}
+
+		/// Normalizes a project subfolder in place: forward slashes, no empty or "." components, no leading
+		/// or trailing slash. Rejects anything that could escape the clone or fail on some platform.
+		public static bool NormalizeGitProjectSubPath(String path)
+		{
+			// Apply Windows filename restrictions on every platform for portable dependencies.
+			const String windowsReservedFileNameChars = ":*?\"<>|";
+
+			path.Replace("\\", "/");
+			String normalizedPath = scope .();
+			for (let part in path.Split('/'))
+			{
+				if ((part.IsEmpty) || (part == "."))
+					continue;
+				if ((part.EndsWith('.')) || (part.EndsWith(' ')))
+					return false;
+				for (let c in part.RawChars)
+				{
+					// Reject ASCII control bytes (including NUL) and DEL.
+					if ((c <= '\x1f') || (c == '\x7f'))
+						return false;
+					if (windowsReservedFileNameChars.Contains(c))
+						return false;
+				}
+
+				if (!normalizedPath.IsEmpty)
+					normalizedPath.Append('/');
+				normalizedPath.Append(part);
+			}
+
+			path.Set(normalizedPath);
+			return true;
+		}
+
+		/// Splits "https://host/repo.git?path=/libraryA" into the repository URL handed to Git and the
+		/// normalized project subfolder ("libraryA", empty for the root). Only the 'path' parameter is
+		/// consumed; other query parameters stay in the repository URL. Fragments and duplicate 'path'
+		/// parameters are rejected. On failure the outputs may hold partial text and must be discarded.
+		public static bool ParseGitProjectURL(StringView url, String outRepoURL, String outProjectPath)
+		{
+			outRepoURL.Clear();
+			outProjectPath.Clear();
+
+			if ((url.IsEmpty) || (url.Contains('#')))
+				return false;
+
+			int queryIdx = url.IndexOf('?');
+			if (queryIdx == -1)
+			{
+				outRepoURL.Append(url);
+				return true;
+			}
+
+			if (queryIdx == 0)
+				return false;
+			outRepoURL.Append(url.Substring(0, queryIdx));
+			StringView query = url.Substring(queryIdx + 1);
+			bool wroteParam = false;
+			bool foundPath = false;
+
+			for (let param in query.Split('&'))
+			{
+				if (param.IsEmpty)
+					continue;
+
+				StringView key = param;
+				StringView value = default;
+				int equalsIdx = param.IndexOf('=');
+				if (equalsIdx != -1)
+				{
+					key = param.Substring(0, equalsIdx);
+					value = param.Substring(equalsIdx + 1);
+				}
+
+				if (key == "path")
+				{
+					if ((foundPath) || (equalsIdx == -1))
+						return false;
+					foundPath = true;
+					if (URLDecode(value, outProjectPath) case .Err)
+						return false;
+				}
+				else
+				{
+					outRepoURL.Append(wroteParam ? '&' : '?');
+					outRepoURL.Append(param);
+					wroteParam = true;
+				}
+			}
+
+			return NormalizeGitProjectSubPath(outProjectPath);
+		}
+
+		/// Default project name for a dependency: the selected subfolder's name, or the repository name for the root.
+		public static void GetGitProjectName(StringView repoURL, StringView projectSubPath, String outName)
+		{
+			outName.Clear();
+
+			if (!projectSubPath.IsEmpty)
+				Path.GetFileName(projectSubPath, outName);
+			else
+			{
+				String repoName = scope .(repoURL);
+				int queryIdx = repoName.IndexOf('?');
+				if (queryIdx != -1)
+					repoName.RemoveToEnd(queryIdx);
+				while (repoName.EndsWith('/'))
+					repoName.RemoveFromEnd(1);
+				Path.GetFileName(repoName, outName);
+			}
+		}
+
+		public static Result<int> Execute(StringView path, StringView args, String outText = null, String outError = null)
+		{
+			var outText;
+			if (outText == null)
+				outText = scope:: .();
+
+			ProcessStartInfo procInfo = scope ProcessStartInfo();
+			procInfo.UseShellExecute = false;
+			procInfo.RedirectStandardError = true;
+			procInfo.RedirectStandardOutput = true;
+			procInfo.SetFileName(path);
+			procInfo.CreateNoWindow = true;
+			if (!args.IsEmpty)
+				procInfo.SetArguments(args);
+
+			SpawnedProcess process = scope SpawnedProcess();
+			if (process.Start(procInfo) case .Err)
+				return .Err;
+
+			FileStream fileStream = scope FileStream();
+			process.AttachStandardError(fileStream);
+			StreamReader streamReader = scope StreamReader(fileStream, null, false, 4096);
+			if (outText != null)
+				streamReader.ReadToEnd(outText).IgnoreError();
+
+			FileStream fileStreamOut = scope FileStream();
+			process.AttachStandardOutput(fileStreamOut);
+			StreamReader streamReaderOut = scope StreamReader(fileStreamOut, null, false, 4096);
+			if ((outError ?? outText) != null)
+				streamReaderOut.ReadToEnd(outError ?? outText).IgnoreError();
+
+			return .Ok(process.ExitCode);
+		}
+
+		public static void WSLPathFix(String str)
+		{
+			for (int i = 1; i < str.Length - 1; i++)
+			{
+				if (str[i] == ':')
+				{
+					if (str[i - 1].IsLetter)
+					{
+						int j = i;
+						for ( ; j < str.Length; j++)
+						{
+							char8 cj = str[j];
+							if (cj == '\\')
+								str[j] = '/';
+							if ((cj.IsWhiteSpace) || (cj == '"'))
+								break;
+						}
+
+						str.Remove(i);
+						str[i - 1] = str[i - 1].ToLower;
+						str.Insert(i - 1, "/mnt/");
+					}
+				}
+			}
+		}
+
+		public static bool IsLinuxPath(StringView path)
+		{
+			return (path.StartsWith('/')) || (path.StartsWith('~'));
+		}
+
+		public static Result<void> WSLCopy(StringView fromPath, StringView toPath)
+		{
+			var fromPath;
+			var toPath;
+
+			if (!IsLinuxPath(fromPath))
+				fromPath = WSLPathFix(.. scope:: .(fromPath));
+			if (!IsLinuxPath(toPath))
+				toPath = WSLPathFix(.. scope:: .(toPath));
+
+			switch (Execute("wsl.exe", scope $"cp {fromPath} {toPath}"))
+			{
+			case .Err(let err):
+				return .Err;
+			case .Ok:
+				return .Ok;
+			}
+		}
+
+		static Result<bool> IsBinaryData(Span<uint8> data)
+		{
+			int len = data.Length;
+			if (len == 0)
+				return false; // Empty file - treat as text
+
+			uint8* ptr = data.Ptr;
+
+			// A recognized text byte-order mark means the file is text, even if it contains NUL
+			//  bytes (as UTF-16/UTF-32 encodings do)
+			if ((len >= 3) && (ptr[0] == 0xEF) && (ptr[1] == 0xBB) && (ptr[2] == 0xBF))
+				return false; // UTF-8 BOM
+			if ((len >= 4) && (ptr[0] == 0xFF) && (ptr[1] == 0xFE) && (ptr[2] == 0x00) && (ptr[3] == 0x00))
+				return false; // UTF-32 LE BOM
+			if ((len >= 4) && (ptr[0] == 0x00) && (ptr[1] == 0x00) && (ptr[2] == 0xFE) && (ptr[3] == 0xFF))
+				return false; // UTF-32 BE BOM
+			if ((len >= 2) && (ptr[0] == 0xFF) && (ptr[1] == 0xFE))
+				return false; // UTF-16 LE BOM
+			if ((len >= 2) && (ptr[0] == 0xFE) && (ptr[1] == 0xFF))
+				return false; // UTF-16 BE BOM
+
+			int suspiciousCount = 0;
+			for (int i = 0; i < len; i++)
+			{
+				uint8 b = ptr[i];
+
+				// A NUL byte is a strong, reliable indicator of binary content
+				if (b == 0)
+					return true;
+
+				// Count control characters that essentially never occur in text files.
+				//  Common text controls (tab, LF, VT, FF, CR) are excluded.
+				if (b < 0x20)
+				{
+					switch (b)
+					{
+					case 0x09, 0x0A, 0x0B, 0x0C, 0x0D: // tab, LF, VT, FF, CR
+					default:
+						suspiciousCount++;
+					}
+				}
+			}
+
+			// Be conservative: only report binary if a substantial fraction of the sample
+			//  consists of unexpected control characters. (High bytes >= 0x80 are NOT counted,
+			//  since they legitimately appear in UTF-8 and other extended text encodings.)
+			if (suspiciousCount * 100 / len > 10)
+				return true;
+
+			return false;
+		}
+
+		public static Result<bool> IsBinaryFile(StringView path)
+		{
+			UnbufferedFileStream fs = scope UnbufferedFileStream();
+			Try!(fs.Open(path, .Read, .ReadWrite));
+
+			uint8[4096] testChunk = ?;
+			if (fs.TryRead(testChunk) case .Ok(let readSize))
+			{
+				return IsBinaryData(.(&testChunk, readSize));
+			}
+			return .Err;
 		}
     }
 }

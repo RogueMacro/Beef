@@ -90,6 +90,7 @@ enum CeOp : int16
 	CeOp_MemSet,
 	CeOp_MemSet_Const,
 	CeOp_MemCpy,
+	CeOp_MemCmp,
 
 	CeOp_FrameAddr_32,
 	CeOp_FrameAddr_64,
@@ -190,6 +191,7 @@ enum CeOp : int16
 	CEOP_SIZED_FLOAT(Cosh),
 	CEOP_SIZED_FLOAT(Exp),
 	CEOP_SIZED_FLOAT(Floor),
+	CEOP_SIZED_FLOAT(Fma),
 	CEOP_SIZED_FLOAT(Log),
 	CEOP_SIZED_FLOAT(Log10),
 	CEOP_SIZED_FLOAT(Pow),
@@ -435,6 +437,7 @@ enum CeFunctionKind
 	CeFunctionKind_GetReflectNextTypeDecl,
 	CeFunctionKind_GetBaseType,
 	CeFunctionKind_HasDeclaredMember,
+	CeFunctionKind_Type_GetMethodDeclarationText,
 	CeFunctionKind_GetReflectType,
 	CeFunctionKind_GetReflectTypeById,
 	CeFunctionKind_GetWrappedType,
@@ -469,6 +472,8 @@ enum CeFunctionKind
 	CeFunctionKind_EmitMethodExit,
 	CeFunctionKind_EmitMixin,
 	CeFunctionKind_GetStringById,
+	CeFunctionKind_GetIdByString,
+	CeFunctionKind_Output,
 
 	CeFunctionKind_BfpDirectory_Create,
 	CeFunctionKind_BfpDirectory_Rename,
@@ -516,6 +521,8 @@ enum CeFunctionKind
 	CeFunctionKind_BfpSpawn_WaitFor,
 
 	CeFunctionKind_BfpSystem_GetTimeStamp,
+	CeFunctionKind_BfpSystem_GetEnvironmentVariable,
+	CeFunctionKind_BfpSystem_SetEnvironmentVariable,
 	CeFunctionKind_Sleep,
 
 	CeFunctionKind_Char32_ToLower,
@@ -530,6 +537,10 @@ enum CeFunctionKind
 	CeFunctionKind_Double_Ftoa,
 	CeFunctionKind_Double_ToString,
 	CeFunctionKind_Float_ToString,
+	CeFunctionKind_Double_ToString_RoundTripFast,
+	CeFunctionKind_Float_ToString_RoundTripFast,
+	CeFunctionKind_Double_Parse,
+	CeFunctionKind_Float_Parse,
 
 	CeFunctionKind_Math_Abs,
 	CeFunctionKind_Math_Acos,
@@ -868,6 +879,7 @@ public:
 	CeBuilder()
 	{
 		mParentBuilder = NULL;
+		mIntPtrType = NULL;
 		mPtrSize = 0;
 		mRecursiveDepth = -1;
 		mCeFunction = NULL;
@@ -1256,6 +1268,7 @@ public:
 	int mRevision;
 	int mMethodBindRevision;
 	int mRevisionExecuteTime;
+	int mExecuteTimerDepth;
 	int mCurFunctionId;
 	int mExecuteId;
 	int mCurRecursiveDepth;

@@ -28,6 +28,10 @@ namespace IDE.Util
 			}
 
 			bool hasLinux = false;
+			// "none" may be the vendor (aarch64-none-linux-android) as well as the OS of a
+			// bare-metal triple (thumbv7em-none-eabi), so it names the platform only when no other
+			// part of the triple does.
+			bool hasNone = false;
 
 			for (let elem in str.Split('-'))
 			{
@@ -47,11 +51,15 @@ namespace IDE.Util
 				case "wasm32",
 					 "wasm64":
 					return .Wasm;
+				case "none":
+					hasNone = true;
 				}
 			}
 
 			if (hasLinux)
 				return .Linux;
+			if (hasNone)
+				return .None;
 			return .Unknown;
 		}
 	}

@@ -5,6 +5,13 @@
 #include "BFWindow.h"
 #include "util/Dictionary.h"
 
+//#define BF_FORCE_SDL
+
+#ifdef BF_FORCE_SDL
+
+#include "../sdl/SdlBFApp.h"
+
+#else
 
 NS_BF_BEGIN;
 
@@ -48,6 +55,9 @@ public:
 	int						mMinWidth;
 	int						mMinHeight;
 	bool					mMouseVisible;
+	bool					mRelativeMouseMode;
+	bool					mRelativeMouseModeWanted; // Start was called but establishing deferred until we're genuinely foreground (see StartRelativeMouseMode)
+	POINT					mSavedCursorPos; // where the real cursor was when relative mode started
 	bool					mHasFocus;
 	bool					mSoftHasFocus; // Mostly tracks mHasFocus except for when we get an explicit 'LostFocus' callback
 	bool					mAwaitKeyReleases;
@@ -56,6 +66,9 @@ public:
 	DWORD					mFocusLostTick;
 	bool					mNeedsStateReset;
 	bool					mKeyLayoutHasAltGr;
+	bool					mBorderlessFullscreen;
+	LONG					mWindowedStyle; // GWL_STYLE to restore when leaving borderless fullscreen
+	WINDOWPLACEMENT			mWindowedPlacement;
 
 public:
 	virtual LRESULT WindowProc(HWND hWnd, UINT Msg, WPARAM wParam, LPARAM lParam);
@@ -63,9 +76,11 @@ public:
 	void					RehupMouseOver(bool isMouseOver);
 	bool					CheckKeyReleases(bool isKeyDown);
 	void					GotFocus();
+	void					TryStartRelativeMouseModeIfWanted();
+	void					PinCursorToCenter();
 
 public:
-	WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int windowFlags);
+	WinBFWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int64 windowFlags);
 	~WinBFWindow();
 
 	virtual void*			GetUnderlying() override;
@@ -84,7 +99,13 @@ public:
 	virtual void			SetAlpha(float alpha, uint32 destAlphaSrcMask, bool isMouseVisible) override;
 	virtual void			CaptureMouse() override;
 	virtual bool			IsMouseCaptured() override;
+	virtual void			StartRelativeMouseMode() override;
+	virtual void			EndRelativeMouseMode() override;
+	virtual bool			IsInRelativeMouseMode() override;
+	virtual void			SetBorderlessFullscreen(bool fullscreen) override;
+	virtual bool			IsBorderlessFullscreen() override { return mBorderlessFullscreen; }
 	virtual int				GetDPI() override; // { return ::GetDpiForWindow(mHWnd); }
+	virtual bool			CaptureClientBits(uint32* outBits, int width, int height) override;
 
 	virtual BFMenu*			AddMenuItem(BFMenu* parent, int insertIdx, const char* text, const char* hotKey, BFSysBitmap* bitmap, bool enabled, int checkState, bool radioCheck) override;
 	virtual void			ModifyMenuItem(BFMenu* item, const char* text, const char* hotKey, BFSysBitmap* bitmap, bool enabled, int checkState, bool radioCheck) override;
@@ -96,11 +117,16 @@ class WinBFApp : public BFApp
 {
 public:
 	bool					mInMsgProc;
+	// When the main loop last finished a Process (the WM_TIMER fallback only runs frames once it's stalled).
+	uint32					mLastLoopProcessTick;
+	// A WM_TIMER frame is running inside a modal loop, which owns the message queue: no pumping of our own.
+	bool					mInTimerProcess;
 	StringToUIntMap			mClipboardFormatMap;
 	DSoundManager*			mDSoundManager;
 	DInputManager*			mDInputManager;
 	BfpThreadId				mVSyncThreadId;
 	BfpThread*				mVSyncThread;
+	HANDLE					mExternalPacingEvent;
 	volatile bool			mClosing;
 
 protected:
@@ -119,11 +145,12 @@ public:
 	virtual void			Init() override;
 	virtual void			Run() override;
 	virtual void			Process() override;
+	virtual void			PumpMessages() override;
 
 	virtual void			GetDesktopResolution(int& width, int& height) override;
 	virtual void			GetWorkspaceRect(int& x, int& y, int& width, int& height) override;
 	virtual void			GetWorkspaceRectFrom(int fromX, int fromY, int fromWidth, int fromHeight, int& outX, int& outY, int& outWidth, int& outHeight) override;
-	virtual BFWindow*		CreateNewWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int windowFlags) override;
+	virtual BFWindow*		CreateNewWindow(BFWindow* parent, const StringImpl& title, int x, int y, int width, int height, int64 windowFlags) override;
 	virtual DrawLayer*		CreateDrawLayer(BFWindow* window);
 
 	virtual void*			GetClipboardData(const StringImpl& format, int* size) override;
@@ -134,6 +161,9 @@ public:
 	virtual String			EnumerateInputDevices() override;
 	virtual BFInputDevice*	CreateInputDevice(const StringImpl& guid) override;
 
+	virtual void			SetExternalPacing(const char* eventName) override;
+	virtual bool			WaitForExternalPacing(int timeoutMS) override;
+
 	virtual BFSysBitmap*	LoadSysBitmap(const WCHAR* fileName) override;
 
 	virtual BFSoundManager* GetSoundManager() override;
@@ -142,3 +172,5 @@ public:
 };
 
 NS_BF_END;
+
+#endif

@@ -51,12 +51,29 @@ public:
 	float mBoneWeights[MODEL_MAX_BONE_WEIGHTS];
 };
 
+// One vertex's four heaviest influences in the GPU vertex's packed form: four uint8 joint indices
+// little-endian in outIdx, four uint16 unorm weights summing to exactly 65535 in outWeights, both
+// sorted heaviest first (the shader's guard reads the first weight). Returns the fraction of weight
+// truncation dropped. Shared by the batched mesh build and the native per-draw path so the two can
+// never disagree about packing.
+float ModelPackBoneData(const ModelVertex& vtx, uint32* outIdx, uint64* outWeights);
+
 class ModelJoint
 {
 public:
 	String mName;
 	int mParentIdx;
 	Matrix4 mPoseInvMatrix;
+	ModelJointTranslation mBindPoseLocal;
+
+public:
+	ModelJoint()
+	{
+		mParentIdx = -1;
+		mBindPoseLocal.mTrans = Vector3(0, 0, 0);
+		mBindPoseLocal.mScale = Vector3(1, 1, 1);
+		mBindPoseLocal.mQuat = Quaternion(0, 0, 0, 1);
+	}
 };
 
 class ModelMetalicRoughness
@@ -138,7 +155,23 @@ public:
 	Array<ModelVertex> mVertices;
 	Array<uint16> mIndices;
 	ModelMaterialInstance* mMaterial;
-	Array<String> mTexPaths;	
+	Array<String> mTexPaths;
+	Array<String> mTexRoles;
+	// The source file's material name for this primitive (empty when it had none).
+	String mMaterialName;
+	bool mHasSurfaceMaterial = false;
+	bool mTwoSided = false;
+	// Alpha-blended: a glTF BLEND material, or an FBX whose opacity is below 1.
+	bool mTransparent = false;
+	// Above 0, the alpha below which a pixel is discarded (a glTF MASK material's alphaCutoff).
+	float mAlphaCutoff = 0;
+	float mRoughness = 0.6f;
+	float mMetallic = 0.0f;
+	Vector3 mEmissive = Vector3(0, 0, 0);
+	// Engine-injected textures (see ModelDef_SetTexture), used in place of path loading when the
+	// def's mExternalTextures is set. Borrowed pointers -- the injector keeps them alive; instances
+	// AddRef what they copy.
+	Array<Texture*> mExtTextures;
 	Flags mFlags;
 
 public:
@@ -147,6 +180,10 @@ public:
 		mMaterial = NULL;
 		mFlags = Flags_None;
 	}
+
+	// Tangents from each triangle's UV gradient, for a normal map on a file that carries none. A vertex
+	// whose UVs are degenerate keeps a zero tangent.
+	void GenerateTangents();
 };
 
 class ModelMesh
@@ -216,14 +253,25 @@ public:
 
 public:
 	String mLoadDir;
-	float mFrameRate;	
+	float mFrameRate;
 	Array<ModelMesh> mMeshes;
 	Array<ModelJoint> mJoints;
+	// World transform of whatever sits above the root joint(s) in the FBX node hierarchy (typically the
+	// armature object). Root ModelJoints only carry their transform relative to that node, not world
+	// space -- DXModelInstance::CommandQueued left-multiplies root joints by this so the skinned result
+	// lands in the same (world-space-aware) space ModelJoint::mPoseInvMatrix expects.
+	Matrix4 mArmatureToWorld;
 	Array<ModelAnimation> mAnims;
 	Array<ModelNode> mNodes;
 	Array<ModelMaterialInstance> mMaterials;
+	// Image files stored inside the model file itself (a .glb's binary chunk), still encoded. A texture
+	// path "*N" names entry N.
+	Array<Array<uint8> > mEmbeddedImages;
 	
 	Flags mFlags;
+	// When set, render instances never load textures from mTexPaths -- they use the injected
+	// per-primitive mExtTextures instead.
+	bool mExternalTextures;
 	AABB mBounds;
 	Array<ModelBVNode> mBVNodes;
 	Array<uint16> mBVIndices;
@@ -240,6 +288,10 @@ public:
 
 	void Compact();
 	void GetBounds(Vector3& min, Vector3& max);
+	// Exact AABB of the verts skinned through the given palette (the SetJointMatrices matrices);
+	// unweighted verts pass through. Raw skinned vert data isn't model-space, so this is the only
+	// correct bounds for a skinned model.
+	void GetPosedBounds(const Matrix4* jointMatrices, int jointCount, Vector3& min, Vector3& max);
 
 	void GenerateCollisionData();
 	bool RayIntersect(const Matrix4& worldMtx, const Vector3& origin, const Vector3& vec, Vector3& outIntersect, float& outDistance);

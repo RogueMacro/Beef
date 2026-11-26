@@ -5,6 +5,19 @@
 
 USING_NS_BF;
 
+// A struct const value is identified by its bytes (which is how BfVariant compares them) - its mInt64 is the heap
+//  address of those bytes, which differs every build. Two letters per byte, so the length is fixed for a given type
+static void MangleConstStructData(StringImpl& name, const BfVariant& value)
+{
+	auto structData = (BfVariant::StructData*)value.mPtr;
+	for (int i = 0; i < structData->mSize; i++)
+	{
+		uint8 byte = structData->mData[i];
+		name += (char)('A' + (byte >> 4));
+		name += (char)('A' + (byte & 0xF));
+	}
+}
+
 int BfGNUMangler::ParseSubIdx(StringImpl& name, int strIdx)
 {
 	const char* charPtr = name.c_str() + strIdx + 1;
@@ -663,29 +676,37 @@ void BfGNUMangler::Mangle(MangleContext& mangleContext, StringImpl& name, BfType
 
 		name += "$0";
 
-		if (val < 0)
+		if (constExprValueType->mValue.mTypeCode == BfTypeCode_Struct)
 		{
-			name += "?";
-			val = -val;
-		}
-		if ((val >= 1) && (val < 10))
-		{
-			name += (char)('0' + val - 1);
+			MangleConstStructData(name, constExprValueType->mValue);
+			name += '`';
 		}
 		else
 		{
-			char str[64];
-			char* strP = str + 63;
-			*strP = 0;
-
-			while (val > 0)
+			if (val < 0)
 			{
-				*(--strP) = (char)((val % 0x10) + 'A');
-				val /= 0x10;
+				name += "?";
+				val = -val;
 			}
+			if ((val >= 1) && (val < 10))
+			{
+				name += (char)('0' + val - 1);
+			}
+			else
+			{
+				char str[64];
+				char* strP = str + 63;
+				*strP = 0;
 
-			name += strP;
-			name += '`';
+				while (val > 0)
+				{
+					*(--strP) = (char)((val % 0x10) + 'A');
+					val /= 0x10;
+				}
+
+				name += strP;
+				name += '`';
+			}
 		}
 
 		if (constExprValueType->mValue.mTypeCode == BfTypeCode_Let)
@@ -838,6 +859,59 @@ String BfGNUMangler::Mangle(BfMethodInstance* methodInst)
 				break;
 			case BfBinaryOp_As:
 				methodName = "2as";
+				break;
+			case BfBinaryOp_Compare:
+				methodName = "ss";
+				break;
+			default: break;
+			}
+
+			// The assignment operators, which otherwise mangle to an empty name and rely on the
+			// method index to tell 'operator+=' from 'operator-=' - which the debug info does not,
+			// so LLVM's verifier rejects the module
+			switch (operatorDef->mOperatorDeclaration->mAssignOp)
+			{
+			case BfAssignmentOp_Assign:
+				methodName = "aS";
+				break;
+			case BfAssignmentOp_Add:
+				methodName = "pL";
+				break;
+			case BfAssignmentOp_Subtract:
+				methodName = "mI";
+				break;
+			case BfAssignmentOp_Multiply:
+				methodName = "mL";
+				break;
+			case BfAssignmentOp_OverflowAdd:
+				methodName = "opL";
+				break;
+			case BfAssignmentOp_OverflowSubtract:
+				methodName = "omI";
+				break;
+			case BfAssignmentOp_OverflowMultiply:
+				methodName = "omL";
+				break;
+			case BfAssignmentOp_Divide:
+				methodName = "dV";
+				break;
+			case BfAssignmentOp_Modulus:
+				methodName = "rM";
+				break;
+			case BfAssignmentOp_ShiftLeft:
+				methodName = "lS";
+				break;
+			case BfAssignmentOp_ShiftRight:
+				methodName = "rS";
+				break;
+			case BfAssignmentOp_BitwiseAnd:
+				methodName = "aN";
+				break;
+			case BfAssignmentOp_BitwiseOr:
+				methodName = "oR";
+				break;
+			case BfAssignmentOp_ExclusiveOr:
+				methodName = "eO";
 				break;
 			default: break;
 			}
@@ -1333,7 +1407,8 @@ bool BfMSMangler::FindOrCreateNameSub(MangleContext& mangleContext, StringImpl& 
 			if (newNameSub.mTypeInst->IsClosure())
 			{
 				auto closureType = (BfClosureType*)newNameSub.mTypeInst;
-				name += closureType->mSrcDelegate->mTypeDef->mName->mString;
+				if (closureType->mSrcDelegate->mTypeDef != NULL)
+					name += closureType->mSrcDelegate->mTypeDef->mName->mString;
 				name += closureType->mNameAdd;
 			}
 			else
@@ -1748,7 +1823,7 @@ void BfMSMangler::Mangle(MangleContext& mangleContext, StringImpl& name, BfType*
 		if (type->IsUnknownSizedArrayType())
 		{
 			auto arrType = (BfUnknownSizedArrayType*)type;
-			name += StrFormat("arr_$", arrType->mSize);
+			name += "arr_$";
 			Mangle(mangleContext, name, arrType->mElementType);
 			name += "$";
 			Mangle(mangleContext, name, arrType->mElementCountSource);
@@ -1832,7 +1907,14 @@ void BfMSMangler::Mangle(MangleContext& mangleContext, StringImpl& name, BfType*
 			Mangle(mangleContext, name, constExprValueType->mType);
 			name += "$";
 		}
-		MangleConst(mangleContext, name, val);
+		if (constExprValueType->mValue.mTypeCode == BfTypeCode_Struct)
+		{
+			name += "$0";
+			MangleConstStructData(name, constExprValueType->mValue);
+			name += '@';
+		}
+		else
+			MangleConst(mangleContext, name, val);
 		if (constExprValueType->mValue.mTypeCode == BfTypeCode_Let)
 			name += "Undef";
 	}
@@ -2295,15 +2377,6 @@ void BfMSMangler::Mangle(StringImpl& name, bool is64Bit, BfMethodInstance* metho
 void BfMSMangler::Mangle(StringImpl& name, bool is64Bit, BfFieldInstance* fieldInstance)
 {
 	auto fieldDef = fieldInstance->GetFieldDef();
-	if (fieldDef->mFieldDeclaration != NULL)
-	{
-		auto module = fieldInstance->mOwner->mModule;
-		if ((fieldInstance->mCustomAttributes != NULL) && (fieldInstance->mCustomAttributes->Contains(module->mCompiler->mCLinkAttributeTypeDef)))
-		{
-			name += fieldDef->mName;
-			return;
-		}
-	}
 
 	BF_ASSERT(fieldDef->mIsStatic);
 	MangleContext mangleContext;
@@ -2441,6 +2514,11 @@ void BfMangler::HandleCustomAttributes(BfCustomAttributes* customAttributes, BfI
 				}
 			}
 		}
+	}
+
+	if (customAttributes->Contains(module->mCompiler->mCLinkAttributeTypeDef))
+	{
+		isCMangle = true;
 	}
 }
 

@@ -32,6 +32,166 @@ bf::System::Runtime::BfRtCallbacks gBfRtDbgCallbacks;
 BfRtFlags gBfRtDbgFlags = (BfRtFlags)0;
 #endif
 
+// An open-addressing table of object pointers (NULL is empty, 1 is a removed entry). A debugger reads
+// mEntries[0..mCapacity) while the process is stopped; callers serialize updates.
+struct BfLiveObjectTable
+{
+	void** mEntries;
+	int32 mCapacity;
+	int32 mCount;
+	int32 mUsed; // mCount plus removed entries
+};
+#define BF_LIVE_OBJECT_REMOVED ((void*)1)
+
+static uintptr BfLiveObjectHash(void* object)
+{
+	uintptr hash = (uintptr)object >> 4;
+	return hash ^ (hash >> 16) ^ (hash * 31);
+}
+
+static void BfLiveObjectInsert(void** entries, int32 capacity, void* object)
+{
+	uintptr hash = BfLiveObjectHash(object);
+	for (int32 probe = 0; probe < capacity; probe++)
+	{
+		int32 idx = (int32)((hash + probe) & (capacity - 1));
+		if ((entries[idx] == NULL) || (entries[idx] == BF_LIVE_OBJECT_REMOVED))
+		{
+			entries[idx] = object;
+			return;
+		}
+	}
+}
+
+static void BfLiveObjectTableUpdate(BfLiveObjectTable& table, void* object, bool add)
+{
+	if (add)
+	{
+		if ((table.mUsed + 1) * 2 > table.mCapacity)
+		{
+			int32 newCapacity = BF_MAX(64, table.mCapacity);
+			while ((table.mCount + 1) * 2 > newCapacity / 2)
+				newCapacity *= 2;
+			void** newEntries = (void**)calloc(newCapacity, sizeof(void*));
+			for (int32 idx = 0; idx < table.mCapacity; idx++)
+			{
+				void* entry = table.mEntries[idx];
+				if ((entry != NULL) && (entry != BF_LIVE_OBJECT_REMOVED))
+					BfLiveObjectInsert(newEntries, newCapacity, entry);
+			}
+			free(table.mEntries);
+			table.mEntries = newEntries;
+			table.mCapacity = newCapacity;
+			table.mUsed = table.mCount;
+		}
+		BfLiveObjectInsert(table.mEntries, table.mCapacity, object);
+		table.mCount++;
+		table.mUsed++;
+	}
+	else if (table.mCapacity > 0)
+	{
+		uintptr hash = BfLiveObjectHash(object);
+		for (int32 probe = 0; probe < table.mCapacity; probe++)
+		{
+			int32 idx = (int32)((hash + probe) & (table.mCapacity - 1));
+			if (table.mEntries[idx] == NULL)
+				break;
+			if (table.mEntries[idx] == object)
+			{
+				table.mEntries[idx] = BF_LIVE_OBJECT_REMOVED;
+				table.mCount--;
+				break;
+			}
+		}
+	}
+}
+
+#ifndef BF_GC_SUPPORTED
+// Live heap allocations by type ID. Without the GC's heap (which the debugger scans on Windows), this is
+// how a debugger tells whether a type is in use, and so whether a hot compile may change its layout.
+// Objects are counted from allocation to delete. Raw allocations can't be identified when freed, so
+// they're only ever counted up, which keeps their types conservatively "in use".
+#define BF_LIVE_TYPE_COUNT_MAX 0x10000
+extern "C" BFRT_EXPORT int32 gBfLiveTypeCounts[BF_LIVE_TYPE_COUNT_MAX];
+extern "C" BFRT_EXPORT int32 gBfLiveTypeCountOverflow; // Set if a type ID didn't fit - the debugger then assumes all types are in use
+int32 gBfLiveTypeCounts[BF_LIVE_TYPE_COUNT_MAX] = { 0 };
+int32 gBfLiveTypeCountOverflow = 0;
+
+static void BfCountLiveType(int32 typeId, int32 delta)
+{
+	if ((typeId >= 0) && (typeId < BF_LIVE_TYPE_COUNT_MAX))
+		__atomic_fetch_add(&gBfLiveTypeCounts[typeId], delta, __ATOMIC_RELAXED);
+	else
+		gBfLiveTypeCountOverflow = 1;
+}
+
+// A ClassVData starts with its type ID
+static int32 BfGetClassVDataTypeId(bf::System::ClassVData* classVData)
+{
+	return *(int32*)classVData;
+}
+
+// Live delegate objects, so a debugger can find the methods they point to - a hot compile must treat
+// those as in use too.
+extern "C" BFRT_EXPORT BfLiveObjectTable gBfLiveDelegates;
+BfLiveObjectTable gBfLiveDelegates = { NULL, 0, 0, 0 };
+static int32 sLiveDelegatesLock = 0;
+#define BF_TYPEFLAG_DELEGATE 0x20000
+
+static bool BfIsDelegateClass(bf::System::ClassVData* classVData)
+{
+	bf::System::Type_NOFLAGS* typeData = BFRTCALLBACKS.ClassVData_GetTypeDataPtr(classVData);
+	return (typeData != NULL) && ((typeData->mTypeFlags & BF_TYPEFLAG_DELEGATE) != 0);
+}
+
+static void BfTrackLiveDelegate(void* object, bool add)
+{
+	while (__atomic_exchange_n(&sLiveDelegatesLock, 1, __ATOMIC_ACQUIRE) != 0)
+	{
+	}
+
+	BfLiveObjectTableUpdate(gBfLiveDelegates, object, add);
+
+	__atomic_store_n(&sLiveDelegatesLock, 0, __ATOMIC_RELEASE);
+}
+
+static void BfTrackAllocatedObject(bf::System::Object* object, bf::System::ClassVData* classVData)
+{
+	BfCountLiveType(BfGetClassVDataTypeId(classVData), 1);
+	if (BfIsDelegateClass(classVData))
+		BfTrackLiveDelegate(object, true);
+}
+
+static void BfTrackDeletedObject(bf::System::Object* object)
+{
+	auto classVData = (bf::System::ClassVData*)(object->mClassVData & ~(intptr)0xFF);
+	BfCountLiveType(BfGetClassVDataTypeId(classVData), -1);
+	if (BfIsDelegateClass(classVData))
+		BfTrackLiveDelegate(object, false);
+}
+#else
+// Live objects outside the GC's heaps: those from custom allocators, and from malloc when the debug
+// allocator is off. On Windows the debugger finds live objects by scanning the GC's heaps, and reads
+// these from here, so a hot compile won't change the layout of a type they still use.
+extern "C" BFRT_EXPORT BfLiveObjectTable gBfLiveNonHeapObjects;
+BfLiveObjectTable gBfLiveNonHeapObjects = { NULL, 0, 0, 0 };
+
+static Beefy::CritSect& BfGetLiveNonHeapObjectsCritSect()
+{
+	static Beefy::CritSect critSect;
+	return critSect;
+}
+
+static void BfTrackNonHeapObject(bf::System::Object* object, bool add)
+{
+	// Most programs never allocate outside the heaps, so a delete needn't take the lock then
+	if ((!add) && (gBfLiveNonHeapObjects.mCount == 0))
+		return;
+	Beefy::AutoCrit autoCrit(BfGetLiveNonHeapObjectsCritSect());
+	BfLiveObjectTableUpdate(gBfLiveNonHeapObjects, object, add);
+}
+#endif
+
 namespace bf
 {
 	namespace System
@@ -271,6 +431,8 @@ void* Internal::Dbg_GetMetadata(bf::System::Object* obj)
 intptr Internal::Dbg_PrepareStackTrace(intptr baseAllocSize, intptr maxStackTraceDepth)
 {
 	intptr allocSize = 0;
+	// Dbg_ObjectAllocatedEx/Dbg_ObjectCreatedEx follow this, so don't leave them a count from a previous allocation
+	gPendingAllocState.mStackTraceCount = 0;
 	if (maxStackTraceDepth > 1)
 	{
 		int capturedTraceCount = BF_CAPTURE_STACK(1, (intptr*)gPendingAllocState.mStackTrace, min((int)maxStackTraceDepth, 1024));
@@ -350,6 +512,7 @@ bf::System::Object* Internal::Dbg_ObjectAlloc(bf::System::ClassVData* classVData
 #endif
 
 	bf::System::Object* result;
+	bool isHeapObject = true; // In one of the GC's heaps, where the debugger finds it
 	if ((BFRTFLAGS & BfRtFlags_LeakCheck) != 0)
 	{
 		uint8* allocBytes = (uint8*)BfObjectAllocate(allocSize, classVData->mType);
@@ -359,12 +522,14 @@ bf::System::Object* Internal::Dbg_ObjectAlloc(bf::System::ClassVData* classVData
 	{
 #if BF_USE_STOMP_ALLOC
 		result = (bf::System::Object*)StompAlloc(allocSize);
+		isHeapObject = false;
 #elif BF_TRACK_SIZES
 		sHighestId = BF_MAX(sHighestId, classVData->mType->mTypeId);
 		uint8* allocPtr = (uint8*)malloc(size + 16);
 		*((int*)allocPtr) = size;
 		sAllocSizes[classVData->mType->mTypeId] += size;
 		result = (bf::System::Object*)(allocPtr + 16);
+		isHeapObject = false;
 #else
 		if ((BFRTFLAGS & BfRtFlags_DebugAlloc) != 0)
 		{			
@@ -375,6 +540,7 @@ bf::System::Object* Internal::Dbg_ObjectAlloc(bf::System::ClassVData* classVData
 		{
 			uint8* allocBytes = (uint8*)BFRTCALLBACKS.Alloc(allocSize);
 			result = (bf::System::Object*)allocBytes;
+			isHeapObject = false;
 		}		
 #endif
 	}
@@ -396,19 +562,26 @@ bf::System::Object* Internal::Dbg_ObjectAlloc(bf::System::ClassVData* classVData
 			dbgAllocInfo = (intptr)BF_RETURN_ADDRESS;
 		else
 		{
+			uint8* traceEnd;
 			if (largeAllocInfo)
 			{
 				classVDataVal |= (intptr)BfObjectFlag_AllocInfo;
 				dbgAllocInfo = size;
 				*(intptr*)((uint8*)result + size) = (capturedTraceCount << 8) | allocFlags;
 				memcpy((uint8*)result + size + sizeof(intptr), stackTrace, capturedTraceCount * sizeof(intptr));
+				traceEnd = (uint8*)result + size + sizeof(intptr) + capturedTraceCount * sizeof(intptr);
 			}
 			else
 			{
 				classVDataVal |= (intptr)BfObjectFlag_AllocInfo_Short;
 				dbgAllocInfo = (size << 16) | (((intptr)allocFlags) << 8) | capturedTraceCount;
 				memcpy((uint8*)result + size, stackTrace, capturedTraceCount * sizeof(intptr));
+				traceEnd = (uint8*)result + size + capturedTraceCount * sizeof(intptr);
 			}
+
+			// Append marking starts from an empty head AppendAllocEntry
+			if ((allocFlags & 1) != 0)
+				memset(traceEnd, 0, sizeof(intptr) * 4);
 		}		
 		result->mClassVData = classVDataVal;
 		BF_FULL_MEMORY_FENCE(); // Since we depend on mDbAllocInfo to determine if we are allocated, we need to set this last after we're set up
@@ -421,6 +594,14 @@ bf::System::Object* Internal::Dbg_ObjectAlloc(bf::System::ClassVData* classVData
 	else
 #endif
 		result->mClassVData = (intptr)classVData;
+
+#ifndef BF_GC_SUPPORTED
+	(void)isHeapObject;
+	BfTrackAllocatedObject(result, classVData);
+#else
+	if (!isHeapObject)
+		BfTrackNonHeapObject(result, true);
+#endif
 
 	//OutputDebugStrF("Object %@ ClassVData %@\n", result, classVData);
 
@@ -468,19 +649,27 @@ static void SetupDbgAllocInfo(bf::System::Object* result, intptr origSize, uint8
 		result->mDbgAllocInfo = (intptr)gPendingAllocState.mStackTrace[0];
 		return;
 	}
+	uint8* traceEnd;
 	if (gPendingAllocState.mIsLargeAlloc)
 	{
 		result->mClassVData |= (intptr)BfObjectFlag_AllocInfo;
 		result->mDbgAllocInfo = origSize;
 		*(intptr*)((uint8*)result + origSize) = (gPendingAllocState.mStackTraceCount << 8) | allocFlags;
 		memcpy((uint8*)result + origSize + sizeof(intptr), gPendingAllocState.mStackTrace, gPendingAllocState.mStackTraceCount * sizeof(intptr));
+		traceEnd = (uint8*)result + origSize + sizeof(intptr) + gPendingAllocState.mStackTraceCount * sizeof(intptr);
 	}
 	else
 	{
 		result->mClassVData |= (intptr)BfObjectFlag_AllocInfo_Short;
 		result->mDbgAllocInfo = (origSize << 16) | (((intptr)allocFlags) << 8) | gPendingAllocState.mStackTraceCount;
 		memcpy((uint8*)result + origSize, gPendingAllocState.mStackTrace, gPendingAllocState.mStackTraceCount * sizeof(intptr));
+		traceEnd = (uint8*)result + origSize + gPendingAllocState.mStackTraceCount * sizeof(intptr);
 	}
+
+	// Append marking starts from an empty head AppendAllocEntry, and a custom allocator's memory
+	//  (AllocObject in particular) isn't necessarily zeroed
+	if ((allocFlags & 1) != 0)
+		memset(traceEnd, 0, sizeof(intptr) * 4);
 #endif
 }
 
@@ -491,6 +680,11 @@ void Internal::Dbg_ObjectCreated(bf::System::Object* result, intptr size, bf::Sy
 	BF_ASSERT_REL((result->mClassVData & ~(BfObjectFlag_Allocated | BfObjectFlag_Mark3)) == (intptr)classVData);
 	result->mDbgAllocInfo = (intptr)BF_RETURN_ADDRESS;
 #endif
+#ifndef BF_GC_SUPPORTED
+	BfTrackAllocatedObject(result, classVData);
+#else
+	BfTrackNonHeapObject(result, true);
+#endif
 }
 
 void Internal::Dbg_ObjectCreatedEx(bf::System::Object* result, intptr origSize, bf::System::ClassVData* classVData, uint8 allocFlags)
@@ -500,12 +694,22 @@ void Internal::Dbg_ObjectCreatedEx(bf::System::Object* result, intptr origSize, 
 	BF_ASSERT_REL((result->mClassVData & ~(BfObjectFlag_Allocated | BfObjectFlag_Mark3)) == (intptr)classVData);
 	SetupDbgAllocInfo(result, origSize, allocFlags);
 #endif
+#ifndef BF_GC_SUPPORTED
+	BfTrackAllocatedObject(result, classVData);
+#else
+	BfTrackNonHeapObject(result, true);
+#endif
 }
 
 void Internal::Dbg_ObjectAllocated(bf::System::Object* result, intptr size, bf::System::ClassVData* classVData)
 {
 	BF_ASSERT((BFRTFLAGS & BfRtFlags_ObjectHasDebugFlags) != 0);
 	result->mClassVData = (intptr)classVData;
+#ifndef BF_GC_SUPPORTED
+	BfTrackAllocatedObject(result, classVData);
+#else
+	BfTrackNonHeapObject(result, true);
+#endif
 #ifndef BFRT_NODBGFLAGS	
 	result->mDbgAllocInfo = (intptr)BF_RETURN_ADDRESS;	
 #endif
@@ -515,6 +719,11 @@ void Internal::Dbg_ObjectAllocatedEx(bf::System::Object* result, intptr origSize
 {
 	BF_ASSERT((BFRTFLAGS & BfRtFlags_ObjectHasDebugFlags) != 0);
 	result->mClassVData = (intptr)classVData;
+#ifndef BF_GC_SUPPORTED
+	BfTrackAllocatedObject(result, classVData);
+#else
+	BfTrackNonHeapObject(result, true);
+#endif
 	SetupDbgAllocInfo(result, origSize, allocFlags);
 }
 
@@ -561,6 +770,12 @@ void Internal::Dbg_ObjectPreDelete(bf::System::Object* object)
 		return;
 	}
 #endif
+
+#ifndef BF_GC_SUPPORTED
+	BfTrackDeletedObject(object);
+#else
+	BfTrackNonHeapObject(object, false);
+#endif
 }
 
 void Internal::Dbg_ObjectPreCustomDelete(bf::System::Object* object)
@@ -587,8 +802,15 @@ void Internal::Dbg_ObjectPreCustomDelete(bf::System::Object* object)
 		errorStr += StrFormat("   (%s)0x%@\n", typeName.c_str(), object);
 		SETUP_ERROR(errorStr.c_str(), 2);
 		BF_DEBUG_BREAK();
-		BFRTCALLBACKS.DebugMessageData_Fatal();		
+		BFRTCALLBACKS.DebugMessageData_Fatal();
+		return;
 	}
+
+#ifndef BF_GC_SUPPORTED
+	BfTrackDeletedObject(object);
+#else
+	BfTrackNonHeapObject(object, false);
+#endif
 }
 
 void* Internal::Dbg_RawAlloc(intptr size, DbgRawAllocData* rawAllocData)
@@ -605,6 +827,14 @@ void* Internal::Dbg_RawAlloc(intptr size, DbgRawAllocData* rawAllocData)
 	{
 		capturedTraceCount = BF_CAPTURE_STACK(1, (intptr*)stackTrace, min(rawAllocData->mMaxStackTrace, 1024));
 	}	
+#endif
+#ifndef BF_GC_SUPPORTED
+	if (rawAllocData->mType != NULL)
+	{
+		// A Type is an object: its mSize and mTypeId follow the object header
+		intptr objectSize = ((BFRTFLAGS & BfRtFlags_ObjectHasDebugFlags) != 0) ? sizeof(intptr) * 2 : sizeof(intptr);
+		BfCountLiveType(*(int32*)((uint8*)rawAllocData->mType + objectSize + sizeof(int32)), 1);
+	}
 #endif
 	return BfRawAllocate(size, rawAllocData, stackTrace, capturedTraceCount);
 }

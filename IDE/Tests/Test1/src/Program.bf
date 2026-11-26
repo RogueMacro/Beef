@@ -9,15 +9,19 @@ namespace IDETest
 			Breakpoints.Test();
 			Breakpoints02.Test();
 			Data01.Test();
+			DuplicateLinkName.Test();
 			EnumTester.Test();
 			HotTester.Test();
 			HotSwap_BaseChange.Test();
 			HotSwap_Data.Test();
+			HotSwap_ExtensionOverride.Test();
 			HotSwap_GetUnusued.Test();
 			HotSwap_Interfaces2.Test();
 			HotSwap_Lambdas01.Test();
+			HotSwap_LiveTypes.Test();
 			HotSwap_LocateSym01.Test();
 			HotSwap_Reflection.Test();
+			HotSwap_StringLiterals.Test();
 			HotSwap_TLS.Test();
 			InlineTester.Test();
 			LambdaTester.Test();
@@ -29,11 +33,13 @@ namespace IDETest
 			Properties.Test();
 			SplatTester.Test();
 			Stepping_Scope.Test();
+			ThreadFreeze.Test();
 			TypedPrimitives.Test();
 			Unions.Test();
 			UsingFields.Test();
 			Virtuals.Test();
 			Virtuals02.Test();
+			Visualizers.Test();
 
 			Bug001.Test();
 			Bug002.Test();

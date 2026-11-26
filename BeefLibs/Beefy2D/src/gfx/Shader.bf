@@ -20,8 +20,28 @@ namespace Beefy.gfx
         public void* mNativeShader;
         public Dictionary<String, ShaderParam> mShaderParamMap;
 
+        public enum CompileFlags : int32
+        {
+            None = 0,
+            // Skip backend optimization: much faster compiles, slower shader -- for iterating.
+            // Part of the shader cache key.
+            NoOptimization = 1,
+            // Shader model 5 profiles: pixel-shader UAVs and SV_PrimitiveID.
+            ShaderModel5 = 2,
+            // The vertex stage reads only position, the instance element and the bone slots, so a
+            // mesh with a compact depth stream can feed it 24 bytes a vertex (see
+            // StaticMesh.SetDepthStream). Asserted at load: a shader that claims this and reads more
+            // fails to build the layout.
+            DepthStream = 4,
+            // Made without loading anything: Load does that later, on any thread.
+            DeferLoad = 8,
+        }
+
         [CallingConvention(.Stdcall), CLink]
-        static extern void* Gfx_LoadShader(char8* fileName, void* vertexDefinition);
+        static extern void* Gfx_LoadShader(char8* fileName, void* vertexDefinition, char8* entrySuffix, int32 shaderFlags);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern int32 Gfx_Shader_Load(void* shader);
 
         [CallingConvention(.Stdcall), CLink]
         static extern void* Gfx_Shader_Delete(void* shader);
@@ -29,13 +49,59 @@ namespace Beefy.gfx
         [CallingConvention(.Stdcall), CLink]
         static extern void* Gfx_GetShaderParam(void* shader, String paramName);
 
-        public static Shader CreateFromFile(StringView fileName, VertexDefinition vertexDefinition)
+        [CallingConvention(.Stdcall), CLink]
+        static extern char8* Gfx_GetShaderError(void* shader);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern void Gfx_AddShaderIncludeDir(char8* dir);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern int32 Gfx_RefreshShaderCache(char8* fxPath, char8* entry, char8* profile);
+
+        [CallingConvention(.Stdcall), CLink]
+        static extern int32 Gfx_CheckShaderCache(char8* fxPath, char8* entry, char8* profile, int32 shaderFlags, out int32 compileMs);
+
+        public enum CacheRefresh
         {
+            Failed = -1,
+            Current,
+            Compiled
+        }
+
+        // Safe off the main thread: compiles one program into the shader cache if its entry there is stale.
+        public static CacheRefresh RefreshCache(StringView fxPath, StringView entry, StringView profile)
+        {
+            return (.)Gfx_RefreshShaderCache(fxPath.ToScopeCStr!(), entry.ToScopeCStr!(), profile.ToScopeCStr!());
+        }
+
+        // Whether loading one program would compile it, without compiling. compileMs gets how long its last compile took,
+        // -1 when unknown. Safe off the main thread.
+        public static bool NeedsCompile(StringView fxPath, StringView entry, StringView profile, CompileFlags flags, out int32 compileMs)
+        {
+            return Gfx_CheckShaderCache(fxPath.ToScopeCStr!(), entry.ToScopeCStr!(), profile.ToScopeCStr!(), (.)flags, out compileMs) != 0;
+        }
+
+        // Registers a search directory for #include resolution (after the including file's own
+        // directory). Register before loading any shader that depends on it.
+        public static void AddIncludeDir(StringView dir)
+        {
+            Gfx_AddShaderIncludeDir(dir.ToScopeCStr!());
+        }
+
+        // entrySuffix compiles alternate entry points ("VS"+suffix / "PS"+suffix) from the same
+        // file -- how one surface-shader source yields its per-pass variants.
+        //
+        // A compile failure fills `outError` and returns null; with no `outError` it's fatal,
+        // carrying the compiler's message -- so callers that can recover (hot reload, user
+        // shaders) opt in, and everything else keeps fail-fast behavior.
+        public static Shader CreateFromFile(StringView fileName, VertexDefinition vertexDefinition, StringView entrySuffix = "", String outError = null, CompileFlags flags = .None)
+        {
+			StringView model = (((int32)flags & (int32)CompileFlags.ShaderModel5) != 0) ? "5_0" : "4_0";
 			var useFileName = scope String(fileName);
-			if (FilePackManager.TryMakeMemoryString(useFileName, ".fx_VS_vs_4_0"))
+			if (FilePackManager.TryMakeMemoryString(useFileName, scope $".fx_VS{entrySuffix}_vs_{model}"))
 			{
 				var useFileName2 = scope String(fileName);
-				if (FilePackManager.TryMakeMemoryString(useFileName2, ".fx_PS_ps_4_0"))
+				if (FilePackManager.TryMakeMemoryString(useFileName2, scope $".fx_PS{entrySuffix}_ps_{model}"))
 				{
 					useFileName.Append("\n");
 					useFileName.Append(useFileName2);
@@ -44,17 +110,40 @@ namespace Beefy.gfx
 
 			FilePackManager.TryMakeMemoryString(useFileName, ".fx");
 
-            void* aNativeShader = Gfx_LoadShader(useFileName, vertexDefinition.mNativeVertexDefinition);
+            void* aNativeShader = Gfx_LoadShader(useFileName, vertexDefinition.mNativeVertexDefinition, entrySuffix.ToScopeCStr!(), (int32)flags);
             if (aNativeShader == null)
                 return null;
 
+            char8* error = Gfx_GetShaderError(aNativeShader);
+            if (error != null)
+            {
+                if (outError != null)
+                {
+                    outError.Append(StringView(error));
+                    Gfx_Shader_Delete(aNativeShader);
+                    return null;
+                }
+                Runtime.FatalError(scope String(StringView(error)));
+            }
+
             Shader aShader = new Shader(aNativeShader);
             return aShader;
-        }        
+        }
 
         public this(void* nativeShader)
         {
-            mNativeShader = nativeShader;        
+            mNativeShader = nativeShader;
+        }
+
+        // A DeferLoad shader's load: safe off the main thread while nothing draws with it. Returns how many programs had
+        // to compile.
+        public Result<int> Load(String outError)
+        {
+            int32 compiled = Gfx_Shader_Load(mNativeShader);
+            if (compiled >= 0)
+                return compiled;
+            outError.Append(StringView(Gfx_GetShaderError(mNativeShader)));
+            return .Err;
         }
 
         public ~this()

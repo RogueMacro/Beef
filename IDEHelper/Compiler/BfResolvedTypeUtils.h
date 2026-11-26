@@ -43,7 +43,8 @@ enum BfResolveTypeRefFlags
 	BfResolveTypeRefFlag_ForceUnboundGeneric = 0x80000,
 	BfResolveTypeRefFlag_IgnoreProtection = 0x100000,
 	BfResolveTypeRefFlag_SpecializedProject = 0x200000,
-	BfResolveTypeRefFlag_GlobalLookup = 0x400000
+	BfResolveTypeRefFlag_GlobalLookup = 0x400000,
+	BfResolveTypeRefFlag_AllowDeletedTypeDef = 0x800000,
 };
 
 enum BfTypeNameFlags : uint16
@@ -91,7 +92,8 @@ enum BfGetMethodInstanceFlags : uint16
 	BfGetMethodInstanceFlag_NoInline = 0x400,
 	BfGetMethodInstanceFlag_DepthExceeded = 0x800,
 	BfGetMethodInstanceFlag_NoReference = 0x1000,
-	BfGetMethodInstanceFlag_MethodInstanceOnly = 0x2000
+	BfGetMethodInstanceFlag_MethodInstanceOnly = 0x2000,
+	BfGetMethodInstanceFlag_NeverInline = 0x4000,
 };
 
 class BfDependencyMap
@@ -513,6 +515,7 @@ class BfType
 {
 public:
 	BfTypeRebuildFlags mRebuildFlags;
+	int mActiveRevision; // Last compile revision we were populated in, had a method processed in, or added a dependency in
 
 	BfContext* mContext;
 	int mTypeId;
@@ -643,6 +646,7 @@ public:
 	virtual bool IsTypeMemberAccessible(BfTypeDef* declaringTypeDef, BfTypeDef* activeTypeDef) { return true; }
 	virtual bool IsTypeMemberAccessible(BfTypeDef* declaringTypeDef, BfProject* curProject) { return true; }
 	virtual bool IsTypeMemberAccessible(BfTypeDef* declaringTypeDef, BfProjectSet* visibleProjectSet) { return true; }
+	virtual bool HasUnderlyingArray() { return false; }
 
 	virtual void ReportMemory(MemReporter* memReporter);
 };
@@ -812,6 +816,7 @@ struct BfClosureCapturedEntry
 	BfIdentifierNode* mNameNode;
 	bool mExplicitlyByReference;
 	int mShadowIdx; // Only relative to matching nameNodes
+	int mNamePrefixCount; // The captured local's declared '@' prefixes, which mName omits
 
 	BfClosureCapturedEntry()
 	{
@@ -819,6 +824,7 @@ struct BfClosureCapturedEntry
 		mType = NULL;
 		mExplicitlyByReference = false;
 		mShadowIdx = 0;
+		mNamePrefixCount = 0;
 	}
 
 	bool operator<(const BfClosureCapturedEntry& other) const
@@ -905,7 +911,7 @@ public:
 	bool mIsClosure:1;
 	bool mMayBeConst:1; // Only used for calcAppend currently
 	bool mIsForeignMethodDef:1;
-	bool mAlwaysInline:1;
+	BfInlineKind mInlineKind : 2;
 	bool mIsIntrinsic:1;
 	bool mHasMethodRefType:1;
 	bool mDisallowCalling:1;
@@ -949,7 +955,7 @@ public:
 		mIsClosure = false;
 		mMayBeConst = true;
 		mIsForeignMethodDef = false;
-		mAlwaysInline = false;
+		mInlineKind = BfInlineKind_NotSet;
 		mIsIntrinsic = false;
 		mHasMethodRefType = false;
 		mDisallowCalling = false;
@@ -975,6 +981,7 @@ public:
 
 	~BfMethodInstance();
 	void Dispose(bool isDeleting = false);
+	void RemoveMethodFromCEMachine(BfCompiler* compiler);
 
 	void CopyFrom(BfMethodInstance* methodInstance);
 
@@ -1020,6 +1027,7 @@ public:
 	BfType* GetParamType(int paramIdx, bool returnUnderlyingParamsType = false);
 	bool GetParamIsSplat(int paramIdx);
 	BfParamKind GetParamKind(int paramIdx);
+	bool GetParamHasDefault(int paramIdx);
 	bool WasGenericParam(int paramIdx);
 	bool IsParamSkipped(int paramIdx); // void/zero-sized
 	bool IsImplicitCapture(int paramIdx);
@@ -1098,6 +1106,7 @@ class BfModuleMethodInstance
 public:
 	BfMethodInstance* mMethodInstance;
 	BfIRValue mFunc;
+	bool mNoInline = false;
 
 public:
 	BfModuleMethodInstance()
@@ -1107,7 +1116,7 @@ public:
 
 	BfModuleMethodInstance(BfMethodInstance* methodInstance);
 
-	BfModuleMethodInstance(BfMethodInstance* methodInstance, BfIRValue func) : mFunc(func)
+	BfModuleMethodInstance(BfMethodInstance* methodInstance, BfIRValue func, bool noInline = false) : mFunc(func), mNoInline(noInline)
 	{
 		mMethodInstance = methodInstance;
 	}
@@ -1383,7 +1392,7 @@ public:
 	}
 
 	BfMethodInstanceGroup(BfMethodInstanceGroup&& prev) noexcept;
-	~BfMethodInstanceGroup();
+	~BfMethodInstanceGroup();	
 
 	bool IsImplemented()
 	{
@@ -1391,6 +1400,8 @@ public:
 			(mOnDemandKind == BfMethodOnDemandKind_Referenced) ||
 			(mOnDemandKind == BfMethodOnDemandKind_InWorkList);
 	}
+
+	void RemoveMethodsFromCEMachine(BfCompiler* compiler);
 };
 
 class BfFieldInstance
@@ -1973,6 +1984,7 @@ public:
 	bool mIsUnspecialized;
 	bool mIsUnspecializedVariation;
 	bool mValidatedGenericConstraints;
+	bool mValidatingGenericConstraints; // Validation of this instance is in progress further up the stack
 	bool mHadValidateErrors;
 	bool mInitializedGenericParams;
 	bool mFinishedGenericParams;
@@ -1987,6 +1999,7 @@ public:
 		mIsUnspecialized = false;
 		mIsUnspecializedVariation = false;
 		mValidatedGenericConstraints = false;
+		mValidatingGenericConstraints = false;
 		mInitializedGenericParams = false;
 		mFinishedGenericParams = false;
 		mMaxGenericDepth = -1;
@@ -2074,6 +2087,7 @@ public:
 	bool mWantsGCMarking;
 	bool mHasDeclError;
 	bool mHasAppendWantMark;
+	bool mHadPopulate; // Set once we have completed a populate, so a repopulate can tell itself apart from a first-time populate
 
 public:
 	BfTypeInstance()
@@ -2127,6 +2141,7 @@ public:
 		mHasParameterizedBase = false;
 		mHasDeclError = false;
 		mHasAppendWantMark = false;
+		mHadPopulate = false;
 		mMergedFieldDataCount = 0;
 		mConstHolder = NULL;
 	}
@@ -2198,6 +2213,7 @@ public:
  	virtual bool HasVarConstraints();
  	virtual bool IsTypeMemberIncluded(BfTypeDef* declaringTypeDef, BfTypeDef* activeTypeDef = NULL, BfModule* module = NULL) override;
 	virtual bool IsZeroGap() override;
+	virtual bool HasUnderlyingArray() override { return mHasUnderlyingArray; }
 
 	virtual BfTypeInstance* GetImplBaseType() { return mBaseType; }
 
@@ -2230,6 +2246,7 @@ public:
 	bool HasAppendCtor();
 	bool BaseHasAppendCtor();
 	bool HasAppendedField(bool checkBase);
+	void RemoveMethodsFromCEMachine();
 
 	virtual void ReportMemory(MemReporter* memReporter) override;
 };
@@ -2509,6 +2526,7 @@ public:
 	virtual bool IsMethodRef() override { return true; }
 	virtual bool IsSplattable() override { return true; }
 	virtual int GetSplatCount(bool force) override { return (int)mDataToParamIdx.mSize; }
+	virtual bool WantsGCMarking() override;
 
 	virtual bool IsOnDemand() override { return true; }
 	virtual bool IsTemporary() override { return true; }
@@ -2725,7 +2743,8 @@ public:
 		BfHashFlag_AllowRef = 1,
 		BfHashFlag_AllowGenericParamConstValue = 2,
 		BfHashFlag_AllowDotDotDot = 4,
-		BfHashFlag_DisallowPointer = 8
+		BfHashFlag_DisallowPointer = 8,
+		BfHashFlag_DisallowUnknownSizedArray = 0x10,
 	};
 
 	struct BfExprResult
@@ -2826,6 +2845,11 @@ public:
 	static int Hash(BfAstNode* typeRefNode, LookupContext* ctx, BfHashFlags flags = BfHashFlag_None, int hashSeed = 0);
 	static void ShowThisPointerWarning(LookupContext* ctx, BfTypeReference* typeRef);
 
+	// Distinct types sharing a full 32-bit hash is astronomically unlikely, so once enough of them pile up on
+	//  one hash we stop trusting luck and check the set's uniquing contract directly
+	static const int sMaxFullHashMisses = 6;
+	void CheckHashPileup(int bucket, int hashVal, LookupContext* ctx);
+
 	static bool Equals(BfType* lhs, BfType* rhs, LookupContext* ctx);
 	static bool Equals(BfType* lhs, BfTypeReference* rhs, LookupContext* ctx);
 	static bool Equals(BfType* lhs, BfAstNode* rhs, LookupContext* ctx);
@@ -2844,7 +2868,7 @@ public:
 	{
 		CheckRehash();
 
-		int tryCount = 0;
+		int fullHashMisses = 0;
 		ctx->mFailed = false;
 
 		BfHashFlags hashFlags = BfHashFlag_AllowRef;
@@ -2874,10 +2898,18 @@ public:
 
 				// checkEntry->mType can be NULL if we're in the process of filling it in (and this Insert is from an element type)
 				//  OR if the type resolution failed after node insertion
-				if ((checkEntry->mValue != NULL) && (hashVal == checkEntry->mHashCode) && (Equals(checkEntry->mValue, findType, ctx)))
+				if ((checkEntry->mValue != NULL) && (hashVal == checkEntry->mHashCode))
 				{
-					*entryPtr = EntryRef(this, checkEntryIdx);
-					return false;
+					if (Equals(checkEntry->mValue, findType, ctx))
+					{
+						*entryPtr = EntryRef(this, checkEntryIdx);
+						return false;
+					}
+
+					// A full 32-bit hash match that Equals rejects. Legitimately this is vanishingly rare, so
+					//  counting these (rather than the bucket chain length, which grows with load factor) gives
+					//  us a signal that does not depend on how many types the workspace happens to have
+					fullHashMisses++;
 				}
 
 				if ((mAllocSize != startAllocSize) || (startEntryIdx != mHashHeads[bucket]))
@@ -2889,14 +2921,13 @@ public:
 				}
 
 				checkEntryIdx = checkEntry->mNext;
+			}
 
-				tryCount++;
-				// If this fires off, this may indicate that our hashes are equivalent but Equals fails
-				if (tryCount >= 10)
-				{
-					NOP;
-				}
-				BF_ASSERT(tryCount < 10);
+			if ((!needsRerun) && (fullHashMisses >= sMaxFullHashMisses))
+			{
+				// Too many types claim this exact hash. Verify against the set's actual uniquing contract before
+				//  deciding whether this is a real bug -- see CheckHashPileup
+				CheckHashPileup(bucket, hashVal, ctx);
 			}
 			
 			if (!needsRerun)
