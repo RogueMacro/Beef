@@ -415,16 +415,53 @@ What doesn't work yet / not verified:
   wrapper on PATH (finds `/opt/homebrew/opt/llvm@22/bin/llvm-config`) and with no brew (empty, so the error path);
   `./bin/build.sh ide` passes. **Not verified:** a really fresh Mac (actual installs, CLT-only machine, Intel).
 
-### Task 16 — GitHub Actions macOS build (written, not yet run)
+### Task 16 — GitHub Actions macOS build (done)
 - `.github/workflows/build.yml`: upstream's `build-macos` job (`if: false` since `88e4b36f` "Disable broken macOS
   build"; plain `bin/build.sh` on macos-latest + macos-15-intel) is replaced by `build-macos-ide`: `macos-15` (arm64),
   `bin/setup_macos.sh` (installs the Brewfile formulas, checks Xcode's `LLDB.framework`), then `bin/build.sh ide`
   (native libs, BeefBuild + IDEHelper tests, both IDE configs). Timeout 90 min. Intel dropped: the port is arm64-only.
 - The Windows/Linux jobs are unchanged and still run on every push.
-- Unverified until the first run: brew install time on the runner (lldb pulls Homebrew's llvm as a dependency), the
-  runner's default Xcode `LLDB.framework` linking against Homebrew lldb's headers, build time vs the timeout.
+- First run (run 45795109331, commit `e3b65bb4`): passed in ≈6.5 min (setup + `build.sh ide` + tests), so brew install
+  time, the runner's Xcode `LLDB.framework` vs Homebrew lldb headers and the 90-minute timeout are all fine.
 - No artifacts yet: the binaries link Homebrew's libLLVM by absolute path and dlopen Homebrew's SDL3, so they only run
   on a machine set up the same way. Uploading an `.app` belongs with the packaging work.
+
+### Task 17 — BeefIDE.app packaging (done, needs testing on another Mac)
+- `bin/package_macos.sh` (after `./bin/build.sh ide`) → `builds/macos/BeefIDE.app` + `BeefIDE-<ver>-macos-arm64.zip`
+  (269 MB / 96 MB; libLLVM alone is 136 MB). `--no-zip` skips the zip.
+- Layout: `Contents/MacOS/{BeefIDE,BeefBuild}` (release builds); `Contents/Frameworks/` libLLVM + libzstd (its only
+  Homebrew dep), libSDL3, libhunspell, all with `@rpath/` ids; `Contents/Resources/bin/` = the install dir (release +
+  debug libBeefRT/libBeefySysLib, `BeefConfig_install.toml` as `BeefConfig.toml`, BeefDbgVis.toml, spell dictionary,
+  fonts, shaders, images incl. ImgCreate); `Contents/Resources/BeefLibs/` (git-tracked files only, plus Beefy2D's
+  `dist/libBeefySysLib*.a`, which build.sh only symlinks). IDEHelper libs (≈250 MB, only for building the IDE) aren't shipped.
+- Code changes:
+  - `BeefySysLib/platform/darwin/DarwinAppBundle.h`: `DarwinGetAppBundleInstallDir` maps `X.app/Contents/MacOS` to
+    `X.app/Contents/Resources/bin/`; `SdlBFApp` (IDE) and `HeadlessApp` (BeefBuild) use it. Same binaries still work
+    from `IDE/dist`.
+  - SDL3 search tries `@executable_path/../Frameworks/libSDL3.dylib` first.
+  - `IDEApp.IsPackagedInstall` (Linux `LINUX_PACKAGE`, or macOS install dir inside `.app/Contents/Resources/`):
+    user data goes to `~/Library/Application Support/BeefLang/` (settings, layout, userdict, BeefManaged). The managed
+    lib dir check in `BeefConfig.bf` is now this runtime check, and `DefaultLayout.toml` uses `mUserDataDir` (identical
+    for unpackaged builds; for Linux packages it moves from the read-only install dir to `~/.config/beeflang`).
+- Script: copies, rewrites non-system deps to bundled `@rpath` copies (recursively), adds rpaths
+  `@executable_path/../Frameworks` and the CLT's `PrivateFrameworks` (Xcode's from the build stays) for
+  `LLDB.framework`, fails if anything still points into Homebrew or the build tree, writes Info.plist
+  (`org.beeflang.BeefIDE`, version from `cVersion`, `LSMinimumSystemVersion` from the exe's `minos`, 15.0 here),
+  makes `AppIcon.icns` from `IDE/Resources/Beef256.png`, signs ad hoc inside-out and runs `codesign --verify --deep --strict`.
+- Verified: bundled BeefBuild with `PATH=/usr/bin:/bin:...` creates, builds and runs a program (dyld: libLLVM, zstd,
+  hunspell from the bundle, nothing from Homebrew); the app via `open` (vmmap: all four dylibs from the bundle), builds
+  the workspace, debugs it (breakpoint, call stack, continue); quitting writes settings/layout/userdict to Application
+  Support, nothing inside the bundle (seal still verifies); unzipped elsewhere, it still verifies and builds.
+- **Not verified:** a Mac without Homebrew; a CLT-only Mac (LLDB.framework via the CLT rpath); Gatekeeper on a
+  downloaded (quarantined) zip.
+- Known gaps / requirements:
+  - Needs Xcode or the Command Line Tools: clang links Beef programs, and `LLDB.framework` is linked normally, so
+    without either the app won't launch at all. Weak-linking LLDB would let it start with the debugger disabled.
+  - Ad hoc signed, not notarized. On macOS 15 a downloaded copy needs System Settings ▸ Privacy & Security ▸ "Open
+    Anyway" (or `xattr -dr com.apple.quarantine BeefIDE.app`). Notarizing needs a paid Apple Developer ID.
+  - No Samples are bundled (none in this repo), so the Welcome panel's sample buttons point at nothing.
+  - Pre-existing, not packaging-specific: macOS static-lib projects call `llvm/bin/llvm-ar` relative to the install dir
+    (`BuildContext.bf` ~420), which exists nowhere on macOS.
 
 ## Decisions
 
@@ -459,6 +496,7 @@ What doesn't work yet / not verified:
 ```sh
 bin/setup_macos.sh        # checks prerequisites, installs missing Brewfile formulas (--check: report only)
 ./bin/build.sh ide        # full: native libs + BeefBuild + tests + BeefIDE_d + BeefIDE (exit 0)
+bin/package_macos.sh      # builds/macos/BeefIDE.app + zip, from the build above
 cd IDE/dist && LIBRARY_PATH=$(brew --prefix llvm@22)/lib ./BeefBuild -proddir=../ -config=Debug   # IDE only
 cd IDE/dist && ./BeefIDE_d                                    # run
 cd IDE/dist && ./BeefIDE_d -mcp=4310 -deterministic -workspace=/path/to/ws   # run + drive via MCP (curl JSON-RPC to /mcp)
